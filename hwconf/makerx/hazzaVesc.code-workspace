@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "../../.."
+		},
+		{
+			"path": "../../../../tsdz8haztesting/display_firmware"
+		},
+		{
+			"path": "../../../../tsdz8haztesting/860c"
+		},
+		{
+			"path": "../../../../../esp/esp-idf/tsdz8protodisplay"
+		},
+		{
+			"path": "../../../esp32"
+		}
+	],
+	"settings": {}
+}

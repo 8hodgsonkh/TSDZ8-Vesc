@@ -40,12 +40,12 @@
 #define TC_DIFF_MAX_PASS				60  // TODO: move to app_conf
 
 #define CTRL_USES_BUTTON(ctrl_type)(\
-		ctrl_type == ADC_CTRL_TYPE_CURRENT_REV_BUTTON || \
-		ctrl_type == ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_ADC || \
-		ctrl_type == ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_CENTER || \
-		ctrl_type == ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_BUTTON || \
-		ctrl_type == ADC_CTRL_TYPE_DUTY_REV_BUTTON || \
-		ctrl_type == ADC_CTRL_TYPE_PID_REV_BUTTON)
+			ctrl_type == ADC_CTRL_TYPE_CURRENT_REV_BUTTON || \
+			ctrl_type == ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_ADC || \
+			ctrl_type == ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_CENTER || \
+			ctrl_type == ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_BUTTON || \
+			ctrl_type == ADC_CTRL_TYPE_DUTY_REV_BUTTON || \
+			ctrl_type == ADC_CTRL_TYPE_PID_REV_BUTTON)
 
 // Threads
 static THD_FUNCTION(adc_thread, arg);
@@ -68,6 +68,151 @@ static volatile bool buttons_detached = false;
 static volatile bool rev_override = false;
 static volatile bool cc_override = false;
 static volatile bool range_ok = true;
+
+// Hazza throttle state (current control)
+typedef struct {
+	float current_rel_cmd;
+} haz_throttle_ctx_t;
+
+static haz_throttle_ctx_t haz_throttle_ctx = {
+	.current_rel_cmd = 0.0f
+};
+
+static float haz_throttle_filtered = 0.0f;
+
+static bool haz_throttle_is_current_ctrl(adc_control_type ctrl) {
+	switch (ctrl) {
+	case ADC_CTRL_TYPE_CURRENT:
+	case ADC_CTRL_TYPE_CURRENT_REV_CENTER:
+	case ADC_CTRL_TYPE_CURRENT_REV_BUTTON:
+	case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_CENTER:
+	case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_CENTER:
+	case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_BUTTON:
+	case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_ADC:
+	case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_ADC:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static float haz_throttle_step(float current, float target, float rate_per_s, float dt_s) {
+	float step = rate_per_s * dt_s;
+	utils_truncate_number(&step, 0.0f, 1.0f);
+	if (target > current) {
+		current += step;
+		if (current > target) current = target;
+	} else {
+		current -= step;
+		if (current < target) current = target;
+	}
+	return current;
+}
+
+static float haz_throttle_process(float pwr_in, float dt_s) {
+	const float release_eps = 0.01f;
+	const float duty_gate_span = 0.08f;
+	const float duty_gate_min_scale = 0.35f;
+	const float launch_boost_rel = 0.08f;
+	const float launch_boost_throttle = 0.15f;
+	const float launch_boost_release_duty = 0.12f;
+	const float launch_boost_release_erpm = 250.0f;
+	const float ramp_up_min_a = 10.0f;
+	const float ramp_up_max_a = 30.0f;
+	const float ramp_up_limited_a = 10.0f;
+	const float ramp_down_a = 40.0f;
+	const float throttle_filter_hz = 12.0f;
+
+	if (pwr_in < 0.0f) {
+		// braking/regen path untouched, decay drive command quickly
+		haz_throttle_ctx.current_rel_cmd = haz_throttle_step(
+			haz_throttle_ctx.current_rel_cmd, 0.0f, 10.0f, dt_s);
+		return pwr_in;
+	}
+
+	float mag = fabsf(pwr_in);
+	if (mag > 1.0f) {
+		mag = 1.0f;
+	}
+	float alpha = throttle_filter_hz * dt_s;
+	utils_truncate_number(&alpha, 0.0f, 1.0f);
+	haz_throttle_filtered += (mag - haz_throttle_filtered) * alpha;
+	mag = haz_throttle_filtered;
+	if (mag < release_eps) {
+		haz_throttle_ctx.current_rel_cmd = haz_throttle_step(
+			haz_throttle_ctx.current_rel_cmd, 0.0f, ramp_down_a, dt_s);
+		return haz_throttle_ctx.current_rel_cmd;
+	}
+
+	const volatile mc_configuration *mcconf = mc_interface_get_configuration();
+	float max_phase_a = fabsf(mcconf->l_current_max);
+	float max_batt_a = fabsf(mcconf->l_in_current_max);
+
+	if (max_phase_a < 1e-3f || max_batt_a < 1e-3f) {
+		haz_throttle_ctx.current_rel_cmd = 0.0f;
+		return 0.0f;
+	}
+
+	float target_batt_a = mag * max_batt_a;
+	float duty_now = fabsf(mc_interface_get_duty_cycle_now());
+	if (duty_now < duty_gate_span) {
+		float ratio = duty_now / duty_gate_span;
+		utils_truncate_number(&ratio, 0.0f, 1.0f);
+		float scale = duty_gate_min_scale + (1.0f - duty_gate_min_scale) * ratio;
+		target_batt_a *= scale;
+	}
+
+	float target_phase_a = target_batt_a * (max_phase_a / max_batt_a);
+	if (target_phase_a > max_phase_a) {
+		target_phase_a = max_phase_a;
+	}
+
+	float rpm_now_abs = fabsf(mc_interface_get_rpm());
+	bool launch_boost_window = (duty_now < launch_boost_release_duty) &&
+		(rpm_now_abs < launch_boost_release_erpm);
+	if (launch_boost_window && mag > release_eps) {
+		float boost_mix = 1.0f - (mag / launch_boost_throttle);
+		utils_truncate_number(&boost_mix, 0.0f, 1.0f);
+		float min_phase_a = launch_boost_rel * max_phase_a * boost_mix;
+		if (target_phase_a < min_phase_a) {
+			target_phase_a = min_phase_a;
+		}
+		if (target_phase_a > max_phase_a) {
+			target_phase_a = max_phase_a;
+		}
+	}
+
+	float target_rel = target_phase_a / max_phase_a;
+	float phase_now = fabsf(mc_interface_get_tot_current_filtered());
+	float batt_now = fabsf(mc_interface_get_tot_current_in_filtered());
+	bool phase_under = phase_now < max_phase_a;
+	bool batt_under = batt_now < max_batt_a;
+	float ramp_up_span_a = ramp_up_max_a - ramp_up_min_a;
+	float ramp_up_base_a = ramp_up_min_a + (ramp_up_span_a * mag);
+	if (ramp_up_base_a > ramp_up_max_a) {
+		ramp_up_base_a = ramp_up_max_a;
+	}
+	if (ramp_up_base_a < ramp_up_min_a) {
+		ramp_up_base_a = ramp_up_min_a;
+	}
+	float ramp_up_a = (phase_under && batt_under) ? ramp_up_base_a : fminf(ramp_up_base_a, ramp_up_limited_a);
+	float ramp_rate = ramp_up_a / max_phase_a;
+	float ramp_down_rate = ramp_down_a / max_phase_a;
+
+	if (target_rel < haz_throttle_ctx.current_rel_cmd) {
+		haz_throttle_ctx.current_rel_cmd = haz_throttle_step(
+			haz_throttle_ctx.current_rel_cmd, target_rel, ramp_down_rate, dt_s);
+	} else {
+		haz_throttle_ctx.current_rel_cmd = haz_throttle_step(
+			haz_throttle_ctx.current_rel_cmd, target_rel, ramp_rate, dt_s);
+	}
+
+	if (haz_throttle_ctx.current_rel_cmd > 1.0f) {
+		haz_throttle_ctx.current_rel_cmd = 1.0f;
+	}
+
+	return haz_throttle_ctx.current_rel_cmd;
+}
 
 void app_adc_configure(adc_config *conf) {
 	if (!buttons_detached && (((conf->buttons >> 0) & 1) || CTRL_USES_BUTTON(conf->ctrl_type))) {
@@ -377,16 +522,9 @@ static THD_FUNCTION(adc_thread, arg) {
 		// Apply throttle curve
 		pwr = utils_throttle_curve(pwr, config.throttle_exp, config.throttle_exp_brake, config.throttle_exp_mode);
 
-		// Apply ramping
-		static systime_t last_time = 0;
-		static float pwr_ramp = 0.0;
-		float ramp_time = fabsf(pwr) > fabsf(pwr_ramp) ? config.ramp_time_pos : config.ramp_time_neg;
-
-		if (ramp_time > 0.01) {
-			const float ramp_step = (float)ST2MS(chVTTimeElapsedSinceX(last_time)) / (ramp_time * 1000.0);
-			utils_step_towards(&pwr_ramp, pwr, ramp_step);
-			last_time = chVTGetSystemTimeX();
-			pwr = pwr_ramp;
+		const float loop_dt = (float)sleep_time / (float)CH_CFG_ST_FREQUENCY;
+		if (haz_throttle_is_current_ctrl(config.ctrl_type)) {
+			pwr = haz_throttle_process(pwr, loop_dt);
 		}
 
 		float current_rel = 0.0;

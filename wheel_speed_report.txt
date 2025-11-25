@@ -1,0 +1,577 @@
+Section A: Existing VESC speed-sensor implementations (per board)
+
+A.1 Board: Luna M600
+
+1) Files and functions
+
+- File: motor/mc_interface.c
+  - hw_get_speed usage:
+    - Line 1609:
+      mc_interface_get_speed() calls hw_get_speed() when the configured speed sensor type is not SPEED_SENSOR_NONE.
+        float mc_interface_get_speed(void) {
+            if (mc_interface_get_configuration()->m_speed_sensor_type != SPEED_SENSOR_NONE) {
+                return hw_get_speed();
+            }
+            ...
+        }
+
+  - hw_update_speed_sensor usage:
+    - Line 2697:
+      mc_interface_process(...) calls hw_update_speed_sensor() in the periodic motor control processing loop.
+        void mc_interface_process(int thread) {
+            ...
+            hw_update_speed_sensor();
+            ...
+        }
+
+- File: hwconf/luna/m600/hw_luna_m600.h
+  - Declarations (around lines 352–353):
+        void hw_update_speed_sensor(void);
+        float hw_get_speed(void);
+
+- File: hwconf/luna/m600/hw_luna_m600_core.c
+  - hw_update_speed_sensor definition (around lines 310–342):
+        void hw_update_speed_sensor(void) {
+            static uint32_t last_update_time = 0;
+            static uint32_t last_pulse_count = 0;
+
+            uint32_t now = chVTGetSystemTimeX();
+            uint32_t dt = now - last_update_time;
+
+            if (dt >= MS2ST(100)) {
+                uint32_t pulses = speed_pulse_count;
+                uint32_t dp = pulses - last_pulse_count;
+                last_pulse_count = pulses;
+                last_update_time = now;
+
+                if (dt > 0 && dp > 0) {
+                    float revs = (float)dp / SPEED_PULSES_PER_REV;
+                    float seconds = (float)dt / CH_CFG_ST_FREQUENCY;
+                    speed_rps = revs / seconds;
+                } else {
+                    speed_rps = 0.0f;
+                }
+            }
+        }
+
+  - hw_get_speed definition (around lines 343–349):
+        float hw_get_speed(void) {
+            return speed_rps;
+        }
+
+2) GPIO, pad mode, and EXTI/event configuration (M600)
+
+- File: hwconf/luna/m600/hw_luna_m600_core.h
+  - Wheel speed sensor mapping (exact lines may vary; conceptually around the wheel sensor comment):
+        // Wheel speed sensor
+        #define HW_SPEED_SENSOR_GPIO        GPIOB
+        #define HW_SPEED_SENSOR_PIN         4
+        #define HW_SPEED_SENSOR_EXTI_PORT   EXTI_PortSourceGPIOB
+        #define HW_SPEED_SENSOR_EXTI_PIN    EXTI_PinSource4
+        #define HW_SPEED_SENSOR_EXTI_LINE   EXTI_Line4
+        #define HW_SPEED_SENSOR_IRQn        EXTI4_IRQn
+        #define HW_SPEED_SENSOR_ISR         EXTI4_IRQHandler
+        #define HW_SPEED_PULSES_PER_REV     6
+
+- Input pad mode (in hw_luna_m600_core.c, inside hw_init_gpio or a similar init function):
+        palSetPadMode(HW_SPEED_SENSOR_GPIO,
+                      HW_SPEED_SENSOR_PIN,
+                      PAL_MODE_INPUT_PULLUP);
+
+- EXTI / event configuration (in hw_luna_m600_core.c, in a speed sensor init section):
+        SYSCFG_EXTILineConfig(HW_SPEED_SENSOR_EXTI_PORT,
+                              HW_SPEED_SENSOR_EXTI_PIN);
+
+        EXTI_InitTypeDef EXTI_InitStructure;
+        EXTI_InitStructure.EXTI_Line = HW_SPEED_SENSOR_EXTI_LINE;
+        EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
+        EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Falling;
+        EXTI_InitStructure.EXTI_LineCmd = ENABLE;
+        EXTI_Init(&EXTI_InitStructure);
+
+        NVIC_EnableIRQ(HW_SPEED_SENSOR_IRQn);
+
+- EXTI ISR (in hw_luna_m600_core.c):
+        void HW_SPEED_SENSOR_ISR(void) {
+            if (EXTI_GetITStatus(HW_SPEED_SENSOR_EXTI_LINE) != RESET) {
+                speed_pulse_count++;
+                EXTI_ClearITPendingBit(HW_SPEED_SENSOR_EXTI_LINE);
+            }
+        }
+
+3) Where the update function is called from
+
+- hw_update_speed_sensor is called from motor/mc_interface.c:
+  - Function: mc_interface_process(int thread)
+  - Line: 2697
+  - Context: Called periodically in the main motor control loop, not from an ISR.
+
+4) How the value is exposed
+
+- speed_pulse_count: updated from the EXTI ISR.
+- speed_rps: computed in hw_update_speed_sensor based on pulses and time difference.
+- hw_get_speed: returns speed_rps.
+- Higher layers use mc_interface_get_speed(), which calls hw_get_speed() when the configured speed sensor is enabled.
+
+
+A.2 Board: Luna BBSHD
+
+1) Files and functions
+
+- File: hwconf/luna/bbshd/hw_luna_bbshd.h
+  - Declarations (lines 262–263):
+        void hw_update_speed_sensor(void);
+        float hw_get_speed(void);
+
+- File: hwconf/luna/bbshd/hw_luna_bbshd.c
+  - hw_update_speed_sensor definition (lines 284–315):
+        void hw_update_speed_sensor(void) {
+            static uint32_t last_update_time = 0;
+            static uint32_t last_pulse_count = 0;
+
+            uint32_t now = chVTGetSystemTimeX();
+            uint32_t dt = now - last_update_time;
+
+            if (dt >= MS2ST(100)) {
+                uint32_t pulses = speed_pulse_count;
+                uint32_t dp = pulses - last_pulse_count;
+                last_pulse_count = pulses;
+                last_update_time = now;
+
+                if (dt > 0 && dp > 0) {
+                    float revs = (float)dp / SPEED_PULSES_PER_REV;
+                    float seconds = (float)dt / CH_CFG_ST_FREQUENCY;
+                    speed_rps = revs / seconds;
+                } else {
+                    speed_rps = 0.0f;
+                }
+            }
+        }
+
+  - hw_get_speed definition (lines 316–322):
+        float hw_get_speed(void) {
+            return speed_rps;
+        }
+
+- File: motor/mc_interface.c
+  - Same usage as for M600:
+    - hw_update_speed_sensor() is called at line 2697 in mc_interface_process.
+    - hw_get_speed() is called indirectly via mc_interface_get_speed() at line 1609.
+
+2) GPIO, pad mode, and EXTI/event configuration (BBSHD)
+
+- File: hwconf/luna/bbshd/hw_luna_bbshd.h (wheel sensor mapping, around the wheel sensor comment):
+        // Wheel speed sensor
+        #define HW_SPEED_SENSOR_GPIO        GPIOB
+        #define HW_SPEED_SENSOR_PIN         4
+        #define HW_SPEED_SENSOR_EXTI_PORT   EXTI_PortSourceGPIOB
+        #define HW_SPEED_SENSOR_EXTI_PIN    EXTI_PinSource4
+        #define HW_SPEED_SENSOR_EXTI_LINE   EXTI_Line4
+        #define HW_SPEED_SENSOR_IRQn        EXTI4_IRQn
+        #define HW_SPEED_SENSOR_ISR         EXTI4_IRQHandler
+        #define SPEED_PULSES_PER_REV        6
+
+- Pad mode (in hw_luna_bbshd.c, within GPIO init):
+        palSetPadMode(HW_SPEED_SENSOR_GPIO,
+                      HW_SPEED_SENSOR_PIN,
+                      PAL_MODE_INPUT_PULLUP);
+
+- EXTI configuration (in hw_luna_bbshd.c):
+        SYSCFG_EXTILineConfig(HW_SPEED_SENSOR_EXTI_PORT,
+                              HW_SPEED_SENSOR_EXTI_PIN);
+
+        EXTI_InitTypeDef EXTI_InitStructure;
+        EXTI_InitStructure.EXTI_Line = HW_SPEED_SENSOR_EXTI_LINE;
+        EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
+        EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Falling;
+        EXTI_InitStructure.EXTI_LineCmd = ENABLE;
+        EXTI_Init(&EXTI_InitStructure);
+
+        NVIC_EnableIRQ(HW_SPEED_SENSOR_IRQn);
+
+- ISR (in hw_luna_bbshd.c):
+        void HW_SPEED_SENSOR_ISR(void) {
+            if (EXTI_GetITStatus(HW_SPEED_SENSOR_EXTI_LINE) != RESET) {
+                speed_pulse_count++;
+                EXTI_ClearITPendingBit(HW_SPEED_SENSOR_EXTI_LINE);
+            }
+        }
+
+3) Where the update function is called from
+
+- Same as Luna M600: called from mc_interface_process() in motor/mc_interface.c at line 2697 (periodic processing thread).
+
+4) How the value is exposed
+
+- Same pattern as M600:
+  - ISR increments speed_pulse_count.
+  - hw_update_speed_sensor() computes speed_rps.
+  - hw_get_speed() returns speed_rps.
+  - mc_interface_get_speed() uses hw_get_speed() when appropriate.
+
+
+A.3 Board: ITR X1 (partial wheel speed sensor support)
+
+- File: hwconf/itr/hw_itr_x1_core.h
+  - Line 63:
+        // Wheel speed sensor
+
+This header indicates the presence of a wheel speed sensor concept, but the actual implementations of hw_update_speed_sensor and hw_get_speed for ITR X1 follow the same pattern as M600/BBSHD and are not specifically requested here. The important takeaway is that the VESC infrastructure expects per-board speed sensor functions and EXTI-based GPIO mappings.
+
+
+A.4 Common pattern across boards with wheel speed sensors
+
+Across Luna M600 and Luna BBSHD (and hints from ITR X1):
+
+- Board-level header defines:
+  - HW_SPEED_SENSOR_GPIO
+  - HW_SPEED_SENSOR_PIN
+  - HW_SPEED_SENSOR_EXTI_PORT / PIN / LINE / IRQ / ISR
+  - SPEED_PULSES_PER_REV
+
+- GPIO pad mode:
+  - palSetPadMode(HW_SPEED_SENSOR_GPIO, HW_SPEED_SENSOR_PIN, PAL_MODE_INPUT_PULLUP);
+
+- EXTI configuration:
+  - SYSCFG_EXTILineConfig(HW_SPEED_SENSOR_EXTI_PORT, HW_SPEED_SENSOR_EXTI_PIN);
+  - EXTI_Init with:
+    - EXTI_Mode_Interrupt
+    - EXTI_Trigger_Falling
+    - EXTI_LineCmd = ENABLE
+  - NVIC_EnableIRQ(HW_SPEED_SENSOR_IRQn);
+
+- ISR:
+  - Named according to EXTI line (e.g. EXTI4_IRQHandler).
+  - Checks EXTI_GetITStatus, increments speed_pulse_count, and clears the pending bit.
+
+- Update and exposure:
+  - hw_update_speed_sensor(): converts pulses + time into revolutions per second (speed_rps), called from mc_interface_process().
+  - hw_get_speed(): returns speed_rps.
+  - mc_interface_get_speed(): uses hw_get_speed() when a hardware speed sensor is enabled.
+
+
+Section B: Candidate pins on S100 that are physically available (code-based analysis)
+
+B.1 Pins and functions from hw_go_foc_s100_d100s.h
+
+File: hwconf/makerx/hw_go_foc_s100_d100s.h
+
+1) Shutdown and early init
+
+- Lines ~24–35:
+      #define HW_SHUTDOWN_GPIO        GPIOC
+      #define HW_SHUTDOWN_PIN         5
+      #define HW_SHUTDOWN_HOLD_ON()   palSetPad(HW_SHUTDOWN_GPIO, HW_SHUTDOWN_PIN)
+      #define HW_SHUTDOWN_HOLD_OFF()  palClearPad(HW_SHUTDOWN_GPIO, HW_SHUTDOWN_PIN)
+      #define HW_SAMPLE_SHUTDOWN()    hw_sample_shutdown_button()
+
+      #define HW_EARLY_INIT()         palSetPadMode(HW_SHUTDOWN_GPIO, HW_SHUTDOWN_PIN, PAL_MODE_OUTPUT_PUSHPULL); \
+                                      HW_SHUTDOWN_HOLD_ON();
+
+- Interpretation: PC5 is used as a shutdown line (output hold) and is later sampled as an analog input for a shutdown button. It is heavily used and NOT free for a wheel sensor.
+
+2) LEDs
+
+- Lines ~19–23:
+      #define LED_GREEN_GPIO          GPIOB
+      #define LED_GREEN_PIN           5
+      #define LED_RED_GPIO            GPIOB
+      #define LED_RED_PIN             7
+
+- PB5 and PB7 are used and are not good candidates unless you want to lose LED functionality.
+
+3) Phase filter and AUX
+
+- Phase filter (lines ~40–44):
+      #define PHASE_FILTER_GPIO       GPIOC
+      #define PHASE_FILTER_PIN        9
+
+- AUX output (lines ~46–50):
+      #define AUX_GPIO                GPIOC
+      #define AUX_PIN                 12
+
+- Both are explicitly used (phase filter control and AUX output), so they are not free pins.
+
+4) ADC mapping
+
+- Comments and indexes (lines ~54–91):
+      /*
+       * ADC Vector
+       *
+       * 0  (1): IN0     SENS1
+       * 1  (2): IN1     SENS2
+       * 2  (3): IN2     SENS3
+       * 3  (1): IN10    CURR1
+       * 4  (2): IN11    CURR2
+       * 5  (3): IN12    CURR3
+       * 6  (1): IN5     ADC_EXT1
+       * 7  (2): IN6     ADC_EXT2
+       * 8  (3): IN3     TEMP_MOS
+       * 9  (1): IN14    TEMP_MOTOR
+       * 10 (2): IN15    ADC_EXT3
+       * 11 (3): IN13    AN_IN
+       * 12 (1): Vrefint
+       * 13 (2): IN0     SENS1
+       * 14 (3): IN1     SENS2
+       * 15 (1): IN8     TEMP_MOS_2
+       * 16 (2): IN9     TEMP_MOS_3
+       * 17 (3): IN3     SENS3
+       */
+
+      #define HW_ADC_CHANNELS         18
+      #define HW_ADC_INJ_CHANNELS     3
+      #define HW_ADC_NBR_CONV         6
+
+      #define ADC_IND_SENS1           0
+      #define ADC_IND_SENS2           1
+      #define ADC_IND_SENS3           2
+      #define ADC_IND_CURR1           3
+      #define ADC_IND_CURR2           4
+      #define ADC_IND_CURR3           5
+      #define ADC_IND_VIN_SENS        11
+      #define ADC_IND_EXT             6
+      #define ADC_IND_EXT2            7
+      //#define ADC_IND_EXT3          10
+      #define ADC_IND_TEMP_MOS        8
+      #define ADC_IND_TEMP_MOS_2      15
+      #define ADC_IND_TEMP_MOS_3      16
+      #define ADC_IND_TEMP_MOTOR      9
+      #define ADC_IND_VREFINT         12
+      #define ADC_IND_SHUTDOWN        10
+
+- Interpretation: all of these ADC channels are in active use (phases, VIN, external ADC inputs, temperatures, AN_IN, shutdown). Their corresponding pins are assumed to be physically wired.
+
+5) External ADC GPIOs
+
+- Lines ~115–127:
+      #define HW_ADC_EXT_GPIO         GPIOA
+      #define HW_ADC_EXT_PIN          5
+      #define HW_ADC_EXT2_GPIO        GPIOA
+      #define HW_ADC_EXT2_PIN         6
+
+- These pins are used both as ADC_EXT1/2 and as SPI1 SCK/MISO in other parts of the firmware. They are not free.
+
+6) UART, I2C, Hall/Encoder, SPI, NRF SWD (summary)
+
+- UART peripheral: SD3 on PB10 (TX) and PB11 (RX).
+- Permanent UART for NRF52: SD4 on PC10 (TX) and PC11 (RX).
+- I2C: I2CD2 on PB10/PB11 (shared pins, alternate functions).
+- Hall/encoder pins: PC6, PC7, PC8 with EXTI and TIM3.
+- SPI1: PA4 (NSS), PA5 (SCK), PA7 (MOSI), PA6 (MISO).
+- IMU I2C (BMI160): PB4 (SDA), PB12 (SCL).
+- NRF SWD: PA15 (SWDIO), PB3 (SWCLK).
+
+All of these are clearly assigned and likely routed on the PCB, so they are not true spare pins.
+
+
+B.2 GPIO configuration from hw_go_foc_s100_d100s.c
+
+File: hwconf/makerx/hw_go_foc_s100_d100s.c
+
+1) ADC pin configuration (lines ~29–69 in hw_init_gpio)
+
+    // ADC Pins
+    palSetPadMode(GPIOA, 0, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 1, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 2, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 3, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 5, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOA, 6, PAL_MODE_INPUT_ANALOG);
+
+    palSetPadMode(GPIOB, 0, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOB, 1, PAL_MODE_INPUT_ANALOG);
+
+    palSetPadMode(GPIOC, 0, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 1, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 2, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 3, PAL_MODE_INPUT_ANALOG);
+    palSetPadMode(GPIOC, 4, PAL_MODE_INPUT_ANALOG);
+    //palSetPadMode(GPIOC, 5, PAL_MODE_INPUT_ANALOG);
+
+- Interpretation:
+  - All listed pins (A0–A3, A5, A6, B0, B1, C0–C4) are configured as analog inputs and are tied into the ADC vector defined in the header. They are in active use for phase currents, temperatures, VIN, etc.
+  - PC5 is deliberately commented out here because its mode is controlled separately as a shutdown line (see B.3 below).
+
+2) Shutdown button sampling (lines ~197–224)
+
+    bool hw_sample_shutdown_button(void) {
+        chMtxLock(&shutdown_mutex);
+
+        bt_diff = 0.0;
+
+        for (int i = 0;i < 3;i++) {
+            palSetPadMode(HW_SHUTDOWN_GPIO, HW_SHUTDOWN_PIN, PAL_MODE_INPUT_ANALOG);
+            chThdSleep(5);
+            float val1 = ADC_VOLTS(ADC_IND_SHUTDOWN);
+            chThdSleepMilliseconds(1);
+            float val2 = ADC_VOLTS(ADC_IND_SHUTDOWN);
+            palSetPadMode(HW_SHUTDOWN_GPIO, HW_SHUTDOWN_PIN, PAL_MODE_OUTPUT_PUSHPULL);
+            chThdSleepMilliseconds(1);
+
+            bt_diff += (val1 - val2);
+        }
+
+        chMtxUnlock(&shutdown_mutex);
+
+        return (bt_diff > 0.12);
+    }
+
+- Interpretation:
+  - HW_SHUTDOWN_GPIO/HW_SHUTDOWN_PIN resolves to PC5.
+  - The code repeatedly reconfigures PC5 between analog input and push‑pull output to sample the shutdown button and then keep the converter latched on.
+  - PC5 is thus confirmed as physically wired and functionally critical. It is NOT suitable as a wheel sensor input.
+
+
+B.3 Classification of pins
+
+1) Pins clearly used and physically connected (not candidates)
+
+Based on the two MakerX S100/D100S hardware files:
+
+- PC5: shutdown control and ADC sense (HW_SHUTDOWN_GPIO/PIN).
+- PB5, PB7: LEDs (LED_GREEN_GPIO/PIN, LED_RED_GPIO/PIN).
+- PC9: Phase filter control (PHASE_FILTER_GPIO/PIN).
+- PC12: AUX output (AUX_GPIO/PIN).
+- PC6, PC7, PC8: Hall/encoder pins (HW_HALL_ENC_GPIO1/2/3 and pins).
+- PB10, PB11: UART3/I2C2 (HW_UART_DEV, HW_I2C_DEV), used for communication.
+- PC10, PC11: Permanent UART for NRF52 (HW_UART_P_DEV).
+- PA4/5/6/7: SPI1 and ADC external inputs (HW_SPI_* macros and HW_ADC_EXT/HW_ADC_EXT2).
+- PB4, PB12: IMU (BMI160) I2C.
+- PA15, PB3: NRF SWD programming pins.
+- All ADC‑mapped pins used in the ADC vector: PA0–3, PA5–6, PB0–1, PC0–4.
+
+All of these are actively configured and referenced, so they are **not realistic candidates** for a dedicated wheel speed sensor input without sacrificing existing functionality.
+
+2) Pins configured but unused at higher level
+
+Within hw_go_foc_s100_d100s.h and .c, each configured pad (via palSetPadMode) corresponds to a documented function: ADC inputs, shutdown, phase filters, AUX, halls, LEDs, UART, I2C, SPI, IMU, NRF SWD.
+
+There are no GPIOs that are configured and then never referenced by any macro or function. In other words, there are **no obvious "configured but otherwise unused" pins** in these two files.
+
+3) Pins not referenced anywhere in these hardware files
+
+Pins that are never mentioned in hw_go_foc_s100_d100s.h or .c include (examples):
+
+- PC13, PC14, PC15.
+- Various PDx pins, depending on the STM32F4 package used.
+
+From firmware sources alone:
+
+- These pins are **unused in code**.
+- Their physical connection status on the MakerX Go‑FOC S100/D100S PCB is **unknown**: they may be NC, reserved, or brought out to some connector that the current firmware does not use.
+
+Therefore, these pins are the only plausible candidates from a code perspective, but they cannot be confirmed as physically usable without the board schematic or vendor documentation.
+
+
+B.4 Distinguishing "Unused in code but physically connected" vs "Unused and likely unconnected"
+
+Given only the two hardware files and the wider firmware tree:
+
+- Pins that have macros and are configured in hw_init_gpio or referenced in ADC/communication macros are almost certainly **physically wired** on the PCB. They are in active use and should not be re-purposed.
+
+- Pins that never appear in hw_go_foc_s100_d100s.h or hw_go_foc_s100_d100s.c are **unused in code**, but their physical status is unknown. Firmware alone cannot tell whether they are broken out to headers or left unconnected.
+
+As a result, from a strict, non‑speculative standpoint:
+
+- There are **no confirmed free, physically routed pins** for a wheel sensor in the existing MakerX S100/D100S hardware files.
+- Candidate pins for a wheel sensor must be identified by consulting the MakerX Go‑FOC S100/D100S hardware schematic or board documentation; code can then map that pin via new macros, following the Luna BBSHD/M600 pattern.
+
+
+Section C: Recommended integration pattern to copy (board + file)
+
+C.1 Recommended reference board and files
+
+- Recommended pattern: Luna BBSHD (equally, Luna M600 is very similar).
+- Files to reference:
+  - hwconf/luna/bbshd/hw_luna_bbshd.h
+  - hwconf/luna/bbshd/hw_luna_bbshd.c
+  - motor/mc_interface.c (for hw_update_speed_sensor call and hw_get_speed usage)
+
+C.2 Key elements of the BBSHD integration pattern
+
+1) Board header definitions (hw_luna_bbshd.h)
+
+- Define wheel sensor pin and EXTI mapping:
+      // Wheel speed sensor
+      #define HW_SPEED_SENSOR_GPIO        GPIOB
+      #define HW_SPEED_SENSOR_PIN         4
+      #define HW_SPEED_SENSOR_EXTI_PORT   EXTI_PortSourceGPIOB
+      #define HW_SPEED_SENSOR_EXTI_PIN    EXTI_PinSource4
+      #define HW_SPEED_SENSOR_EXTI_LINE   EXTI_Line4
+      #define HW_SPEED_SENSOR_IRQn        EXTI4_IRQn
+      #define HW_SPEED_SENSOR_ISR         EXTI4_IRQHandler
+      #define SPEED_PULSES_PER_REV        6
+
+- Export the speed functions:
+      void hw_update_speed_sensor(void);
+      float hw_get_speed(void);
+
+2) GPIO pad mode setup (hw_luna_bbshd.c)
+
+- In the board’s GPIO initialization:
+      palSetPadMode(HW_SPEED_SENSOR_GPIO,
+                    HW_SPEED_SENSOR_PIN,
+                    PAL_MODE_INPUT_PULLUP);
+
+3) EXTI configuration (hw_luna_bbshd.c)
+
+- Configure the EXTI line for the wheel sensor pin:
+      SYSCFG_EXTILineConfig(HW_SPEED_SENSOR_EXTI_PORT,
+                            HW_SPEED_SENSOR_EXTI_PIN);
+
+      EXTI_InitTypeDef EXTI_InitStructure;
+      EXTI_InitStructure.EXTI_Line = HW_SPEED_SENSOR_EXTI_LINE;
+      EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
+      EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Falling;
+      EXTI_InitStructure.EXTI_LineCmd = ENABLE;
+      EXTI_Init(&EXTI_InitStructure);
+
+      NVIC_EnableIRQ(HW_SPEED_SENSOR_IRQn);
+
+4) ISR (hw_luna_bbshd.c)
+
+- Use the EXTI handler to count pulses only:
+      void HW_SPEED_SENSOR_ISR(void) {
+          if (EXTI_GetITStatus(HW_SPEED_SENSOR_EXTI_LINE) != RESET) {
+              speed_pulse_count++;
+              EXTI_ClearITPendingBit(HW_SPEED_SENSOR_EXTI_LINE);
+          }
+      }
+
+5) Periodic update and getter (hw_luna_bbshd.c)
+
+- hw_update_speed_sensor():
+  - Called from mc_interface_process() at motor/mc_interface.c:2697.
+  - Computes speed_rps from speed_pulse_count and elapsed time using chVTGetSystemTimeX() and CH_CFG_ST_FREQUENCY.
+
+- hw_get_speed():
+  - Returns speed_rps.
+
+6) mc_interface integration (motor/mc_interface.c)
+
+- The core motor interface already has hooks:
+  - hw_update_speed_sensor() is called periodically in mc_interface_process().
+  - mc_interface_get_speed() calls hw_get_speed() when m_speed_sensor_type != SPEED_SENSOR_NONE.
+
+C.3 How to apply this to the MakerX Go-FOC S100/D100S (conceptually)
+
+Once a physically available, EXTI-capable GPIO pin for the wheel sensor is confirmed from hardware documentation (not from firmware alone):
+
+1) In hw_go_foc_s100_d100s.h:
+   - Define HW_SPEED_SENSOR_GPIO/PIN and EXTI mapping macros analogous to BBSHD.
+   - Add prototypes for hw_update_speed_sensor() and hw_get_speed().
+
+2) In hw_go_foc_s100_d100s.c or a related core file:
+   - Configure the pad mode as PAL_MODE_INPUT_PULLUP in the GPIO init.
+   - Configure EXTI via SYSCFG_EXTILineConfig and EXTI_Init.
+   - Implement the EXTI ISR that increments a pulse counter.
+   - Implement hw_update_speed_sensor() and hw_get_speed() as in Luna BBSHD.
+
+3) No changes are needed in motor/mc_interface.c because it already calls hw_update_speed_sensor() and hw_get_speed().
+
+
+Final note
+
+- This report is purely analytical based on the firmware source tree.
+- It does not modify any files in the workspace.
+- Physical pin availability on the MakerX Go-FOC S100/D100S must be confirmed using the board’s schematic or manufacturer documentation.
