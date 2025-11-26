@@ -1,5 +1,6 @@
-README.md — TSDZ8 VESC Firmware (Hazza Edition)
-
+Welcome page
+TSDZ8 VESC Firmware (Hazza Edition)
+Firmware source can be found under branches
 A cursed science project disguised as an ebike controller.
 
 ⚡ What This Repo Is
