@@ -26,6 +26,7 @@
 #include "hw.h"
 #include "encoder/encoder.h"
 #include "main.h"
+#include "app.h"
 
 CH_IRQ_HANDLER(ADC1_2_3_IRQHandler) {
 	CH_IRQ_PROLOGUE();
@@ -41,6 +42,14 @@ CH_IRQ_HANDLER(HW_ENC_EXTI_ISR_VEC) {
 		// Clear the EXTI line pending bit
 		EXTI_ClearITPendingBit(HW_ENC_EXTI_LINE);
 	}
+
+#ifdef HW_PAS_PPM_EXTI_LINE
+	if (EXTI_GetITStatus(HW_PAS_PPM_EXTI_LINE) != RESET) {
+		app_pas_pas_irq_handler();
+
+		EXTI_ClearITPendingBit(HW_PAS_PPM_EXTI_LINE);
+	}
+#endif
 }
 
 CH_IRQ_HANDLER(HW_ENC_TIM_ISR_VEC) {

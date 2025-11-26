@@ -172,6 +172,11 @@
 #define HW_ICU_GPIO_AF			GPIO_AF_TIM4
 #define HW_ICU_GPIO				GPIOB
 #define HW_ICU_PIN				6
+#define HW_PAS_PPM_EXTI_PORTSRC	EXTI_PortSourceGPIOB
+#define HW_PAS_PPM_EXTI_PINSRC	EXTI_PinSource6
+#define HW_PAS_PPM_EXTI_LINE		EXTI_Line6
+#define HW_PAS_PPM_EXTI_CH		EXTI9_5_IRQn
+#define HW_PAS_PPM_EXTI_ISR_VEC	EXTI9_5_IRQHandler
 
 // I2C Peripheral
 #define HW_I2C_DEV				I2CD2

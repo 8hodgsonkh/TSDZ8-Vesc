@@ -36,6 +36,7 @@ static app_configuration appconf = {0};
 static virtual_timer_t output_vt = {0};
 static bool output_vt_init_done = false;
 static volatile bool output_disabled_now = false;
+static bool pas_sidecar_started = false;
 
 // Private functions
 static void output_vt_cb(void *arg);
@@ -58,6 +59,14 @@ void app_set_configuration(app_configuration *conf) {
 	}
 
 	appconf = *conf;
+#if defined(HW_PAS_PPM_EXTI_LINE)
+	bool start_pas_sidecar =
+		(appconf.app_pas_conf.ctrl_type != PAS_CTRL_TYPE_NONE) &&
+		(appconf.app_pas_conf.sensor_type == PAS_SENSOR_TYPE_SINGLE_PIN_PPM) &&
+		(appconf.app_to_use == APP_ADC || appconf.app_to_use == APP_ADC_UART);
+#else
+	bool start_pas_sidecar = false;
+#endif
 
 	if (app_changed) {
 		app_ppm_stop();
@@ -65,6 +74,7 @@ void app_set_configuration(app_configuration *conf) {
 		app_uartcomm_stop(UART_PORT_COMM_HEADER);
 		app_nunchuk_stop();
 		app_pas_stop();
+		pas_sidecar_started = false;
 
 #ifdef APP_CUSTOM_TO_USE
 		app_custom_stop();
@@ -98,6 +108,11 @@ void app_set_configuration(app_configuration *conf) {
 
 		case APP_ADC:
 			app_adc_start(true);
+			if (start_pas_sidecar) {
+				app_pas_start(false);
+				start_pas_sidecar = false;
+				pas_sidecar_started = true;
+			}
 			break;
 
 		case APP_UART:
@@ -115,6 +130,11 @@ void app_set_configuration(app_configuration *conf) {
 			hw_stop_i2c();
 			app_adc_start(false);
 			app_uartcomm_start(UART_PORT_COMM_HEADER);
+			if (start_pas_sidecar) {
+				app_pas_start(false);
+				start_pas_sidecar = false;
+				pas_sidecar_started = true;
+			}
 			break;
 
 		case APP_NUNCHUK:
@@ -123,11 +143,13 @@ void app_set_configuration(app_configuration *conf) {
 
 		case APP_PAS:
 			app_pas_start(true);
+			start_pas_sidecar = false;
 			break;
 
 		case APP_ADC_PAS:
 			app_adc_start(false);
 			app_pas_start(false);
+			start_pas_sidecar = false;
 			break;
 
 		case APP_NRF:
@@ -146,6 +168,14 @@ void app_set_configuration(app_configuration *conf) {
 
 		default:
 			break;
+		}
+	} else {
+		if (start_pas_sidecar && !pas_sidecar_started) {
+			app_pas_start(false);
+			pas_sidecar_started = true;
+		} else if (!start_pas_sidecar && pas_sidecar_started) {
+			app_pas_stop();
+			pas_sidecar_started = false;
 		}
 	}
 

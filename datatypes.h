@@ -680,7 +680,8 @@ typedef enum {
 
 // PAS sensor types
 typedef enum {
-	PAS_SENSOR_TYPE_QUADRATURE = 0
+	PAS_SENSOR_TYPE_QUADRATURE = 0,
+	PAS_SENSOR_TYPE_SINGLE_PIN_PPM = 1
 } pas_sensor_type;
 
 typedef struct {
@@ -746,6 +747,7 @@ typedef struct {
 	float ramp_time_pos;
 	float ramp_time_neg;
 	uint32_t update_rate_hz;
+	float max_current;
 } pas_config;
 
 // NRF Datatypes

@@ -316,6 +316,7 @@ int32_t confgenerator_serialize_appconf(uint8_t *buffer, const app_configuration
 	buffer_append_float16(buffer, conf->app_pas_conf.ramp_time_pos, 100, &ind);
 	buffer_append_float16(buffer, conf->app_pas_conf.ramp_time_neg, 100, &ind);
 	buffer_append_uint16(buffer, conf->app_pas_conf.update_rate_hz, &ind);
+	buffer_append_float16(buffer, conf->app_pas_conf.max_current, 10, &ind);
 	buffer[ind++] = conf->imu_conf.type;
 	buffer[ind++] = conf->imu_conf.mode;
 	buffer[ind++] = conf->imu_conf.filter;
@@ -659,6 +660,7 @@ bool confgenerator_deserialize_appconf(const uint8_t *buffer, app_configuration 
 	conf->app_pas_conf.ramp_time_pos = buffer_get_float16(buffer, 100, &ind);
 	conf->app_pas_conf.ramp_time_neg = buffer_get_float16(buffer, 100, &ind);
 	conf->app_pas_conf.update_rate_hz = buffer_get_uint16(buffer, &ind);
+	conf->app_pas_conf.max_current = buffer_get_float16(buffer, 10, &ind);
 	conf->imu_conf.type = buffer[ind++];
 	conf->imu_conf.mode = buffer[ind++];
 	conf->imu_conf.filter = buffer[ind++];
@@ -986,6 +988,7 @@ void confgenerator_set_defaults_appconf(app_configuration *conf) {
 	conf->app_pas_conf.ramp_time_pos = APPCONF_PAS_RAMP_TIME_POS;
 	conf->app_pas_conf.ramp_time_neg = APPCONF_PAS_RAMP_TIME_NEG;
 	conf->app_pas_conf.update_rate_hz = APPCONF_PAS_UPDATE_RATE_HZ;
+	conf->app_pas_conf.max_current = APPCONF_PAS_MAX_CURRENT;
 	conf->imu_conf.type = APPCONF_IMU_TYPE;
 	conf->imu_conf.mode = APPCONF_IMU_AHRS_MODE;
 	conf->imu_conf.filter = APPCONF_IMU_FILTER;

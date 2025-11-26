@@ -38,6 +38,18 @@
 #define FILTER_SAMPLES					5
 #define RPM_FILTER_SAMPLES				8
 #define TC_DIFF_MAX_PASS				60  // TODO: move to app_conf
+#define PAS_THROTTLE_IDLE_GATE		0.05f
+#define PAS_FOLLOW_START_ROTATIONS	0.5f
+#define PAS_FOLLOW_IDLE_TIMEOUT_S	0.6f
+#define PAS_FOLLOW_BASE_CURRENT_FRAC	0.2f
+#define PAS_FOLLOW_BASE_RPM_FULL	40.0f
+#define PAS_FOLLOW_KP_A_PER_ERPM	0.01f
+#define PAS_FOLLOW_DEADBAND_ERPM	30.0f
+#define PAS_FOLLOW_TARGET_LEAD	1.02f
+#define PAS_FOLLOW_RAMP_UP_BASE_A_PER_S	5.0f
+#define PAS_FOLLOW_RAMP_UP_FULL_A_PER_S	25.0f
+#define PAS_FOLLOW_RAMP_UP_RISE_TIME_S	2.0f
+#define PAS_FOLLOW_RAMP_DOWN_A_PER_S	60.0f
 
 #define CTRL_USES_BUTTON(ctrl_type)(\
 			ctrl_type == ADC_CTRL_TYPE_CURRENT_REV_BUTTON || \
@@ -79,6 +91,22 @@ static haz_throttle_ctx_t haz_throttle_ctx = {
 };
 
 static float haz_throttle_filtered = 0.0f;
+
+typedef struct {
+	float current_rel_cmd;
+	float rotation_progress;
+	float idle_time;
+	bool engaged;
+	float ramp_elapsed;
+} haz_pas_follow_ctx_t;
+
+static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
+	.current_rel_cmd = 0.0f,
+	.rotation_progress = 0.0f,
+	.idle_time = 0.0f,
+	.engaged = false,
+	.ramp_elapsed = 0.0f
+};
 
 static bool haz_throttle_is_current_ctrl(adc_control_type ctrl) {
 	switch (ctrl) {
@@ -212,6 +240,140 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 	}
 
 	return haz_throttle_ctx.current_rel_cmd;
+}
+
+static void haz_pas_follow_reset(void) {
+	haz_pas_follow_ctx.current_rel_cmd = 0.0f;
+	haz_pas_follow_ctx.rotation_progress = 0.0f;
+	haz_pas_follow_ctx.idle_time = 0.0f;
+	haz_pas_follow_ctx.engaged = false;
+	haz_pas_follow_ctx.ramp_elapsed = 0.0f;
+}
+
+static float haz_pas_follow_process(float dt_s) {
+	const app_configuration *appconf = app_get_configuration();
+	const pas_config *pas_conf = &appconf->app_pas_conf;
+	if (pas_conf->ctrl_type == PAS_CTRL_TYPE_NONE) {
+		haz_pas_follow_reset();
+		return 0.0f;
+	}
+
+	float target_erpm = app_pas_get_target_erpm();
+	float pedal_rpm = app_pas_get_pedal_rpm();
+	if (target_erpm <= 0.0f || pedal_rpm <= 0.1f) {
+		haz_pas_follow_ctx.idle_time += dt_s;
+		if (haz_pas_follow_ctx.idle_time > PAS_FOLLOW_IDLE_TIMEOUT_S) {
+			haz_pas_follow_reset();
+		}
+		return 0.0f;
+	}
+
+	haz_pas_follow_ctx.idle_time = 0.0f;
+	float rotations = (pedal_rpm / 60.0f) * dt_s;
+	haz_pas_follow_ctx.rotation_progress = fminf(haz_pas_follow_ctx.rotation_progress + rotations, PAS_FOLLOW_START_ROTATIONS);
+	if (!haz_pas_follow_ctx.engaged) {
+		if (haz_pas_follow_ctx.rotation_progress >= PAS_FOLLOW_START_ROTATIONS) {
+			haz_pas_follow_ctx.engaged = true;
+		} else {
+			return 0.0f;
+		}
+	}
+
+	const volatile mc_configuration *mcconf = mc_interface_get_configuration();
+	float max_phase_a = fabsf(mcconf->l_current_max);
+	if (max_phase_a < 0.1f) {
+		return 0.0f;
+	}
+
+	float pas_max_current = pas_conf->max_current;
+	float max_current = max_phase_a;
+	if (isfinite(pas_max_current) && pas_max_current > 0.0f) {
+		if (pas_max_current <= 1.0f) {
+			float ratio = pas_max_current;
+			utils_truncate_number(&ratio, 0.0f, 1.0f);
+			max_current = ratio * max_phase_a;
+		} else {
+			max_current = fminf(fabsf(pas_max_current), max_phase_a);
+		}
+	}
+	if (max_current < 1e-3f) {
+		max_current = max_phase_a;
+	}
+
+	float target_erpm_lead = target_erpm * PAS_FOLLOW_TARGET_LEAD;
+	float erpm_now = mc_interface_get_rpm();
+	float erpm_err = target_erpm_lead - erpm_now;
+	if (fabsf(erpm_err) < PAS_FOLLOW_DEADBAND_ERPM) {
+		erpm_err = 0.0f;
+	}
+
+	float trim_current = erpm_err * PAS_FOLLOW_KP_A_PER_ERPM;
+	float base_current = max_current * PAS_FOLLOW_BASE_CURRENT_FRAC;
+	if (pedal_rpm < PAS_FOLLOW_BASE_RPM_FULL) {
+		float scale = pedal_rpm / PAS_FOLLOW_BASE_RPM_FULL;
+		utils_truncate_number(&scale, 0.0f, 1.0f);
+		base_current *= scale;
+	}
+
+	float target_current = base_current + trim_current;
+	utils_truncate_number(&target_current, 0.0f, max_current);
+	float target_rel = target_current / max_phase_a;
+	if (target_rel >= haz_pas_follow_ctx.current_rel_cmd) {
+		haz_pas_follow_ctx.ramp_elapsed += dt_s;
+		if (haz_pas_follow_ctx.ramp_elapsed > PAS_FOLLOW_RAMP_UP_RISE_TIME_S) {
+			haz_pas_follow_ctx.ramp_elapsed = PAS_FOLLOW_RAMP_UP_RISE_TIME_S;
+		}
+	} else {
+		haz_pas_follow_ctx.ramp_elapsed = 0.0f;
+	}
+
+	float ramp_rate = 0.0f;
+	if (target_rel >= haz_pas_follow_ctx.current_rel_cmd) {
+		float ramp_ratio = 1.0f;
+		if (PAS_FOLLOW_RAMP_UP_RISE_TIME_S > 1e-3f) {
+			ramp_ratio = haz_pas_follow_ctx.ramp_elapsed / PAS_FOLLOW_RAMP_UP_RISE_TIME_S;
+		}
+		utils_truncate_number(&ramp_ratio, 0.0f, 1.0f);
+		float ramp_up_a = PAS_FOLLOW_RAMP_UP_BASE_A_PER_S +
+			(PAS_FOLLOW_RAMP_UP_FULL_A_PER_S - PAS_FOLLOW_RAMP_UP_BASE_A_PER_S) * ramp_ratio;
+		ramp_rate = ramp_up_a / max_phase_a;
+	} else {
+		ramp_rate = PAS_FOLLOW_RAMP_DOWN_A_PER_S / max_phase_a;
+	}
+	haz_pas_follow_ctx.current_rel_cmd = haz_throttle_step(
+		haz_pas_follow_ctx.current_rel_cmd,
+		target_rel,
+		ramp_rate,
+		dt_s);
+
+	return haz_pas_follow_ctx.current_rel_cmd;
+}
+
+static bool haz_pas_try_takeover(float *pwr, float *current_rel, float loop_dt) {
+	if (*pwr < 0.0f) {
+		haz_pas_follow_reset();
+		return false;
+	}
+
+	if (!app_pas_is_running()) {
+		haz_pas_follow_reset();
+		return false;
+	}
+
+	if (fabsf(*pwr) < PAS_THROTTLE_IDLE_GATE) {
+		float pas_rel = haz_pas_follow_process(loop_dt);
+		if (pas_rel > 0.0f) {
+			*pwr = pas_rel;
+			if (current_rel) {
+				*current_rel = pas_rel;
+			}
+			return true;
+		}
+		return false;
+	}
+
+	haz_pas_follow_reset();
+	return false;
 }
 
 void app_adc_configure(adc_config *conf) {
@@ -540,7 +702,14 @@ static THD_FUNCTION(adc_thread, arg) {
 		case ADC_CTRL_TYPE_CURRENT_REV_CENTER:
 		case ADC_CTRL_TYPE_CURRENT_REV_BUTTON:
 			current_mode = true;
-			current_rel = pwr;
+			if (pwr >= 0.0f) {
+				if (!haz_pas_try_takeover(&pwr, &current_rel, loop_dt)) {
+					current_rel = pwr;
+				}
+			} else {
+				haz_pas_follow_reset();
+				current_rel = pwr;
+			}
 
 			if (fabsf(pwr) < 0.001) {
 				ms_without_power += (1000.0 * (float)sleep_time) / (float)CH_CFG_ST_FREQUENCY;
@@ -553,13 +722,12 @@ static THD_FUNCTION(adc_thread, arg) {
 		case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_ADC:
 		case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_ADC:
 			current_mode = true;
-			if (pwr >= 0.0) {
-				// if pedal assist (PAS) thread is running, use the highest current command
-				if (app_pas_is_running()) {
-					pwr = utils_max_abs(pwr, app_pas_get_current_target_rel());
+			if (pwr >= 0.0f) {
+				if (!haz_pas_try_takeover(&pwr, &current_rel, loop_dt)) {
+					current_rel = pwr;
 				}
-				current_rel = pwr;
 			} else {
+				haz_pas_follow_reset();
 				current_rel = fabsf(pwr);
 				current_mode_brake = true;
 			}
