@@ -50,8 +50,9 @@
 #define PAS_BOOST_MAX_FRACTION	0.6f
 #define PAS_BOOST_MIN_CADENCE_RPM	20.0f
 
-#define PAS_REAL_STEP_WINDOW		0.2f
-#define PAS_REAL_STEP_WINDOW_MAX	1.6f
+#define PAS_REAL_STEP_WINDOW		0.08f
+#define PAS_REAL_STEP_WINDOW_MAX	0.8f
+#define PAS_STEP_WINDOW_MULT		1.5f
 #define PAS_STARTUP_DETECT_RPM_DEFAULT	20.0f
 #define PAS_STOP_TIMEOUT		0.5f
 
@@ -68,7 +69,7 @@
 #define PAS_ERPM_STEP_THRESHOLD	6000.0f
 #define PAS_CADENCE_MIN_ACTIVE		0.5f
 #define PAS_STATIC_CADENCE_RPM_END	400.0f
-#define PAS_STARTUP_ASSIST_WINDOW	0.8f
+#define PAS_STARTUP_ASSIST_WINDOW	0.35f
 #define PAS_STARTUP_ASSIST_RPM_MIN	6.0f
 #define PAS_STARTUP_ASSIST_RPM_MAX	35.0f
 #define PAS_STARTUP_SEED_RPM_MIN	3.0f
@@ -480,7 +481,7 @@ void app_pas_configure(pas_config *conf) {
 		est_event_period = PAS_REAL_STEP_WINDOW_MAX;
 	}
 
-	float step_window = est_event_period * 3.0f;
+	float step_window = est_event_period * PAS_STEP_WINDOW_MULT;
 	if (!isfinite(step_window) || step_window <= 0.0f) {
 		step_window = PAS_REAL_STEP_WINDOW_MAX;
 	}

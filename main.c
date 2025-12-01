@@ -370,25 +370,33 @@ int main(void) {
 
 static bool detect_offroad_mode_on_boot(void) {
 #ifdef HW_SAMPLE_SHUTDOWN
-	chThdSleepMilliseconds(100);
-	if (!HW_SAMPLE_SHUTDOWN()) {
-		return false;
-	}
+    chThdSleepMilliseconds(100);
+    // Check if button is pressed (assuming Active Low logic where !HW_SAMPLE_SHUTDOWN is true when pressed)
+    bool pressed_now = !HW_SAMPLE_SHUTDOWN();
+    
+    // If NOT pressed immediately (Tap), return FALSE (Street Mode)
+    if (!pressed_now) {
+        return false;
+    }
 
-	const int hold_ms = 5000;
-	const int step_ms = 10;
-	int elapsed = 0;
-	while (elapsed < hold_ms) {
-		chThdSleepMilliseconds(step_ms);
-		elapsed += step_ms;
-		if (!HW_SAMPLE_SHUTDOWN()) {
-			return false;
-		}
-	}
+    const int hold_ms = 5000;
+    const int step_ms = 10;
+    int elapsed = 0;
+    while (elapsed < hold_ms) {
+        chThdSleepMilliseconds(step_ms);
+        elapsed += step_ms;
+        pressed_now = !HW_SAMPLE_SHUTDOWN();
+        
+        // If released during the 5s loop (Tap), return FALSE (Street Mode)
+        if (!pressed_now) {
+            return false;
+        }
+    }
 
-	return true;
+    // Held for full 5s -> Return TRUE (Offroad Mode)
+    return true;
 #else
-	return false;
+    return false;
 #endif
 }
 
