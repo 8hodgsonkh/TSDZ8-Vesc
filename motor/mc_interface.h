@@ -97,6 +97,10 @@ float mc_interface_get_speed(void);
 float mc_interface_get_distance(void);
 float mc_interface_get_distance_abs(void);
 void mc_interface_override_wheel_speed(bool ovr, float speed);
+float mc_get_active_erpm_limit(void);
+void mc_interface_set_offroad_mode(bool enabled);
+bool mc_interface_is_offroad_mode(void);
+void mc_interface_set_throttle_limit_active(bool active);
 
 setup_values mc_interface_get_setup_values(void);
 volatile gnss_data *mc_interface_gnss(void);
@@ -133,7 +137,7 @@ void mc_interface_stat_reset(void);
 void mc_interface_set_fault_info(const char *str, int argn, float arg0, float arg1);
 void mc_interface_fault_stop(mc_fault_code fault, bool is_second_motor, bool is_isr);
 int mc_interface_try_input(void);
-void mc_interface_mc_timer_isr(bool is_second_motor);
+void mc_interface_mc_timer_isr(bool is_second_motor, float dt);
 
 // Interrupt handlers
 void mc_interface_adc_inj_int_handler(void);

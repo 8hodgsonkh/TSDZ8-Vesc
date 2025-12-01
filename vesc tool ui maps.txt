@@ -2,9 +2,9 @@ VESC Tool UI reuse notes
 ========================
 
 1. Pedelec → "Pedal RPM End" slider
-   - Default behaviour: top cadence limit.
-   - Single-pin PAS mode: treated as drive gear ratio.
-   - Firmware: `app_pas.c::pas_get_drive_reduction` reads `app_pas_conf.pedal_rpm_end` and multiplies cadence by this value before converting to ERPM.
+   - Default behaviour: top cadence limit (now fixed to 180 rpm in firmware).
+   - All PAS sensor types: slider value is treated as the drivetrain gear reduction.
+   - Firmware: `app_pas.c::pas_get_drive_reduction` reads `app_pas_conf.pedal_rpm_end` and multiplies cadence by this value before converting to ERPM. `pas_refresh_effective_rpm_end` keeps a static cadence ceiling so the UI field is free for the ratio.
 
 2. Pedelec → "PAS Max Current" slider (0–1 or >1)
    - Firmware: `app_adc.c::haz_pas_follow_process` interprets values ≤1.00 as a percentage of `l_current_max`, values >1.00 as absolute phase amps.

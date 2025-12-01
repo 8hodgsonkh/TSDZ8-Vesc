@@ -92,6 +92,9 @@ static THD_WORKING_AREA(periodic_thread_wa, 256);
 static THD_WORKING_AREA(led_thread_wa, 256);
 static THD_WORKING_AREA(flash_integrity_check_thread_wa, 256);
 static volatile bool m_init_done = false;
+static bool boot_offroad_mode = false;
+
+static bool detect_offroad_mode_on_boot(void);
 
 static THD_FUNCTION(flash_integrity_check_thread, arg) {
 	(void)arg;
@@ -287,6 +290,8 @@ int main(void) {
 
 	ledpwm_init();
 	mc_interface_init();
+	boot_offroad_mode = detect_offroad_mode_on_boot();
+	mc_interface_set_offroad_mode(boot_offroad_mode);
 
 	commands_init();
 
@@ -361,6 +366,30 @@ int main(void) {
 	for(;;) {
 		chThdSleepMilliseconds(10);
 	}
+}
+
+static bool detect_offroad_mode_on_boot(void) {
+#ifdef HW_SAMPLE_SHUTDOWN
+	chThdSleepMilliseconds(100);
+	if (!HW_SAMPLE_SHUTDOWN()) {
+		return false;
+	}
+
+	const int hold_ms = 5000;
+	const int step_ms = 10;
+	int elapsed = 0;
+	while (elapsed < hold_ms) {
+		chThdSleepMilliseconds(step_ms);
+		elapsed += step_ms;
+		if (!HW_SAMPLE_SHUTDOWN()) {
+			return false;
+		}
+	}
+
+	return true;
+#else
+	return false;
+#endif
 }
 
 void main_stop_motor_and_reset(void) {

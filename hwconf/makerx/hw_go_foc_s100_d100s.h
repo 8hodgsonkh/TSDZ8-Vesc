@@ -86,6 +86,9 @@
 #define HW_ADC_INJ_CHANNELS		3
 #define HW_ADC_NBR_CONV			6
 
+// When defined, ADC_EXT2/PA6 is repurposed as a digital PAS input.
+#define HW_USE_PAS2_DIGITAL_EXT2
+
 // ADC Indexes
 #define ADC_IND_SENS1			0
 #define ADC_IND_SENS2			1
@@ -95,7 +98,9 @@
 #define ADC_IND_CURR3			5
 #define ADC_IND_VIN_SENS		11
 #define ADC_IND_EXT				6
+#ifndef HW_USE_PAS2_DIGITAL_EXT2
 #define ADC_IND_EXT2			7
+#endif
 //#define ADC_IND_EXT3			10
 #define ADC_IND_TEMP_MOS		8
 #define ADC_IND_TEMP_MOS_2		15
@@ -145,6 +150,12 @@
 #define HW_ADC_EXT_PIN			5
 #define HW_ADC_EXT2_GPIO		GPIOA
 #define HW_ADC_EXT2_PIN			6
+
+// Dual-channel PAS (SPED_A/B)
+#define HW_PAS1_PORT		GPIOB
+#define HW_PAS1_PIN		6
+#define HW_PAS2_PORT		GPIOA
+#define HW_PAS2_PIN		6
 
 // UART Peripheral
 #define HW_UART_DEV				SD3

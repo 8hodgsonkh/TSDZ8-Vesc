@@ -394,6 +394,8 @@ typedef struct {
 	float l_abs_current_max;
 	float l_min_erpm;
 	float l_max_erpm;
+	float l_max_erpm_pas;
+	float l_max_erpm_throttle;
 	float l_erpm_start;
 	float l_max_erpm_fbrake;
 	float l_max_erpm_fbrake_cc;

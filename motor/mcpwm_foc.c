@@ -51,6 +51,9 @@ static volatile motor_all_state_t m_motor_1;
 static volatile motor_all_state_t m_motor_2;
 #endif
 static volatile int m_isr_motor = 0;
+#ifdef FOC_PROFILE_EN
+foc_profile g_foc_profile;
+#endif
 
 // Private functions
 static void control_current(motor_all_state_t *motor, float dt);
@@ -2850,6 +2853,9 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	uint32_t t_start = timer_time_now();
 
 	bool is_v7 = !(TIM1->CR1 & TIM_CR1_DIR);
+
+	FOC_PROFILE_BEGIN();
+	FOC_PROFILE_LINE();
 	bool is_second_motor = false;
 	int norm_curr_ofs = 0;
 
@@ -2876,6 +2882,10 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	mc_configuration *conf_other = motor_other->m_conf;
 
 	bool skip_interpolation = motor_other->m_cc_was_hfi;
+
+	FOC_PROFILE_LINE_FINE();
+
+	FOC_PROFILE_LINE_FINE();
 
 	// Update modulation for V7 and collect current samples. This is used by the HFI.
 	if (motor_other->m_duty_next_set) {
@@ -2908,6 +2918,8 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		motor_other->m_i_beta_sample_next = ONE_BY_SQRT3 * curr0 + TWO_BY_SQRT3 * curr1;
 	}
 
+	FOC_PROFILE_LINE_FINE();
+
 	bool do_return = false;
 
 #ifndef HW_HAS_DUAL_MOTORS
@@ -2922,19 +2934,13 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 #endif
 #endif
 
-#ifdef HW_HAS_PHASE_SHUNTS
-	float dt;
-	if (conf_now->foc_control_sample_mode == FOC_CONTROL_SAMPLE_MODE_V0_V7) {
-		dt = 1.0 / conf_now->foc_f_zv;
-	} else {
-		dt = 1.0 / (conf_now->foc_f_zv / 2.0);
-	}
-#else
-	float dt = 1.0 / (conf_now->foc_f_zv / 2.0);
-#endif
+	FOC_PROFILE_LINE_FINE();
+
+	float dt = motor_now->p_dt;
 
 	if (conf_other->foc_control_sample_mode == FOC_CONTROL_SAMPLE_MODE_V0_V7_INTERPOL && !skip_interpolation) {
-		float interpolated_phase = motor_other->m_motor_state.phase + motor_other->m_speed_est_fast * dt * 0.5;
+		const float dt_other = motor_other->p_dt;
+		float interpolated_phase = motor_other->m_motor_state.phase + motor_other->m_speed_est_fast * dt_other * 0.5;
 		utils_norm_angle_rad(&interpolated_phase);
 
 		float s, c;
@@ -2968,6 +2974,7 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	}
 
 	if (do_return) {
+		FOC_PROFILE_LINE_FINE();
 		return;
 	}
 
@@ -2985,8 +2992,11 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	dt *= (float)FOC_CONTROL_LOOP_FREQ_DIVIDER;
 #endif
 
+	FOC_PROFILE_LINE();
+
 	// Reset the watchdog
 	timeout_feed_WDT(THREAD_MCPWM);
+	FOC_PROFILE_LINE_FINE();
 
 #ifdef AD2S1205_SAMPLE_GPIO
 	// force a position sample in the AD2S1205 resolver IC (falling edge)
@@ -3213,6 +3223,7 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	ADC_curr_norm_value[0 + norm_curr_ofs] = curr0;
 	ADC_curr_norm_value[1 + norm_curr_ofs] = curr1;
 	ADC_curr_norm_value[2 + norm_curr_ofs] = curr2;
+	FOC_PROFILE_LINE_FINE();
 	
 	float ia = curr0;
 	float ib = curr1;
@@ -3721,6 +3732,8 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		utils_truncate_number_abs((float*)&motor_now->m_motor_state.mod_q_filter, 1.0);
 	}
 
+	FOC_PROFILE_LINE();
+
 	// Calculate duty cycle
 	motor_now->m_motor_state.duty_now = SIGN(motor_now->m_motor_state.vq) *
 			NORM2_f(motor_now->m_motor_state.mod_d, motor_now->m_motor_state.mod_q) *
@@ -3816,11 +3829,13 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	palSetPad(AD2S1205_SAMPLE_GPIO, AD2S1205_SAMPLE_PIN);
 #endif
 
+	FOC_PROFILE_LINE();
 #ifdef HW_HAS_DUAL_MOTORS
-	mc_interface_mc_timer_isr(is_second_motor);
+	mc_interface_mc_timer_isr(is_second_motor, dt);
 #else
-	mc_interface_mc_timer_isr(false);
+	mc_interface_mc_timer_isr(false, dt);
 #endif
+	FOC_PROFILE_LINE();
 
 	m_isr_motor = 0;
 	m_last_adc_isr_duration = timer_seconds_elapsed_since(t_start);

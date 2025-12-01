@@ -32,6 +32,8 @@
 #include "hw.h"
 #include "timer.h"
 #include <math.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 // Settings
 #define PEDAL_INPUT_TIMEOUT				0.2
@@ -40,7 +42,40 @@
 #define MIN_MS_WITHOUT_POWER			500
 #define FILTER_SAMPLES					5
 #define RPM_FILTER_SAMPLES				8
+#define PAS_BOOST_CADENCE_TC		0.1f
+#define PAS_BOOST_INTENT_THRESHOLD	1.0f
+#define PAS_BOOST_INTENT_STRONG	40.0f
+#define PAS_BOOST_RISE_TC		0.08f
+#define PAS_BOOST_FALL_TC		0.25f
+#define PAS_BOOST_MAX_FRACTION	0.6f
+#define PAS_BOOST_MIN_CADENCE_RPM	20.0f
 
+#define PAS_REAL_STEP_WINDOW		0.2f
+#define PAS_REAL_STEP_WINDOW_MAX	1.6f
+#define PAS_STARTUP_DETECT_RPM_DEFAULT	20.0f
+#define PAS_STOP_TIMEOUT		0.5f
+
+// Local-only PAS -> ERPM tracking knobs (not exposed via appconf)
+#define PAS_ERPM_PER_RPM		100.0f
+#define PAS_ERPM_BASE_MAX		9000.0f
+#define PAS_ERPM_DELTA_THRESHOLD	2.0f
+#define PAS_ERPM_BOOST_GAIN		50.0f
+#define PAS_ERPM_BOOST_MAX		2000.0f
+#define PAS_ERPM_BOOST_DECAY		0.95f
+#define PAS_ERPM_STEP_LIMIT_RISE_LOW	3000.0f
+#define PAS_ERPM_STEP_LIMIT_RISE_HIGH	25000.0f
+#define PAS_ERPM_STEP_LIMIT_FALL	40000.0f
+#define PAS_ERPM_STEP_THRESHOLD	6000.0f
+#define PAS_CADENCE_MIN_ACTIVE		0.5f
+#define PAS_STATIC_CADENCE_RPM_END	400.0f
+#define PAS_STARTUP_ASSIST_WINDOW	0.8f
+#define PAS_STARTUP_ASSIST_RPM_MIN	6.0f
+#define PAS_STARTUP_ASSIST_RPM_MAX	35.0f
+#define PAS_STARTUP_SEED_RPM_MIN	3.0f
+#define PAS_STARTUP_SEED_RPM_SCALE	0.4f
+#define PAS_ERPM_OVERBOOST_RATIO_CAP	1.35f
+#define PAS_ERPM_OVERBOOST_ABS_MAX	1200.0f
+#define PAS_ERPM_CADENCE_CAP_MARGIN	800.0f
 // Threads
 static THD_FUNCTION(pas_thread, arg);
 __attribute__((section(".ram4"))) static THD_WORKING_AREA(pas_thread_wa, 512);
@@ -48,6 +83,13 @@ static void pas_sensor_update(float loop_dt);
 static void pas_sensor_update_quadrature(float loop_dt);
 static void pas_sensor_update_single(float loop_dt);
 static void pas_single_exti_enable(bool enable);
+static float pas_get_idle_timeout_limit(void);
+static void pas_speed_state_reset(bool instant_zero);
+static void pas_speed_target_update(float loop_dt, bool force_idle_now);
+static void pas_startup_assist_trigger(void);
+static float pas_get_startup_assist_rpm(void);
+static float pas_get_seeded_start_rpm(void);
+static float pas_get_reported_cadence(float measured);
 
 // Private variables
 static volatile pas_config config;
@@ -63,6 +105,30 @@ static volatile bool stop_now = true;
 static volatile bool is_running = false;
 static volatile float torque_ratio = 0.0;
 static volatile float pas_rpm_end_effective = 0.0f;
+static volatile float pas_base_erpm = 0.0f;
+static volatile float pas_erpm_boost_offset = 0.0f;
+static volatile float pas_erpm_target_filtered = 0.0f;
+static volatile float pas_erpm_target_raw = 0.0f;
+static float pas_cadence_rpm_prev = 0.0f;
+static float pas_startup_assist_timer = 0.0f;
+static float pas_start_rpm_config = PAS_STARTUP_DETECT_RPM_DEFAULT;
+#if defined(HW_PAS1_PORT) && defined(HW_PAS1_PIN)
+static volatile int pas_dbg_a_level = 0;
+#else
+static volatile int pas_dbg_a_level = -1;
+#endif
+#if defined(HW_PAS2_PORT) && defined(HW_PAS2_PIN)
+static volatile int pas_dbg_b_level = 0;
+#else
+static volatile int pas_dbg_b_level = -1;
+#endif
+static float pas_boost_cadence_smooth = 0.0f;
+static float pas_boost_state = 0.0f;
+static bool pas_boost_initialized = false;
+static volatile bool pas_force_idle = true;
+static volatile uint32_t pas_step_count = 0;
+static volatile float pas_time_last_real_step = 0.0f;
+static volatile float pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
 #if defined(HW_PAS_PPM_EXTI_LINE)
 typedef struct {
 	volatile uint32_t last_edge_time;
@@ -78,27 +144,60 @@ static volatile pas_ppm_single_state_t ppm_pas_state = {
 	.exti_enabled = false
 };
 #endif
+static float pas_boost_compute_scale(float cadence_rpm, float loop_dt, bool enable);
 
 static volatile float pas_target_erpm = 0.0f;
+static float pas_step_window_config = PAS_REAL_STEP_WINDOW;
 
-static float pas_default_cadence_rpm_end(void) {
-#ifdef APPCONF_PAS_PEDAL_RPM_END
-	return APPCONF_PAS_PEDAL_RPM_END;
-#else
-	return 180.0f;
-#endif
+typedef struct {
+	uint8_t last_state;
+	uint8_t ref_state;
+	float last_ref_timestamp;
+	float event_period;
+	float idle_time;
+	bool has_period;
+	bool seeded_start;
+} pas_quadrature_state_t;
+
+static pas_quadrature_state_t pas_quad_state = {
+	.last_state = 0xFF,
+	.ref_state = 0xFF,
+	.last_ref_timestamp = 0.0f,
+	.event_period = 0.0f,
+	.idle_time = 0.0f,
+	.has_period = false,
+	.seeded_start = false
+};
+
+static void pas_quadrature_reset_state(void) {
+	pas_quad_state.last_state = 0xFF;
+	pas_quad_state.ref_state = 0xFF;
+	pas_quad_state.last_ref_timestamp = 0.0f;
+	pas_quad_state.event_period = 0.0f;
+	pas_quad_state.idle_time = 0.0f;
+	pas_quad_state.has_period = false;
+	pas_quad_state.seeded_start = false;
+}
+
+static float pas_get_idle_timeout_limit(void) {
+	float limit = PAS_STOP_TIMEOUT;
+	if (pas_force_idle) {
+		float extended = fmaxf(limit, pas_step_window_config);
+		utils_truncate_number(&extended, PAS_STOP_TIMEOUT, PAS_REAL_STEP_WINDOW_MAX);
+		limit = extended;
+	}
+	return limit;
 }
 
 static void pas_refresh_effective_rpm_end(void) {
-	float rpm_end = config.pedal_rpm_end;
-	if (config.sensor_type == PAS_SENSOR_TYPE_SINGLE_PIN_PPM) {
-		rpm_end = pas_default_cadence_rpm_end();
+	float rpm_end = PAS_STATIC_CADENCE_RPM_END;
+	if (!isfinite(rpm_end) || rpm_end <= 0.0f) {
+		rpm_end = PAS_STATIC_CADENCE_RPM_END;
 	}
-
-	if (!isfinite(rpm_end) || rpm_end < (config.pedal_rpm_start + 1.0f)) {
-		rpm_end = config.pedal_rpm_start + 1.0f;
+	float guard = pas_start_rpm_config + 1.0f;
+	if (rpm_end < guard) {
+		rpm_end = guard;
 	}
-
 	pas_rpm_end_effective = rpm_end;
 }
 
@@ -109,18 +208,10 @@ static float pas_get_assist_ceiling(void) {
 	return config.current_scaling;
 }
 
-#if defined(HW_PAS_PPM_EXTI_LINE)
 static float pas_get_drive_reduction(void) {
-	float ratio = config.current_scaling;
-	if (config.sensor_type == PAS_SENSOR_TYPE_SINGLE_PIN_PPM) {
-		ratio = config.pedal_rpm_end;
-		if (!isfinite(ratio) || ratio < 1.0f) {
-			ratio = 1.0f;
-		}
-	} else {
-		if (!isfinite(ratio) || ratio <= 0.0f) {
-			ratio = 1.0f;
-		}
+	float ratio = config.pedal_rpm_end;
+	if (!isfinite(ratio) || ratio <= 0.0f) {
+		ratio = 1.0f;
 	}
 	return ratio;
 }
@@ -137,16 +228,145 @@ static float pas_get_motor_pole_pairs(void) {
 	return ((float)poles) * 0.5f;
 }
 
-static void pas_set_target_erpm(float pedal_rpm_target) {
-	float target = pedal_rpm_target * pas_get_drive_reduction() * pas_get_motor_pole_pairs();
-	pas_target_erpm = target;
+static float pas_get_max_pas_erpm(void) {
+	float max_erpm = mc_get_active_erpm_limit();
+	if (!isfinite(max_erpm) || max_erpm <= 0.0f) {
+		max_erpm = PAS_ERPM_BASE_MAX;
+	}
+	if (!isfinite(max_erpm) || max_erpm <= 0.0f) {
+		max_erpm = PAS_ERPM_BASE_MAX;
+	}
+	return max_erpm;
 }
-#else
-static void pas_set_target_erpm(float pedal_rpm_target) {
-	(void)pedal_rpm_target;
-	pas_target_erpm = 0.0f;
+
+static void pas_startup_assist_trigger(void) {
+	pas_startup_assist_timer = PAS_STARTUP_ASSIST_WINDOW;
 }
-#endif
+
+static float pas_get_startup_assist_rpm(void) {
+	float rpm = pas_start_rpm_config;
+	if (!isfinite(rpm) || rpm <= 0.0f) {
+		rpm = PAS_STARTUP_DETECT_RPM_DEFAULT;
+	}
+	utils_truncate_number(&rpm, PAS_STARTUP_ASSIST_RPM_MIN, PAS_STARTUP_ASSIST_RPM_MAX);
+	return rpm;
+}
+
+static float pas_get_seeded_start_rpm(void) {
+	float rpm = pas_start_rpm_config * PAS_STARTUP_SEED_RPM_SCALE;
+	if (!isfinite(rpm) || rpm <= 0.0f) {
+		rpm = PAS_STARTUP_ASSIST_RPM_MIN;
+	}
+	float max_seed = pas_get_startup_assist_rpm();
+	utils_truncate_number(&rpm, PAS_STARTUP_SEED_RPM_MIN, max_seed);
+	return rpm;
+}
+
+static float pas_get_reported_cadence(float measured) {
+	if (pas_startup_assist_timer > 0.0f) {
+		float assist_rpm = pas_get_startup_assist_rpm();
+		if (assist_rpm > measured) {
+			return assist_rpm;
+		}
+	}
+	return measured;
+}
+
+static void pas_speed_state_reset(bool instant_zero) {
+	pas_base_erpm = 0.0f;
+	pas_erpm_boost_offset = 0.0f;
+	pas_erpm_target_raw = 0.0f;
+	if (instant_zero) {
+		pas_erpm_target_filtered = 0.0f;
+	}
+	pas_target_erpm = pas_erpm_target_filtered;
+	pas_cadence_rpm_prev = pedal_rpm;
+}
+
+static void pas_speed_target_update(float loop_dt, bool force_idle_now) {
+	float safe_dt = fmaxf(loop_dt, 1e-4f);
+	float erpm_ceiling = pas_get_max_pas_erpm();
+
+	if (pas_startup_assist_timer > 0.0f) {
+		pas_startup_assist_timer = fmaxf(0.0f, pas_startup_assist_timer - safe_dt);
+	}
+
+	if (force_idle_now) {
+		pas_startup_assist_timer = 0.0f;
+		pas_speed_state_reset(true);
+		return;
+	}
+
+	float cadence_measured = pedal_rpm;
+	if (!isfinite(cadence_measured) || cadence_measured < PAS_CADENCE_MIN_ACTIVE) {
+		cadence_measured = 0.0f;
+	}
+	if (pas_startup_assist_timer > 0.0f && cadence_measured >= pas_start_rpm_config) {
+		pas_startup_assist_timer = 0.0f;
+	}
+	float cadence_for_drive = cadence_measured;
+	if (pas_startup_assist_timer > 0.0f) {
+		float assist_rpm = pas_get_startup_assist_rpm();
+		if (cadence_for_drive < assist_rpm) {
+			cadence_for_drive = assist_rpm;
+		}
+	}
+
+	if (cadence_for_drive < PAS_CADENCE_MIN_ACTIVE) {
+		pas_base_erpm = 0.0f;
+		pas_erpm_boost_offset *= PAS_ERPM_BOOST_DECAY;
+		pas_erpm_target_raw = 0.0f;
+	} else {
+		float gear_ratio = pas_get_drive_reduction();
+		float pole_pairs = pas_get_motor_pole_pairs();
+		float base_target = cadence_for_drive * gear_ratio * pole_pairs;
+		utils_truncate_number(&base_target, 0.0f, erpm_ceiling);
+		pas_base_erpm = base_target;
+
+		float cadence_delta = cadence_measured - pas_cadence_rpm_prev;
+		float erpm_delta = cadence_delta * PAS_ERPM_PER_RPM;
+		float boost = pas_erpm_boost_offset * PAS_ERPM_BOOST_DECAY;
+		if (erpm_delta > PAS_ERPM_DELTA_THRESHOLD) {
+			boost += erpm_delta * PAS_ERPM_BOOST_GAIN;
+		}
+		utils_truncate_number(&boost, 0.0f, PAS_ERPM_BOOST_MAX);
+		pas_erpm_boost_offset = boost;
+		pas_cadence_rpm_prev = cadence_measured;
+
+		pas_erpm_target_raw = base_target + boost;
+		if (base_target > 1e-3f) {
+			float ratio_cap = base_target * PAS_ERPM_OVERBOOST_RATIO_CAP;
+			float abs_cap = base_target + PAS_ERPM_OVERBOOST_ABS_MAX;
+			float margin_cap = base_target + PAS_ERPM_CADENCE_CAP_MARGIN;
+			float target_limit = fminf(ratio_cap, abs_cap);
+			target_limit = fminf(target_limit, margin_cap);
+			if (pas_erpm_target_raw > target_limit) {
+				pas_erpm_target_raw = target_limit;
+			}
+			float new_boost = pas_erpm_target_raw - base_target;
+			utils_truncate_number(&new_boost, 0.0f, PAS_ERPM_BOOST_MAX);
+			pas_erpm_boost_offset = new_boost;
+		}
+	}
+	float target_clamped = pas_erpm_target_raw;
+	utils_truncate_number(&target_clamped, 0.0f, erpm_ceiling);
+	pas_erpm_target_raw = target_clamped;
+
+	float target_delta = pas_erpm_target_raw - pas_erpm_target_filtered;
+	float erpm_slew_state = fmaxf(pas_erpm_target_raw, pas_erpm_target_filtered);
+	bool allow_high_slew = erpm_slew_state >= PAS_ERPM_STEP_THRESHOLD;
+	float step_per_sec;
+	if (target_delta >= 0.0f) {
+		step_per_sec = allow_high_slew ? PAS_ERPM_STEP_LIMIT_RISE_HIGH : PAS_ERPM_STEP_LIMIT_RISE_LOW;
+	} else {
+		step_per_sec = PAS_ERPM_STEP_LIMIT_FALL;
+	}
+	float step_limit = step_per_sec * safe_dt;
+	float filtered = pas_erpm_target_filtered;
+	utils_step_towards(&filtered, pas_erpm_target_raw, step_limit);
+	pas_erpm_target_filtered = filtered;
+	pas_target_erpm = pas_erpm_target_filtered;
+}
 
 static void pas_single_exti_enable(bool enable) {
 #if defined(HW_PAS_PPM_EXTI_LINE)
@@ -216,11 +436,7 @@ void app_pas_pas_irq_handler(void) {
 			return;
 		}
 
-		if (!ppm_pas_state.period_valid || !config.use_filter) {
-			ppm_pas_state.revolution_period = pedal_period;
-		} else {
-			UTILS_LP_FAST(ppm_pas_state.revolution_period, pedal_period, 0.2f);
-		}
+		ppm_pas_state.revolution_period = pedal_period;
 
 		ppm_pas_state.period_valid = true;
 	}
@@ -237,15 +453,53 @@ void app_pas_pas_irq_handler(void) {
  */
 void app_pas_configure(pas_config *conf) {
 	config = *conf;
+	config.use_filter = false;
 	ms_without_power = 0.0;
 	output_current_rel = 0.0;
 	pas_refresh_effective_rpm_end();
 
+	float pulses_per_rev = fmaxf(1.0f, (float)config.magnets);
+	// Use the existing pedal_rpm_start slider as the user-facing knob for
+	// startup detection sensitivity so we stay compatible with older VESC Tool builds.
+	float start_rpm = config.pedal_rpm_start;
+	if (!isfinite(start_rpm) || start_rpm <= 0.1f) {
+		start_rpm = PAS_STARTUP_DETECT_RPM_DEFAULT;
+	}
+	start_rpm = fmaxf(start_rpm, 1.0f);
+	float detect_rpm = start_rpm;
+	if (!isfinite(detect_rpm) || detect_rpm <= 0.1f) {
+		detect_rpm = PAS_STARTUP_DETECT_RPM_DEFAULT;
+	}
+	utils_truncate_number(&detect_rpm, 1.0f, pas_rpm_end_effective);
+	pas_start_rpm_config = detect_rpm;
+	pas_refresh_effective_rpm_end();
+	float detect_rps = detect_rpm / 60.0f;
+	float edge_rate = detect_rps * pulses_per_rev;
+	float est_event_period = (edge_rate > 1e-4f) ? (1.0f / edge_rate) : PAS_REAL_STEP_WINDOW_MAX;
+	if (!isfinite(est_event_period) || est_event_period <= 0.0f) {
+		est_event_period = PAS_REAL_STEP_WINDOW_MAX;
+	}
+
+	float step_window = est_event_period * 3.0f;
+	if (!isfinite(step_window) || step_window <= 0.0f) {
+		step_window = PAS_REAL_STEP_WINDOW_MAX;
+	}
+	utils_truncate_number(&step_window, PAS_REAL_STEP_WINDOW, PAS_REAL_STEP_WINDOW_MAX);
+	pas_step_window_config = step_window;
+
 	// a period longer than this should immediately reduce power to zero
-	max_pulse_period = 1.0 / ((config.pedal_rpm_start / 60.0) * config.magnets) * 1.2;
+	max_pulse_period = est_event_period * 1.2f;
+	if (!isfinite(max_pulse_period) || max_pulse_period <= 0.0f) {
+		max_pulse_period = PAS_REAL_STEP_WINDOW_MAX;
+	}
 
 	// if pedal spins at x3 the end rpm, assume its beyond limits
-	min_pedal_period = 1.0 / ((pas_rpm_end_effective * 3.0 / 60.0));
+	float rpm_end_safe = fmaxf(pas_rpm_end_effective, start_rpm + 1.0f);
+	float min_period_denom = (rpm_end_safe * 3.0f) / 60.0f;
+	if (min_period_denom <= 1e-4f) {
+		min_period_denom = 1e-4f;
+	}
+	min_pedal_period = 1.0f / min_period_denom;
 
 	(config.invert_pedal_direction) ? (direction_conf = -1.0) : (direction_conf = 1.0);
 
@@ -254,6 +508,16 @@ void app_pas_configure(pas_config *conf) {
 	ppm_pas_state.revolution_period = 0.0f;
 	ppm_pas_state.last_edge_time = timer_time_now();
 #endif
+	pas_step_count = 0;
+	pas_time_last_real_step = 0.0f;
+	pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
+	pas_quadrature_reset_state();
+	pas_speed_state_reset(true);
+	pas_force_idle = true;
+	pas_boost_state = 0.0f;
+	pas_boost_initialized = false;
+	pas_startup_assist_timer = 0.0f;
+	pedal_rpm = 0.0f;
 }
 
 /**
@@ -294,6 +558,13 @@ void app_pas_stop(void) {
 	else {
 		output_current_rel = 0.0;
 	}
+	pas_quadrature_reset_state();
+	pedal_rpm = 0.0f;
+	pas_speed_state_reset(true);
+	pas_force_idle = true;
+	pas_boost_state = 0.0f;
+	pas_boost_initialized = false;
+	pas_startup_assist_timer = 0.0f;
 }
 
 void app_pas_set_current_sub_scaling(float current_sub_scaling) {
@@ -312,60 +583,162 @@ float app_pas_get_target_erpm(void) {
 	return pas_target_erpm;
 }
 
+float app_pas_get_target_erpm_base(void) {
+	return pas_base_erpm;
+}
+
+float app_pas_get_target_erpm_boost(void) {
+	return pas_erpm_boost_offset;
+}
+
+int app_pas_get_pas2_level(void) {
+	return pas_dbg_b_level;
+}
+
+int app_pas_get_pas1_level(void) {
+	return pas_dbg_a_level;
+}
+
+uint32_t app_pas_get_step_count(void) {
+	return pas_step_count;
+}
+
+float app_pas_get_time_since_real_step(void) {
+	return pas_time_since_last_real_step;
+}
+
+bool app_pas_is_forced_idle(void) {
+	return pas_force_idle;
+}
+
 static void pas_sensor_update_quadrature(float loop_dt) {
-#ifdef HW_PAS1_PORT
-	const int8_t QEM[] = {0,-1,1,2,1,0,2,-1,-1,2,0,1,2,1,-1,0}; // Quadrature Encoder Matrix
-	int8_t direction_qem;
-	uint8_t new_state;
-	static uint8_t old_state = 0;
-	static float old_timestamp = 0;
-	static float inactivity_time = 0;
-	static float period_filtered = 0;
-	static int32_t correct_direction_counter = 0;
+#if defined(HW_PAS1_PORT) && defined(HW_PAS2_PORT)
+	const int8_t QEM[] = {0,-1,1,2,1,0,2,-1,-1,2,0,1,2,1,-1,0};
+	const float startup_rpm = 7.0f;
+	const float stop_factor = 1.5f;
+	static float rpm_filtered = 0.0f;
 
-	uint8_t PAS1_level = palReadPad(HW_PAS1_PORT, HW_PAS1_PIN);
-	uint8_t PAS2_level = palReadPad(HW_PAS2_PORT, HW_PAS2_PIN);
+	pas_quad_state.idle_time += loop_dt;
+	pas_time_since_last_real_step = pas_quad_state.idle_time;
 
-	new_state = PAS2_level * 2 + PAS1_level;
-	direction_qem = (float) QEM[old_state * 4 + new_state];
-	old_state = new_state;
+	uint8_t pas1 = palReadPad(HW_PAS1_PORT, HW_PAS1_PIN) ? 1 : 0;
+	uint8_t pas2 = palReadPad(HW_PAS2_PORT, HW_PAS2_PIN) ? 1 : 0;
+	pas_dbg_a_level = pas1;
+	pas_dbg_b_level = pas2;
+	uint8_t new_state = (pas2 << 1) | pas1;
 
-	// Require several quadrature events in the right direction to prevent vibrations from
-	// engging PAS
-	int8_t direction = (direction_conf * direction_qem);
-	
-	switch(direction) {
-		case 1: correct_direction_counter++; break;
-		case -1:correct_direction_counter = 0; break;
+	if (pas_quad_state.last_state == 0xFF && new_state <= 3) {
+		pas_quad_state.last_state = new_state;
 	}
 
-	const float timestamp = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
+	if (new_state <= 3 && pas_quad_state.last_state <= 3 && new_state != pas_quad_state.last_state) {
+		int idx = (pas_quad_state.last_state * 4) + new_state;
+		int8_t step = QEM[idx];
+		pas_quad_state.last_state = new_state;
 
-	// sensors are poorly placed, so use only one rising edge as reference
-	if( (new_state == 3) && (correct_direction_counter >= 4) ) {
-		float period = (timestamp - old_timestamp) * (float)config.magnets;
-		old_timestamp = timestamp;
-
-		UTILS_LP_FAST(period_filtered, period, 1.0);
-
-		if(period_filtered < min_pedal_period) { //can't be that short, abort
+		if (step == 2 || step == -2) {
 			return;
 		}
-		pedal_rpm = 60.0 / period_filtered;
-		pedal_rpm *= (direction_conf * (float)direction_qem);
-		inactivity_time = 0.0;
-		correct_direction_counter = 0;
-	}
-	else {
-		inactivity_time += loop_dt;
 
-		//if no pedal activity, set RPM as zero
-		if(inactivity_time > max_pulse_period) {
-			pedal_rpm = 0.0;
+		int8_t direction = (int8_t)(direction_conf * (float)step);
+		if (direction < 0) {
+			pas_quadrature_reset_state();
+			pedal_rpm = 0.0f;
+			pas_force_idle = true;
+			pas_boost_state = 0.0f;
+			pas_boost_initialized = false;
+			pas_startup_assist_timer = 0.0f;
+			pas_time_last_real_step = 0.0f;
+			pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
+			pas_speed_state_reset(true);
+			return;
+		} else if (direction == 0) {
+			return;
+		}
+
+		pas_quad_state.idle_time = 0.0f;
+		float now = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
+		if (pas_quad_state.ref_state == 0xFF) {
+			pas_quad_state.ref_state = new_state;
+			pas_quad_state.last_ref_timestamp = now;
+			pas_quad_state.seeded_start = true;
+		} else if (new_state == pas_quad_state.ref_state) {
+			float event_period = now - pas_quad_state.last_ref_timestamp;
+			pas_quad_state.last_ref_timestamp = now;
+
+			float magnets = fmaxf(1.0f, (float)config.magnets);
+			float min_event_period = min_pedal_period;
+			if (magnets > 1.0f && min_event_period > 0.0f) {
+				min_event_period /= magnets;
+			}
+			if (min_event_period < 1e-4f) {
+				min_event_period = 1e-4f;
+			}
+
+			if (event_period >= min_event_period) {
+				if (!pas_quad_state.has_period || !config.use_filter) {
+					pas_quad_state.event_period = event_period;
+				} else {
+					UTILS_LP_FAST(pas_quad_state.event_period, event_period, 0.3f);
+				}
+				pas_quad_state.has_period = true;
+				pas_quad_state.seeded_start = false;
+
+				pas_time_last_real_step = now;
+				pas_time_since_last_real_step = 0.0f;
+				pas_step_count++;
+				bool was_idle = pas_force_idle;
+				pas_force_idle = false;
+				if (was_idle) {
+					pas_startup_assist_trigger();
+				}
+			}
 		}
 	}
-#endif
+
+	float rpm = pedal_rpm;
+	if (pas_quad_state.has_period && pas_quad_state.event_period > 1e-4f) {
+		float magnets = fmaxf(1.0f, (float)config.magnets);
+		float rev_per_s = 1.0f / (pas_quad_state.event_period * magnets);
+		rpm = rev_per_s * 60.0f;
+	} else if (pas_quad_state.seeded_start) {
+		rpm = fmaxf(rpm, startup_rpm);
+	}
+
+	if (config.use_filter) {
+		UTILS_LP_FAST(rpm_filtered, rpm, 0.2f);
+		rpm = rpm_filtered;
+	}
+
+	float timeout = max_pulse_period;
+	if (pas_quad_state.has_period) {
+		float magnets = fmaxf(1.0f, (float)config.magnets);
+		float extended = pas_quad_state.event_period * magnets * stop_factor;
+		timeout = fmaxf(timeout, extended);
+	}
+
+	if (pas_quad_state.idle_time > timeout) {
+		pas_quadrature_reset_state();
+		rpm = 0.0f;
+		pas_force_idle = true;
+		pas_boost_state = 0.0f;
+		pas_boost_initialized = false;
+		pas_startup_assist_timer = 0.0f;
+		pas_time_last_real_step = 0.0f;
+		pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
+		pas_speed_state_reset(true);
+	}
+
+	if (rpm < 0.001f) {
+		rpm = 0.0f;
+	}
+
+	pedal_rpm = pas_get_reported_cadence(rpm);
+#else
 	(void)loop_dt;
+	pedal_rpm = 0.0f;
+	pas_speed_state_reset(true);
+#endif
 }
 
 static void pas_sensor_update_single(float loop_dt) {
@@ -373,15 +746,23 @@ static void pas_sensor_update_single(float loop_dt) {
 #if defined(HW_PAS_PPM_EXTI_LINE)
 	if (!ppm_pas_state.exti_enabled) {
 		pedal_rpm = 0.0f;
-		pas_set_target_erpm(0.0f);
+		pas_speed_state_reset(true);
 		return;
 	}
 
 	float idle_time = timer_seconds_elapsed_since(ppm_pas_state.last_edge_time);
+	pas_time_since_last_real_step = idle_time;
+	float idle_timeout = pas_get_idle_timeout_limit();
+	if (idle_time > idle_timeout) {
+		pas_force_idle = true;
+		pas_boost_state = 0.0f;
+		pas_boost_initialized = false;
+		pas_startup_assist_timer = 0.0f;
+	}
 	if (idle_time > max_pulse_period) {
 		pedal_rpm = 0.0f;
 		ppm_pas_state.period_valid = false;
-		pas_set_target_erpm(0.0f);
+		pas_speed_state_reset(true);
 		return;
 	}
 
@@ -400,19 +781,19 @@ static void pas_sensor_update_single(float loop_dt) {
 	}
 	rpm *= direction_conf;
 
-	if (config.use_filter) {
-		static float rpm_filtered = 0.0f;
-		UTILS_LP_FAST(rpm_filtered, rpm, 0.2f);
-		pedal_rpm = rpm_filtered;
-	} else {
-		pedal_rpm = rpm;
-	}
+	pedal_rpm = pas_get_reported_cadence(rpm);
 
-	pas_set_target_erpm(pedal_rpm);
+	pas_time_last_real_step = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
+	pas_time_since_last_real_step = 0.0f;
+	bool was_idle = pas_force_idle;
+	pas_force_idle = false;
+	if (was_idle) {
+		pas_startup_assist_trigger();
+	}
 #else
 	(void)loop_dt;
 	pedal_rpm = 0.0f;
-	pas_set_target_erpm(0.0f);
+	pas_speed_state_reset(true);
 #endif
 }
 
@@ -426,6 +807,41 @@ static void pas_sensor_update(float loop_dt) {
 		pas_sensor_update_quadrature(loop_dt);
 		break;
 	}
+}
+
+static float pas_boost_compute_scale(float cadence_rpm, float loop_dt, bool enable) {
+	if (!pas_boost_initialized) {
+		pas_boost_cadence_smooth = cadence_rpm;
+		pas_boost_initialized = true;
+	}
+
+	float safe_dt = fmaxf(loop_dt, 1e-4f);
+	float alpha = safe_dt / fmaxf(PAS_BOOST_CADENCE_TC, 1e-3f);
+	utils_truncate_number(&alpha, 0.0f, 1.0f);
+	float prev_smooth = pas_boost_cadence_smooth;
+	pas_boost_cadence_smooth += (cadence_rpm - pas_boost_cadence_smooth) * alpha;
+
+	float cadence_delta = (pas_boost_cadence_smooth - prev_smooth) / safe_dt;
+	float intent = 0.0f;
+	if (enable && pas_boost_cadence_smooth >= PAS_BOOST_MIN_CADENCE_RPM) {
+		float delta_above = cadence_delta - PAS_BOOST_INTENT_THRESHOLD;
+		if (delta_above > 0.0f) {
+			intent = delta_above / fmaxf(PAS_BOOST_INTENT_STRONG - PAS_BOOST_INTENT_THRESHOLD, 1.0f);
+			utils_truncate_number(&intent, 0.0f, 1.0f);
+		}
+	}
+
+	if (!enable) {
+		intent = 0.0f;
+	}
+
+	float tau = (intent > pas_boost_state) ? PAS_BOOST_RISE_TC : PAS_BOOST_FALL_TC;
+	float beta = safe_dt / fmaxf(tau, 1e-3f);
+	utils_truncate_number(&beta, 0.0f, 1.0f);
+	pas_boost_state += (intent - pas_boost_state) * beta;
+	utils_truncate_number(&pas_boost_state, 0.0f, 1.0f);
+
+	return 1.0f + (PAS_BOOST_MAX_FRACTION * pas_boost_state);
 }
 
 static THD_FUNCTION(pas_thread, arg) {
@@ -458,6 +874,12 @@ static THD_FUNCTION(pas_thread, arg) {
 
 		const float loop_dt = (float)sleep_time / (float)CH_CFG_ST_FREQUENCY;
 		pas_sensor_update(loop_dt);
+		float time_since_step = pas_time_since_last_real_step;
+		bool timeout_idle = time_since_step > PAS_STOP_TIMEOUT;
+		bool force_idle_now = pas_force_idle || timeout_idle;
+		bool boost_enabled = (config.ctrl_type == PAS_CTRL_TYPE_CADENCE) && !force_idle_now;
+		float boost_scale = pas_boost_compute_scale(pedal_rpm, loop_dt, boost_enabled);
+		pas_speed_target_update(loop_dt, force_idle_now);
 		float assist_ceiling = pas_get_assist_ceiling();
 
 		// For safe start when fault codes occur
@@ -480,16 +902,29 @@ static THD_FUNCTION(pas_thread, arg) {
 				// NOTE: If the limits are the same a numerical instability is approached, so in that case
 				// just use on/off control (which is what setting the limits to the same value essentially means).
 				float cadence_rpm_end = pas_rpm_end_effective;
-				if (cadence_rpm_end > (config.pedal_rpm_start + 1.0)) {
-					output = utils_map(pedal_rpm, config.pedal_rpm_start, cadence_rpm_end, 0.0, assist_ceiling * sub_scaling);
+				float start_rpm = pas_start_rpm_config;
+				float cadence_for_output = pedal_rpm;
+				if (pas_startup_assist_timer > 0.0f) {
+					float assist_rpm = pas_get_startup_assist_rpm();
+					if (assist_rpm < start_rpm) {
+						start_rpm = assist_rpm;
+					}
+					if (cadence_for_output < assist_rpm) {
+						cadence_for_output = assist_rpm;
+					}
+				}
+				if (cadence_rpm_end > (start_rpm + 1.0f)) {
+					output = utils_map(cadence_for_output, start_rpm, cadence_rpm_end, 0.0, assist_ceiling * sub_scaling);
 					utils_truncate_number(&output, 0.0, assist_ceiling * sub_scaling);
 				} else {
-					if (pedal_rpm > cadence_rpm_end) {
+					if (cadence_for_output > cadence_rpm_end) {
 						output = assist_ceiling * sub_scaling;
 					} else {
 						output = 0.0;
 					}
 				}
+				output *= boost_scale;
+				utils_truncate_number(&output, 0.0, assist_ceiling * sub_scaling);
 				break;
 			}
 
@@ -531,12 +966,20 @@ static THD_FUNCTION(pas_thread, arg) {
 				break;
 		}
 
+			if (force_idle_now) {
+				output = 0.0f;
+			}
+
 		// Apply ramping
 		static systime_t last_time = 0;
 		static float output_ramp = 0.0;
 		float ramp_time = fabsf(output) > fabsf(output_ramp) ? config.ramp_time_pos : config.ramp_time_neg;
 
-		if (ramp_time > 0.01) {
+			if (force_idle_now) {
+				output_ramp = 0.0f;
+				last_time = chVTGetSystemTimeX();
+				output = 0.0f;
+			} else if (ramp_time > 0.01) {
 			const float ramp_step = (float)ST2MS(chVTTimeElapsedSinceX(last_time)) / (ramp_time * 1000.0);
 			utils_step_towards(&output_ramp, output, ramp_step);
 			utils_truncate_number(&output_ramp, 0.0, assist_ceiling * sub_scaling);

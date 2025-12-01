@@ -44,6 +44,22 @@
 #include <stdio.h>
 #include <math.h>
 
+#if defined(HW_PAS2_PORT) && defined(HW_PAS2_PIN)
+static void pas_dbg_print_status(void) {
+	commands_printf("PAS1 level: %d", app_pas_get_pas1_level());
+	commands_printf("PAS2 level: %d", app_pas_get_pas2_level());
+	commands_printf("PAS app running: %s", app_pas_is_running() ? "true" : "false");
+	commands_printf("PAS forced idle: %s", app_pas_is_forced_idle() ? "true" : "false");
+	commands_printf("PAS step count: %u", (unsigned int)app_pas_get_step_count());
+	commands_printf("Time since real step: %.3f s", (double)app_pas_get_time_since_real_step());
+	commands_printf("Pedal RPM: %.2f", (double)app_pas_get_pedal_rpm());
+	commands_printf("PAS ERPM base/boost/filtered: %.0f / %.0f / %.0f\n",
+		(double)app_pas_get_target_erpm_base(),
+		(double)app_pas_get_target_erpm_boost(),
+		(double)app_pas_get_target_erpm());
+}
+#endif
+
 // Settings
 #ifndef FAULT_VEC_LEN
 #define FAULT_VEC_LEN						25
@@ -219,6 +235,65 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 		commands_printf("Input voltage: %.2f\n", (double)mc_interface_get_input_voltage_filtered());
 #ifdef HW_HAS_GATE_DRIVER_SUPPLY_MONITOR
 		commands_printf("Gate driver power supply output voltage: %.2f\n", (double)GET_GATE_DRIVER_SUPPLY_VOLTAGE());
+#endif
+	} else if (strcmp(argv[0], "pas_dbg") == 0) {
+#if defined(HW_PAS2_PORT) && defined(HW_PAS2_PIN)
+		bool watch_mode = false;
+		bool stop_requested = false;
+		int interval_ms = 250;
+		int max_updates = 50;
+
+		if (argc >= 2) {
+			if (strcmp(argv[1], "stop") == 0) {
+				stop_requested = true;
+			} else if (strcmp(argv[1], "watch") == 0 || strcmp(argv[1], "live") == 0 || strcmp(argv[1], "stream") == 0) {
+				watch_mode = true;
+				if (argc >= 3) {
+					int tmp = 0;
+					if (sscanf(argv[2], "%d", &tmp) == 1 && tmp > 0) {
+						interval_ms = tmp;
+					}
+				}
+				if (argc >= 4) {
+					int tmp = 0;
+					if (sscanf(argv[3], "%d", &tmp) == 1) {
+						max_updates = tmp;
+					}
+				}
+			}
+		}
+
+		if (stop_requested) {
+			commands_printf("PAS watch now auto-stops; nothing to stop. Re-run 'pas_dbg watch' if needed.\n");
+		} else if (!watch_mode) {
+			pas_dbg_print_status();
+		} else {
+			if (interval_ms < 20) {
+				interval_ms = 20;
+			}
+			if (interval_ms > 2000) {
+				interval_ms = 2000;
+			}
+			if (max_updates < 1) {
+				max_updates = 1;
+			}
+			if (max_updates > 500) {
+				max_updates = 500;
+			}
+
+			float duration_s = ((float)interval_ms * (float)max_updates) / 1000.0f;
+			commands_printf("Streaming PAS status (%d updates, %d ms interval ~%.1f s total).\n",
+					max_updates, interval_ms, (double)duration_s);
+			for (int i = 0; i < max_updates; i++) {
+				pas_dbg_print_status();
+				if (i < (max_updates - 1)) {
+					chThdSleepMilliseconds(interval_ms);
+				}
+			}
+			commands_printf("PAS watch finished after %d update(s).\n", max_updates);
+		}
+#else
+		commands_printf("PAS2 digital input not available on this hardware\n");
 #endif
 	} else if (strcmp(argv[0], "param_detect") == 0) {
 		// Use COMM_MODE_DELAY and try to figure out the motor parameters.

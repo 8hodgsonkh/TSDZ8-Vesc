@@ -39,13 +39,13 @@
 #define RPM_FILTER_SAMPLES				8
 #define TC_DIFF_MAX_PASS				60  // TODO: move to app_conf
 #define PAS_THROTTLE_IDLE_GATE		0.05f
-#define PAS_FOLLOW_START_ROTATIONS	0.5f
+#define PAS_FOLLOW_START_ROTATIONS	0.15f
 #define PAS_FOLLOW_IDLE_TIMEOUT_S	0.6f
 #define PAS_FOLLOW_BASE_CURRENT_FRAC	0.2f
 #define PAS_FOLLOW_BASE_RPM_FULL	40.0f
 #define PAS_FOLLOW_KP_A_PER_ERPM	0.01f
 #define PAS_FOLLOW_DEADBAND_ERPM	30.0f
-#define PAS_FOLLOW_TARGET_LEAD	1.02f
+#define PAS_FOLLOW_TARGET_LEAD	1.08f
 #define PAS_FOLLOW_RAMP_UP_BASE_A_PER_S	5.0f
 #define PAS_FOLLOW_RAMP_UP_FULL_A_PER_S	25.0f
 #define PAS_FOLLOW_RAMP_UP_RISE_TIME_S	2.0f
@@ -146,8 +146,8 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 	const float launch_boost_release_duty = 0.12f;
 	const float launch_boost_release_erpm = 250.0f;
 	const float ramp_up_min_a = 10.0f;
-	const float ramp_up_max_a = 30.0f;
-	const float ramp_up_limited_a = 10.0f;
+	const float ramp_up_max_a = 40.0f;
+	const float ramp_up_limited_a = 12.0f;
 	const float ramp_down_a = 40.0f;
 	const float throttle_filter_hz = 12.0f;
 
@@ -415,6 +415,10 @@ void app_adc_stop(void) {
 	}
 }
 
+bool app_adc_is_running(void) {
+	return is_running;
+}
+
 float app_adc_get_decoded_level(void) {
 	return decoded_level;
 }
@@ -487,6 +491,10 @@ static THD_FUNCTION(adc_thread, arg) {
 			is_running = false;
 			return;
 		}
+
+		// Reset throttle-only ERPM cap; it will be re-enabled later in this loop
+		// only if the throttle (not PAS) is requesting forward torque.
+		mc_interface_set_throttle_limit_active(false);
 
 		// For safe start when fault codes occur
 		if (mc_interface_get_fault() != FAULT_CODE_NONE && config.safe_start != SAFE_START_NO_FAULT) {
@@ -703,8 +711,12 @@ static THD_FUNCTION(adc_thread, arg) {
 		case ADC_CTRL_TYPE_CURRENT_REV_BUTTON:
 			current_mode = true;
 			if (pwr >= 0.0f) {
+				const float throttle_cmd = pwr;
 				if (!haz_pas_try_takeover(&pwr, &current_rel, loop_dt)) {
 					current_rel = pwr;
+					if (throttle_cmd > 0.0f) {
+						mc_interface_set_throttle_limit_active(true);
+					}
 				}
 			} else {
 				haz_pas_follow_reset();
@@ -716,15 +728,19 @@ static THD_FUNCTION(adc_thread, arg) {
 			}
 			break;
 
-        case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_CENTER:
+		case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_CENTER:
 		case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_CENTER:
 		case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_BUTTON:
 		case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_ADC:
 		case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_ADC:
 			current_mode = true;
 			if (pwr >= 0.0f) {
+				const float throttle_cmd = pwr;
 				if (!haz_pas_try_takeover(&pwr, &current_rel, loop_dt)) {
 					current_rel = pwr;
+					if (throttle_cmd > 0.0f) {
+						mc_interface_set_throttle_limit_active(true);
+					}
 				}
 			} else {
 				haz_pas_follow_reset();
@@ -750,6 +766,9 @@ static THD_FUNCTION(adc_thread, arg) {
 			}
 
 			if (!(ms_without_power < MIN_MS_WITHOUT_POWER && config.safe_start)) {
+				if (pwr > 0.0f) {
+					mc_interface_set_throttle_limit_active(true);
+				}
 				mc_interface_set_duty(utils_map(pwr, -1.0, 1.0, -mcconf->l_max_duty, mcconf->l_max_duty));
 				send_duty = true;
 			}
@@ -765,11 +784,23 @@ static THD_FUNCTION(adc_thread, arg) {
 			}
 
 			if (!(ms_without_power < MIN_MS_WITHOUT_POWER && config.safe_start)) {
-				float speed = 0.0;
-				if (pwr >= 0.0) {
-					speed = pwr * mcconf->l_max_erpm;
+				if (pwr > 0.0f) {
+					mc_interface_set_throttle_limit_active(true);
+				}
+				float speed = 0.0f;
+				float erpm_cap = mc_get_active_erpm_limit();
+				if (erpm_cap <= 0.0f) {
+					erpm_cap = fabsf(mcconf->l_max_erpm);
+				}
+				float neg_cap = erpm_cap;
+				float min_erpm_abs = fabsf(mcconf->l_min_erpm);
+				if (isfinite(min_erpm_abs) && min_erpm_abs > 0.0f) {
+					neg_cap = fminf(neg_cap, min_erpm_abs);
+				}
+				if (pwr >= 0.0f) {
+					speed = pwr * erpm_cap;
 				} else {
-					speed = pwr * fabsf(mcconf->l_min_erpm);
+					speed = pwr * neg_cap;
 				}
 
 				mc_interface_set_pid_speed(speed);

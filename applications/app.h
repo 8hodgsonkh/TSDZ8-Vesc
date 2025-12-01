@@ -21,6 +21,7 @@
 #define APP_H_
 
 #include "conf_general.h"
+#include <stdint.h>
 
 // Functions
 const app_configuration* app_get_configuration(void);
@@ -39,6 +40,7 @@ void app_ppm_configure(ppm_config *conf);
 
 void app_adc_start(bool use_rx_tx);
 void app_adc_stop(void);
+bool app_adc_is_running(void);
 void app_adc_configure(adc_config *conf);
 float app_adc_get_decoded_level(void);
 float app_adc_get_voltage(void);
@@ -82,6 +84,13 @@ void app_pas_configure(pas_config *conf);
 float app_pas_get_current_target_rel(void);
 float app_pas_get_pedal_rpm(void);
 float app_pas_get_target_erpm(void);
+float app_pas_get_target_erpm_base(void);
+float app_pas_get_target_erpm_boost(void);
+int app_pas_get_pas1_level(void);
+int app_pas_get_pas2_level(void);
+uint32_t app_pas_get_step_count(void);
+float app_pas_get_time_since_real_step(void);
+bool app_pas_is_forced_idle(void);
 void app_pas_set_current_sub_scaling(float current_sub_scaling);
 void app_pas_pas_irq_handler(void);
 

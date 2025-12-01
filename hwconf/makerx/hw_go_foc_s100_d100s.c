@@ -98,7 +98,11 @@ void hw_init_gpio(void) {
 	palSetPadMode(GPIOA, 2, PAL_MODE_INPUT_ANALOG);
 	palSetPadMode(GPIOA, 3, PAL_MODE_INPUT_ANALOG);
 	palSetPadMode(GPIOA, 5, PAL_MODE_INPUT_ANALOG);
-	palSetPadMode(GPIOA, 6, PAL_MODE_INPUT_ANALOG);
+	#if defined(HW_USE_PAS2_DIGITAL_EXT2) && defined(HW_PAS2_PORT) && defined(HW_PAS2_PIN)
+		palSetPadMode(HW_PAS2_PORT, HW_PAS2_PIN, PAL_MODE_INPUT_PULLUP);
+	#else
+		palSetPadMode(GPIOA, 6, PAL_MODE_INPUT_ANALOG);
+	#endif
 
 	palSetPadMode(GPIOB, 0, PAL_MODE_INPUT_ANALOG);
 	palSetPadMode(GPIOB, 1, PAL_MODE_INPUT_ANALOG);
@@ -123,7 +127,11 @@ void hw_setup_adc_channels(void) {
 	// ADC2 regular channels
 	ADC_RegularChannelConfig(ADC2, ADC_Channel_1, 1, ADC_SampleTime_15Cycles);
 	ADC_RegularChannelConfig(ADC2, ADC_Channel_11, 2, ADC_SampleTime_15Cycles);
+#if defined(HW_USE_PAS2_DIGITAL_EXT2)
+	ADC_RegularChannelConfig(ADC2, ADC_Channel_1, 3, ADC_SampleTime_15Cycles);
+#else
 	ADC_RegularChannelConfig(ADC2, ADC_Channel_6, 3, ADC_SampleTime_15Cycles);
+#endif
 	ADC_RegularChannelConfig(ADC2, ADC_Channel_15, 4, ADC_SampleTime_15Cycles);
 	ADC_RegularChannelConfig(ADC2, ADC_Channel_0, 5, ADC_SampleTime_15Cycles);
 	ADC_RegularChannelConfig(ADC2, ADC_Channel_9, 6, ADC_SampleTime_15Cycles);

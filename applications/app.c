@@ -59,10 +59,25 @@ void app_set_configuration(app_configuration *conf) {
 	}
 
 	appconf = *conf;
+#if defined(HW_PAS_PPM_EXTI_LINE) || (defined(HW_PAS1_PORT) && defined(HW_PAS2_PORT))
+	bool pas_hw_ready = false;
+	switch (appconf.app_pas_conf.sensor_type) {
+	case PAS_SENSOR_TYPE_SINGLE_PIN_PPM:
 #if defined(HW_PAS_PPM_EXTI_LINE)
+		pas_hw_ready = true;
+#endif
+		break;
+	case PAS_SENSOR_TYPE_QUADRATURE:
+#if defined(HW_PAS1_PORT) && defined(HW_PAS2_PORT)
+		pas_hw_ready = true;
+#endif
+		break;
+	default:
+		break;
+	}
 	bool start_pas_sidecar =
 		(appconf.app_pas_conf.ctrl_type != PAS_CTRL_TYPE_NONE) &&
-		(appconf.app_pas_conf.sensor_type == PAS_SENSOR_TYPE_SINGLE_PIN_PPM) &&
+		pas_hw_ready &&
 		(appconf.app_to_use == APP_ADC || appconf.app_to_use == APP_ADC_UART);
 #else
 	bool start_pas_sidecar = false;

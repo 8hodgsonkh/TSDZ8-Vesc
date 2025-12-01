@@ -41,6 +41,7 @@
 #include "crc.h"
 #include "bms.h"
 #include "events.h"
+#include "timer.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -48,6 +49,22 @@
 
 // Macros
 #define DIR_MULT		(motor_now()->m_conf.m_invert_direction ? -1.0 : 1.0)
+
+// Street-mode ERPM caps; override in hwconf or build flags if local rules differ.
+// STREET_MODE_ERPM_LIMIT applies to every app (PAS, PID, etc.) when off-road mode is disabled.
+// STREET_MODE_THROTTLE_ERPM_LIMIT is an optional lower clamp that only engages while the
+// throttle app is actively requesting torque; PAS and off-road behavior still use the main cap.
+#ifndef STREET_MODE_ERPM_LIMIT
+#define STREET_MODE_ERPM_LIMIT	7500.0f
+#endif
+
+#ifndef STREET_MODE_THROTTLE_ERPM_LIMIT
+#define STREET_MODE_THROTTLE_ERPM_LIMIT	2000.0f
+#endif
+
+// Safety fallbacks if the overrides above are disabled or zeroed by mistake.
+#define STREET_MODE_ERPM_FALLBACK	7500.0f
+#define STREET_MODE_THROTTLE_ERPM_FALLBACK	2000.0f
 
 // Global variables
 volatile uint16_t ADC_Value[HW_ADC_CHANNELS + HW_ADC_CHANNELS_EXTRA];
@@ -131,6 +148,8 @@ static volatile bool m_sample_is_second_motor;
 static volatile gnss_data m_gnss = {0};
 static volatile bool m_wheel_speed_override = false;
 static volatile float m_wheel_speed_override_value = 0.0;
+static volatile bool m_offroad_mode = false;
+static volatile bool m_throttle_limit_active = false;
 
 typedef struct {
 	bool is_second_motor;
@@ -1648,6 +1667,59 @@ void mc_interface_override_wheel_speed(bool ovr, float speed) {
 	m_wheel_speed_override_value = speed;
 }
 
+float mc_get_active_erpm_limit(void) {
+	const volatile mc_configuration *mcconf = mc_interface_get_configuration();
+	if (!mcconf) {
+		return 0.0f;
+	}
+
+	float base_limit = fabsf(mcconf->l_max_erpm);
+	if (!isfinite(base_limit) || base_limit <= 0.0f) {
+		base_limit = 0.0f;
+	}
+
+	if (m_offroad_mode) {
+		return base_limit > 0.0f ? base_limit : STREET_MODE_ERPM_LIMIT;
+	}
+
+	float street_limit = STREET_MODE_ERPM_LIMIT;
+	if (!isfinite(street_limit) || street_limit <= 0.0f) {
+		street_limit = STREET_MODE_ERPM_FALLBACK;
+	}
+	if (street_limit <= 0.0f) {
+		street_limit = STREET_MODE_ERPM_FALLBACK;
+	}
+
+	if (m_throttle_limit_active) {
+		float throttle_limit = STREET_MODE_THROTTLE_ERPM_LIMIT;
+		if (!isfinite(throttle_limit) || throttle_limit <= 0.0f) {
+			throttle_limit = STREET_MODE_THROTTLE_ERPM_FALLBACK;
+		}
+		if (throttle_limit <= 0.0f) {
+			throttle_limit = STREET_MODE_THROTTLE_ERPM_FALLBACK;
+		}
+		street_limit = fminf(street_limit, throttle_limit);
+	}
+
+	if (base_limit <= 0.0f) {
+		return street_limit;
+	}
+
+	return fminf(base_limit, street_limit);
+}
+
+void mc_interface_set_offroad_mode(bool enabled) {
+	m_offroad_mode = enabled;
+}
+
+bool mc_interface_is_offroad_mode(void) {
+	return m_offroad_mode;
+}
+
+void mc_interface_set_throttle_limit_active(bool active) {
+	m_throttle_limit_active = active;
+}
+
 setup_values mc_interface_get_setup_values(void) {
 	setup_values val = {0, 0, 0, 0, 0, 0, 0};
 	val.num_vescs = 1;
@@ -1858,7 +1930,8 @@ void mc_interface_fault_stop(mc_fault_code fault, bool is_second_motor, bool is_
 
 #pragma GCC pop_options
 
-void mc_interface_mc_timer_isr(bool is_second_motor) {
+void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
+	FOC_PROFILE_LINE();
 	ledpwm_update_pwm();
 
 #ifdef HW_HAS_DUAL_MOTORS
@@ -2001,7 +2074,10 @@ void mc_interface_mc_timer_isr(bool is_second_motor) {
 	}
 #endif
 
-	float t_samp = 1.0 / motor->m_f_samp_now;
+	float t_samp = dt;
+	if (dt > 0.0f) {
+		motor->m_f_samp_now = 1.0f / dt;
+	}
 
 	// Watt and ah counters
 	if (fabsf(current_filtered) > 1.0) {
@@ -2199,6 +2275,8 @@ void mc_interface_mc_timer_isr(bool is_second_motor) {
 			m_last_adc_duration_sample = mc_interface_get_last_inj_adc_isr_duration();
 		}
 	}
+
+	FOC_PROFILE_LINE();
 }
 
 void mc_interface_adc_inj_int_handler(void) {
@@ -2395,8 +2473,9 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 
 	// RPM max
 	float lo_max_rpm = 0.0;
-	const float rpm_pos_cut_start = conf->l_max_erpm * conf->l_erpm_start;
-	const float rpm_pos_cut_end = conf->l_max_erpm;
+	const float erpm_limit = mc_get_active_erpm_limit();
+	const float rpm_pos_cut_start = erpm_limit * conf->l_erpm_start;
+	const float rpm_pos_cut_end = erpm_limit;
 	if (rpm_now < (rpm_pos_cut_start + 0.1)) {
 		lo_max_rpm = l_current_max_tmp;
 	} else if (rpm_now > (rpm_pos_cut_end - 0.1)) {
