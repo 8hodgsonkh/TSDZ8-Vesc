@@ -25,6 +25,24 @@
 #include "foc_math.h"
 #include <stdbool.h>
 
+#if HAZZA_MIDDRIVE_TUNING
+typedef struct {
+	float erpm_now;
+	float erpm_prev;
+	float iq_target;
+	float iq_command;
+	float iq_measured;
+	float recovery_timer;
+	float precharge_timer;
+	uint8_t hazza_state;
+	uint8_t bleed_count;
+	bool hall_window_active;
+	bool mode_ok;
+	bool precharge_done;
+	bool precharge_enabled;
+} hazza_status_t;
+#endif
+
 // Functions
 void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2);
 void mcpwm_foc_deinit(void);
@@ -139,6 +157,13 @@ float mcpwm_foc_get_ts(void);
 bool mcpwm_foc_is_using_encoder(void);
 void mcpwm_foc_get_observer_state(float *x1, float *x2);
 void mcpwm_foc_set_current_off_delay(float delay_sec);
+
+#if HAZZA_MIDDRIVE_TUNING
+void mcpwm_foc_get_hazza_status(hazza_status_t *status);
+void mcpwm_foc_set_hazza_precharge_enabled(bool enabled, bool is_second_motor);
+bool mcpwm_foc_get_hazza_precharge_enabled(bool is_second_motor);
+void mcpwm_foc_reset_hazza_precharge(bool is_second_motor);
+#endif
 
 // Functions where the motor can be selected
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor);

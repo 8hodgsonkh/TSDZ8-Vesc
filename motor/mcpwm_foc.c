@@ -126,6 +126,32 @@ static volatile bool pid_thd_stop;
 		TIM8->CR1 &= ~TIM_CR1_UDIS; \
 		TIM2->CR1 &= ~TIM_CR1_UDIS;
 
+#if HAZZA_MIDDRIVE_TUNING
+#define HAZZA_SLACK_ERPM_MAX             5500.0f
+#define HAZZA_SLACK_EXIT_ERPM            7500.0f
+#define HAZZA_ERPMSLOPE_THRESHOLD        100.0f
+#define HAZZA_IQ_OVERSHOOT_MARGIN        6.0f
+#define HAZZA_IQ_MIN_TRIGGER             3.0f
+#define HAZZA_IQ_JUMP_MARGIN             4.0f
+#define HAZZA_MOD_SAT_TRIGGER            0.96f
+#define HAZZA_ANGLE_STALL_RAD            (2.0f * (float)M_PI / 180.0f)
+#define HAZZA_IQ_SLEW_A_PER_S            40.0f
+#define HAZZA_IQ_SLEW_RECOVERY_MAX       200.0f
+#define HAZZA_PI_SCALE_ACTIVE_D_KP       0.60f
+#define HAZZA_PI_SCALE_ACTIVE_D_KI       0.40f
+#define HAZZA_PI_SCALE_ACTIVE_Q_KP       0.60f
+#define HAZZA_PI_SCALE_ACTIVE_Q_KI       0.40f
+#define HAZZA_ACTIVE_DWELL_MS            30.0f
+#define HAZZA_RECOVERY_TIME_MS           200.0f
+#define HAZZA_INT_BLEED_FACTOR           0.90f
+#define HAZZA_INT_BLEED_CYCLES           10
+#define HAZZA_PRECHARGE_EXIT_ERPM        1500.0f
+#define HAZZA_PRECHARGE_EXIT_TIME_S      0.75f
+#define HAZZA_PRECHARGE_RESET_ERPM       400.0f
+#define HAZZA_PRECHARGE_MIN_IQ           0.15f
+#define HAZZA_PRECHARGE_IQ_FLOOR         2.5f
+#endif
+
 // #define M_MOTOR: For single motor compilation, expands to &m_motor_1.
 // For dual motors, expands to &m_motor_1 or _2, depending on is_second_motor.
 #ifdef HW_HAS_DUAL_MOTORS
@@ -375,6 +401,9 @@ void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2) {
 	m_motor_1.m_hall_dt_diff_last = 1.0;
 	m_motor_1.m_hall_dt_diff_now = 1.0;
 	m_motor_1.m_ang_hall_int_prev = -1;
+#if HAZZA_MIDDRIVE_TUNING
+	m_motor_1.hazza_precharge_enabled = true;
+#endif
 	foc_precalc_values((motor_all_state_t*)&m_motor_1);
 	update_hfi_samples(m_motor_1.m_conf->foc_hfi_samples, &m_motor_1);
 	init_audio_state(&m_motor_1.m_audio);
@@ -387,6 +416,9 @@ void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2) {
 	m_motor_2.m_hall_dt_diff_last = 1.0;
 	m_motor_2.m_hall_dt_diff_now = 1.0;
 	m_motor_2.m_ang_hall_int_prev = -1;
+#if HAZZA_MIDDRIVE_TUNING
+	m_motor_2.hazza_precharge_enabled = true;
+#endif
 	foc_precalc_values((motor_all_state_t*)&m_motor_2);
 	update_hfi_samples(m_motor_2.m_conf->foc_hfi_samples, &m_motor_2);
 	init_audio_state(&m_motor_2.m_audio);
@@ -1110,6 +1142,59 @@ void mcpwm_foc_set_current_off_delay(float delay_sec) {
 		get_motor_now()->m_current_off_delay = delay_sec;
 	}
 }
+
+#if HAZZA_MIDDRIVE_TUNING
+void mcpwm_foc_get_hazza_status(hazza_status_t *status) {
+	if (!status) {
+		return;
+	}
+
+	chSysLock();
+	const volatile motor_all_state_t *motor = get_motor_now();
+	status->hazza_state = motor->hazza_state;
+	status->bleed_count = motor->hazza_bleed_count;
+	status->iq_command = motor->hazza_iq_cmd_prev;
+	status->iq_target = motor->m_iq_set;
+	status->iq_measured = motor->m_motor_state.iq;
+	status->recovery_timer = motor->hazza_recovery_timer;
+	status->precharge_timer = motor->hazza_precharge_timer;
+	status->erpm_prev = motor->hazza_prev_erpm;
+	status->erpm_now = RADPS2RPM_f(motor->m_speed_est_fast_corrected);
+	status->hall_window_active = motor->m_using_hall &&
+			(fabsf(status->erpm_now) < HAZZA_SLACK_ERPM_MAX);
+	status->mode_ok = (motor->m_state == MC_STATE_RUNNING) &&
+			(motor->m_control_mode == CONTROL_MODE_CURRENT ||
+			 motor->m_control_mode == CONTROL_MODE_CURRENT_BRAKE);
+	status->precharge_done = motor->hazza_precharge_done;
+	status->precharge_enabled = motor->hazza_precharge_enabled;
+	chSysUnlock();
+}
+
+void mcpwm_foc_set_hazza_precharge_enabled(bool enabled, bool is_second_motor) {
+	volatile motor_all_state_t *motor = M_MOTOR(is_second_motor);
+	chSysLock();
+	motor->hazza_precharge_enabled = enabled;
+	motor->hazza_precharge_timer = 0.0f;
+	motor->hazza_precharge_done = enabled ? false : true;
+	chSysUnlock();
+}
+
+bool mcpwm_foc_get_hazza_precharge_enabled(bool is_second_motor) {
+	bool res = false;
+	chSysLock();
+	res = M_MOTOR(is_second_motor)->hazza_precharge_enabled;
+	chSysUnlock();
+	return res;
+}
+
+void mcpwm_foc_reset_hazza_precharge(bool is_second_motor) {
+	volatile motor_all_state_t *motor = M_MOTOR(is_second_motor);
+	chSysLock();
+	motor->hazza_precharge_done = false;
+	motor->hazza_precharge_timer = 0.0f;
+	chSysUnlock();
+}
+#endif
 
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor) {
 	volatile motor_all_state_t *motor = M_MOTOR(is_second_motor);
@@ -4006,7 +4091,8 @@ static void timer_update(motor_all_state_t *motor, float dt) {
 	}
 
 	bool started_now = false;
-	if (motor->m_min_rpm_hyst_timer >= conf_now->foc_sl_openloop_hyst &&
+	if (!motor->hazza_precharge_done &&
+			motor->m_min_rpm_hyst_timer >= conf_now->foc_sl_openloop_hyst &&
 			motor->m_min_rpm_timer <= 0.0001) {
 		motor->m_min_rpm_timer = t_lock + t_ramp + t_const;
 		started_now = true;
@@ -4041,6 +4127,12 @@ static void timer_update(motor_all_state_t *motor, float dt) {
 		motor->m_observer_x2_override = s * conf_now->foc_motor_flux_linkage;
 	} else {
 		motor->m_phase_now_observer_override = motor->m_phase_now_observer;
+		motor->m_phase_observer_override = false;
+	}
+
+	if (motor->hazza_precharge_done) {
+		motor->m_min_rpm_timer = 0.0f;
+		motor->m_min_rpm_hyst_timer = 0.0f;
 		motor->m_phase_observer_override = false;
 	}
 
@@ -4088,6 +4180,153 @@ static void timer_update(motor_all_state_t *motor, float dt) {
 		UTILS_LP_FAST(motor->m_conf->foc_offsets_current[1], motor->m_currents_adc[1], 0.0001);
 		UTILS_LP_FAST(motor->m_conf->foc_offsets_current[2], motor->m_currents_adc[2], 0.0001);
 	}
+
+#if HAZZA_MIDDRIVE_TUNING
+	{
+		const float iq_input = motor->m_iq_set;
+		const bool detection_active = motor->m_state == MC_STATE_DETECTING;
+
+		if (detection_active) {
+			motor->m_iq_set = iq_input;
+		} else {
+			volatile motor_state_t *state_h = &motor->m_motor_state;
+			const float erpm_now = RADPS2RPM_f(motor->m_speed_est_fast_corrected);
+		const float erpm_abs = fabsf(erpm_now);
+		const bool hall_window = motor->m_using_hall && (erpm_abs < HAZZA_SLACK_ERPM_MAX);
+		const bool mode_ok = motor->m_state == MC_STATE_RUNNING &&
+				(motor->m_control_mode == CONTROL_MODE_CURRENT ||
+				 motor->m_control_mode == CONTROL_MODE_CURRENT_BRAKE);
+		const float iq_input_abs = fabsf(iq_input);
+		const bool throttle_active = iq_input_abs > HAZZA_PRECHARGE_MIN_IQ;
+		float iq_target = iq_input;
+		const float iq_meas = motor->m_motor_state.iq;
+		const bool precharge_enabled = motor->hazza_precharge_enabled;
+
+		if (!precharge_enabled) {
+			motor->hazza_precharge_done = true;
+			motor->hazza_precharge_timer = 0.0f;
+		} else if (!motor->hazza_precharge_done && throttle_active && iq_input_abs > 0.0f) {
+			const float dir = iq_target >= 0.0f ? 1.0f : -1.0f;
+			if (iq_input_abs < HAZZA_PRECHARGE_IQ_FLOOR) {
+				iq_target = dir * HAZZA_PRECHARGE_IQ_FLOOR;
+			}
+		}
+
+		if (precharge_enabled) {
+			if (motor->hazza_precharge_done) {
+				if (erpm_abs < HAZZA_PRECHARGE_RESET_ERPM) {
+					motor->hazza_precharge_done = false;
+					motor->hazza_precharge_timer = 0.0f;
+				}
+			} else {
+				if (!mode_ok || !throttle_active) {
+					motor->hazza_precharge_timer = 0.0f;
+				} else if (erpm_abs > HAZZA_PRECHARGE_EXIT_ERPM) {
+					motor->hazza_precharge_timer += dt;
+					if (motor->hazza_precharge_timer >= HAZZA_PRECHARGE_EXIT_TIME_S) {
+						motor->hazza_precharge_done = true;
+					}
+				} else {
+					motor->hazza_precharge_timer = 0.0f;
+				}
+			}
+		} else {
+			motor->hazza_precharge_timer = 0.0f;
+		}
+		// iq_target/iq_meas already declared above
+		const float derpm = erpm_now - motor->hazza_prev_erpm;
+		const bool erpm_collapse = derpm < -HAZZA_ERPMSLOPE_THRESHOLD;
+		const bool iq_overshoot = fabsf(iq_meas - iq_target) > HAZZA_IQ_OVERSHOOT_MARGIN;
+		const bool iq_jump = fabsf(iq_meas - motor->hazza_prev_iq) > HAZZA_IQ_JUMP_MARGIN;
+		const float mod_mag = NORM2_f(motor->m_motor_state.mod_d, motor->m_motor_state.mod_q);
+		const bool mod_sat = mod_mag > (conf_now->l_max_duty * HAZZA_MOD_SAT_TRIGGER);
+		const float angle_now = motor->m_phase_now_observer;
+		const float angle_delta = fabsf(utils_angle_difference_rad(angle_now, motor->hazza_prev_angle));
+		const bool angle_stall = angle_delta < HAZZA_ANGLE_STALL_RAD;
+		const bool iq_capable = fabsf(iq_target) > HAZZA_IQ_MIN_TRIGGER;
+		bool slap_detected = hall_window && mode_ok && iq_capable && erpm_collapse && (iq_overshoot || mod_sat || iq_jump);
+		slap_detected = slap_detected && (angle_stall || fabsf(derpm) > (HAZZA_ERPMSLOPE_THRESHOLD * 1.5f));
+
+		hazza_slack_state_t hazza_state = (hazza_slack_state_t)motor->hazza_state;
+		const float active_dwell = HAZZA_ACTIVE_DWELL_MS * 0.001f;
+		const float recovery_time = HAZZA_RECOVERY_TIME_MS * 0.001f;
+		const float base_step = HAZZA_IQ_SLEW_A_PER_S * dt;
+		float iq_limited = iq_target;
+
+		if ((!hall_window || !mode_ok) && hazza_state != HAZZA_SLACK_IDLE) {
+			hazza_state = HAZZA_SLACK_IDLE;
+			motor->hazza_iq_cmd_prev = iq_target;
+			motor->hazza_recovery_timer = 0.0f;
+		}
+
+		switch (hazza_state) {
+		case HAZZA_SLACK_IDLE:
+			motor->hazza_recovery_timer = 0.0f;
+			motor->hazza_bleed_count = 0;
+			if (slap_detected) {
+				hazza_state = HAZZA_SLACK_ACTIVE;
+				motor->hazza_recovery_timer = 0.0f;
+				motor->hazza_iq_cmd_prev = iq_meas;
+				motor->hazza_bleed_count = HAZZA_INT_BLEED_CYCLES;
+			} else {
+				motor->hazza_iq_cmd_prev = iq_target;
+			}
+			break;
+
+		case HAZZA_SLACK_ACTIVE:
+			motor->hazza_recovery_timer += dt;
+			utils_step_towards((float*)&motor->hazza_iq_cmd_prev, iq_target, base_step);
+			iq_limited = motor->hazza_iq_cmd_prev;
+			if (motor->hazza_recovery_timer >= active_dwell && !slap_detected && !mod_sat) {
+				hazza_state = HAZZA_SLACK_RECOVERING;
+				motor->hazza_recovery_timer = 0.0f;
+				motor->hazza_iq_cmd_prev = iq_limited;
+			}
+			if (slap_detected) {
+				motor->hazza_recovery_timer = 0.0f;
+			}
+			break;
+
+		case HAZZA_SLACK_RECOVERING: {
+			if (slap_detected) {
+				hazza_state = HAZZA_SLACK_ACTIVE;
+				motor->hazza_recovery_timer = 0.0f;
+				motor->hazza_iq_cmd_prev = iq_meas;
+				break;
+			}
+			motor->hazza_recovery_timer += dt;
+			float alpha = recovery_time > 0.0f ? motor->hazza_recovery_timer / recovery_time : 1.0f;
+			utils_truncate_number(&alpha, 0.0f, 1.0f);
+			float slew_limit = utils_map(alpha, 0.0f, 1.0f,
+					HAZZA_IQ_SLEW_A_PER_S, HAZZA_IQ_SLEW_RECOVERY_MAX) * dt;
+			utils_step_towards((float*)&motor->hazza_iq_cmd_prev, iq_target, slew_limit);
+			iq_limited = motor->hazza_iq_cmd_prev;
+			if (alpha >= 1.0f || erpm_abs > HAZZA_SLACK_EXIT_ERPM || !hall_window) {
+				hazza_state = HAZZA_SLACK_IDLE;
+				motor->hazza_iq_cmd_prev = iq_target;
+				motor->hazza_recovery_timer = 0.0f;
+			}
+		} break;
+		}
+
+			if (hazza_state != HAZZA_SLACK_IDLE && hall_window) {
+				motor->m_phase_observer_override = false;
+				motor->m_min_rpm_timer = 0.0f;
+			}
+
+			motor->m_iq_set = iq_limited;
+			motor->hazza_state = (uint8_t)hazza_state;
+			motor->hazza_prev_erpm = erpm_now;
+			motor->hazza_prev_iq = iq_meas;
+			motor->hazza_prev_angle = angle_now;
+			if (motor->hazza_bleed_count > 0) {
+				motor->hazza_bleed_count--;
+				state_h->vd_int *= HAZZA_INT_BLEED_FACTOR;
+				state_h->vq_int *= HAZZA_INT_BLEED_FACTOR;
+			}
+		}
+	}
+#endif
 }
 
 static THD_FUNCTION(timer_thread, arg) {
@@ -4555,17 +4794,43 @@ static void control_current(motor_all_state_t *motor, float dt) {
 	float Ierr_d = state_m->id_target - state_m->id;
 	float Ierr_q = state_m->iq_target - state_m->iq;
 
-	float ki = conf_now->foc_current_ki;
+	float kp_d = conf_now->foc_current_kp;
+	float kp_q = conf_now->foc_current_kp;
+	float ki_d = conf_now->foc_current_ki;
+	float ki_q = conf_now->foc_current_ki;
 	if (conf_now->foc_temp_comp) {
-		ki = motor->m_current_ki_temp_comp;
+		ki_d = motor->m_current_ki_temp_comp;
+		ki_q = motor->m_current_ki_temp_comp;
 	}
 
-	state_m->vd_int += Ierr_d * (ki * d_gain_scale * dt);
-	state_m->vq_int += Ierr_q * (ki * dt);
+#if HAZZA_MIDDRIVE_TUNING
+	const hazza_slack_state_t hazza_state = (hazza_slack_state_t)motor->hazza_state;
+	if (hazza_state == HAZZA_SLACK_ACTIVE) {
+		kp_d *= HAZZA_PI_SCALE_ACTIVE_D_KP;
+		ki_d *= HAZZA_PI_SCALE_ACTIVE_D_KI;
+		kp_q *= HAZZA_PI_SCALE_ACTIVE_Q_KP;
+		ki_q *= HAZZA_PI_SCALE_ACTIVE_Q_KI;
+	} else if (hazza_state == HAZZA_SLACK_RECOVERING) {
+		const float recover_time = HAZZA_RECOVERY_TIME_MS * 0.001f;
+		float t = recover_time > 0.0f ? motor->hazza_recovery_timer / recover_time : 1.0f;
+		utils_truncate_number(&t, 0.0f, 1.0f);
+		const float kp_d_scale = utils_map(t, 0.0f, 1.0f, HAZZA_PI_SCALE_ACTIVE_D_KP, 1.0f);
+		const float ki_d_scale = utils_map(t, 0.0f, 1.0f, HAZZA_PI_SCALE_ACTIVE_D_KI, 1.0f);
+		const float kp_q_scale = utils_map(t, 0.0f, 1.0f, HAZZA_PI_SCALE_ACTIVE_Q_KP, 1.0f);
+		const float ki_q_scale = utils_map(t, 0.0f, 1.0f, HAZZA_PI_SCALE_ACTIVE_Q_KI, 1.0f);
+		kp_d *= kp_d_scale;
+		ki_d *= ki_d_scale;
+		kp_q *= kp_q_scale;
+		ki_q *= ki_q_scale;
+	}
+#endif
+
+	state_m->vd_int += Ierr_d * (ki_d * d_gain_scale * dt);
+	state_m->vq_int += Ierr_q * (ki_q * dt);
 
 	// Feedback (PI controller). No D action needed because the plant is a first order system (tf = 1/(Ls+R))
-	state_m->vd = state_m->vd_int + Ierr_d * conf_now->foc_current_kp * d_gain_scale;
-	state_m->vq = state_m->vq_int + Ierr_q * conf_now->foc_current_kp;
+	state_m->vd = state_m->vd_int + Ierr_d * kp_d * d_gain_scale;
+	state_m->vq = state_m->vq_int + Ierr_q * kp_q;
 
 	// Decoupling. Using feedforward this compensates for the fact that the equations of a PMSM
 	// are not really decoupled (the d axis current has impact on q axis voltage and visa-versa):

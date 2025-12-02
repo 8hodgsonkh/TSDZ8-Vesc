@@ -22,6 +22,10 @@
 
 #define HW_NAME					"Go-FOC S100/D100S"
 
+// Enable Hazza-specific guard so power-switch logic only runs in toggle mode
+#undef HAZZA_SHUTDOWN_TOGGLE_GUARD
+#define HAZZA_SHUTDOWN_TOGGLE_GUARD	1
+
 // HW properties
 #define HW_HAS_3_SHUNTS
 #define INVERTED_SHUNT_POLARITY
@@ -278,9 +282,9 @@
 #ifndef MCCONF_L_IN_CURRENT_MIN
 #define MCCONF_L_IN_CURRENT_MIN			-100.0	// Input current limit in Amperes (Lower)
 #endif
-#ifndef APPCONF_SHUTDOWN_MODE           
-#define APPCONF_SHUTDOWN_MODE			SHUTDOWN_MODE_ALWAYS_ON       
-#endif 
+#ifndef APPCONF_SHUTDOWN_MODE
+#define APPCONF_SHUTDOWN_MODE		SHUTDOWN_MODE_TOGGLE_BUTTON_ONLY 
+#endif
 #ifndef MCCONF_FOC_CURRENT_SAMPLE_MODE
 #define MCCONF_FOC_CURRENT_SAMPLE_MODE	        FOC_CURRENT_SAMPLE_MODE_ALL_SENSORS
 #endif

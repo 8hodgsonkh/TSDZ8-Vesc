@@ -130,6 +130,24 @@ static THD_FUNCTION(shutdown_thread, arg) {
 
 		const app_configuration *conf = app_get_configuration();
 
+#if HAZZA_SHUTDOWN_TOGGLE_GUARD
+		if (conf->shutdown_mode != SHUTDOWN_MODE_TOGGLE_BUTTON_ONLY) {
+			HW_SHUTDOWN_HOLD_ON();
+			m_inactivity_time += dt;
+
+			if (m_inactivity_time >= SHUTDOWN_SAVE_BACKUPDATA_TIMEOUT) {
+				shutdown_reset_timer();
+				if ((mc_interface_get_odometer() - odometer_old) >= 1000) {
+					conf_general_store_backup_data();
+					odometer_old = mc_interface_get_odometer();
+				}
+			}
+
+			chThdSleepMilliseconds(10);
+			continue;
+		}
+#endif
+
 		// Note: When the gates are enabled, the push to start function
 		// will prevent the regulator from shutting down. Therefore, the
 		// gate driver has to be disabled.

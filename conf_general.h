@@ -156,6 +156,16 @@
  */
 #define BLDC_SPEED_CONTROL_CURRENT	1
 
+// Hazza mid-drive tuning gate (1 = enabled, 0 = disabled)
+#ifndef HAZZA_MIDDRIVE_TUNING
+#define HAZZA_MIDDRIVE_TUNING	1
+#endif
+
+// Guard shutdown switch logic behind toggle-button mode when desired
+#ifndef HAZZA_SHUTDOWN_TOGGLE_GUARD
+#define HAZZA_SHUTDOWN_TOGGLE_GUARD	0
+#endif
+
 /*
  *	Run the FOC loop once every N ADC ISR requests. This way the pwm frequency is
  *	detached from the FOC calculation, which because it takes ~25usec it can't work

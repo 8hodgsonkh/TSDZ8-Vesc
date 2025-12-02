@@ -20,7 +20,16 @@
 #ifndef FOC_MATH_H_
 #define FOC_MATH_H_
 
+#include <stdint.h>
 #include "datatypes.h"
+
+#if HAZZA_MIDDRIVE_TUNING
+typedef enum {
+	HAZZA_SLACK_IDLE = 0,
+	HAZZA_SLACK_ACTIVE = 1,
+	HAZZA_SLACK_RECOVERING = 2
+} hazza_slack_state_t;
+#endif
 
 // Types
 typedef struct {
@@ -244,6 +253,18 @@ typedef struct {
 	float p_duty_norm;
 	float p_fs;
 	float p_dt;
+#if HAZZA_MIDDRIVE_TUNING
+	float hazza_prev_erpm;
+	float hazza_prev_iq;
+	float hazza_iq_cmd_prev;
+	float hazza_recovery_timer;
+	float hazza_prev_angle;
+	float hazza_precharge_timer;
+	uint8_t hazza_state;
+	uint8_t hazza_bleed_count;
+	bool hazza_precharge_done;
+	bool hazza_precharge_enabled;
+#endif
 } motor_all_state_t;
 
 // Functions
