@@ -11,52 +11,150 @@ This is my custom fork of the VESC firmware for the Go-FOC S100 / VESC 100/250, 
 This is not your normal typical firmware.
 This is tinker-fuel — expect experiments, PAS logic rewrites, custom logic rewrites, and things that may or may not scream when compiled.
 
-🔧 What I’m Building Here
-1. Current control throttle that works smoothly without the *CHAIN SLAP BANG NYLON GEAR GO REEEE* ✅implmented
-2. PAS That can be used along side throttle + uart for bluetooth module
-3. Plans to maybe try and get the original pas+torque sensor to work
-4. Try and add support for the original speed sensor
+✅ 1. What This Project Is Building
+1.1 Current-control throttle that behaves on a chain-driven mid-drive
+
+– Smooth low-speed torque.
+– No “chain slap → BANG BANG → nylon gear screaming REEEEE.”
+– Adaptive ramping.
+– Predictable launches.
+
+Status: ✔ Fully implemented
+Notes: Uses haz_throttle_process().
+
+1.2 PAS sensor support (generic 3-wire cadence + throttle + UART)
+
+– PAS and throttle run simultaneously.
+– PAS only active when throttle = idle.
+– Cadence → ERPM mapping.
+– Interrupt-based timing on single sensor mode. quad mode still polling.
+– Clean override logic.
+
+Status: ✔ Fully implemented
+Future: Integrate native TSDZ8 torque+cadence sensor if hardware feasibility works out.
+
+1.3 Explore native TSDZ8 torque sensor
+
+– Original torque sensor requires specialised signal conditioning.
+– I have a small PCB from a dead controller that may provide the missing analog stages.
+
+Status: ❌ Not implemented (hardware dependent)
+
+1.4 Mid-drive-optimised FOC logic (“Hazza Mid-Drive Tuning”)
+
+Chain slack kills normal FOC. This logic:
+
+– Detects backlash (ERPM collapse, Iq overshoot, angle stall, mod saturation).
+– Softens PI gains on impact.
+– Slew-limits torque re-application.
+– Gradually recovers stiffness.
+– Eliminates bang-dead-bang FOC instability.
+
+Status: ✔ Implemented (tuning ongoing)
+Flag: Enable with #define HAZZA_MIDDRIVE_TUNING 1
+
+1.5 External speed sensor support
+
+Goal:
+Use leftover pins  to support the TSDZ8 wheel speed sensor.
+
+Status: ❌ Not implemented (pin constraints)
+Past attempts:
+– Tried using MCU temp input → failed
+– ADC2 with pull-up hack works for PAS, may be repurposed later
+
+1.6 Street/Off-road mode via power button (boot-time toggle)
+
+– Street mode: throttle ERPM cap + PAS ERPM cap for UK legality
+– Off-road mode: full power
+– Uses power button like a TF2 Spycicle, gives some time immunity to P.C. pyro checking your bike
+– Tap at boot = disguise as Heavy
+– Hold for ~15 sec = Scout speed
+
+Status: ✔ Fully implemented
+Notes: Now protected so it can’t soft-brick the controller again.
+
+1.7 Custom VESC Tool fork (future)
+
+Goal: expose all Hazza variables cleanly:
+
+– PAS tuneables → PAS App page
+– Throttle ramp tuneables → ADC App page
+– Mid-drive FOC tuneables → new “Hazza Mid-Drive Tuning” dropdown
+– Street/off-road config (but NOT speed limits) → UART tab
+– Maintain full compatibility with stock VESC Tool
+– Add new serialization fields only at the end to avoid breaking existing layouts
+– Ensure stock VESC Tool can still write configs without trashing Hazza options
+
+Status: 🔄 In planning
+Android build: planning
+
+🔥 2. What Has Already Been Implemented (Technical Breakdown)
+2.1 Custom Throttle Logic (haz_throttle_process)
+
+✔ 12 Hz low-pass filter to remove jitter
+✔ Normalizes request against batt + phase current limits
+✔ Low-duty torque scaling (prevents instant chain snap at 0–8% duty)
+✔ Launch-boost zone (<12% duty & <250 ERPM)
+✔ Asymmetric ramping:
+
+Ramp-up 10–30 A/s adaptive
+
+Ramp-down 40 A/s hard
+✔ Regen bypasses fancy logic
+✔ Smooth, predictable starts
+
+2.2 PAS Logic (Generic Cadence Sensor)
+
+✔ Runs on PPM pin via interrupts
+✔ Accurate cadence → ERPM mapping
+✔ Throttle override
+✔ PAS only active when throttle idle
+✔ Zero busy loops
+✔ Safe for high RPM cadence sensors
+✔ Works with Bluetooth UART active simultaneously
+
+2.3 Mid-Drive Safe FOC Logic
+
+Implemented under the compile-time flag:
+
+#define HAZZA_MIDDRIVE_TUNING 1
+
+Core behaviour:
+
+✔ Detects chain slap via:
+– ERPM collapse
+– Iq overshoot
+– Modulation saturation
+– Angle stall
+– Iq jump events
+✔ Switches through 3 states:
+– IDLE → normal
+– ACTIVE → torque heavily limited
+– RECOVERING → gradual ramp-out
+✔ Integrator bleed to prevent torque rebound
+✔ PI gains reduced in ACTIVE
+✔ PI gains interpolated in RECOVERING
+✔ Holds halls authoritative
+✔ Prevents observer from breaking traction control
+
+🧩 3. Future Work Roadmap
+
+Reduce Iq slew rates to match mid-drive power levels (40–70 A/s).
+
+Integrate tuneables into custom VESC Tool.
 
 
-what I’m implementing and have already done:
+Support multiple hardware targets (not only MakerX GO-FOC S100).
 
-*Throttle tweaks.
+Add native speed sensor (TSDZ8)
 
-When the selected control mode is current-based, the value runs through haz_throttle_process, which is our custom “current envelope”:
-A 12 Hz one-pole low-pass smooths any bike jitter before we even think about torque.
-We track both absolute battery current (l_in) and phase current (l_current_max). The normalized request is clamped so you can never ask for more than either limit.
-At very low duty (the first ~8 % of electrical rotation) we scale the request down, which stops the “chain slap” spike when you crack the throttle from a dead stop.
-There’s a launch boost window (below ~12 % duty and ~250 erpm) that enforces a small minimum torque so the bike actually pulls away instead of chattering—once duty or rpm climb, the boost fades out automatically.
-Ramp-up/down is asymmetric: we accelerate between 10–30 A/s based on how far you’ve opened the throttle, but the controller never increases faster than the available headroom (phase/batt actuals are compared against their limits and fall back to a gentler 10 A/s if you’re already saturating). Roll-off is capped at 40 A/s so letting go feels immediate without a jerk.
-Regen/brake commands (negative throttle) bypass the fancy stuff; we simply decay the drive command to zero and let the standard brake current path take over.
-
-This is currently implemented and may be tuned and/or better yet, have its variables tied to an option currently not being used in vesc tool to tweak after compile time.
-
-*Add pas support (currently working with a generic 3 wire cadence sensor, maybe add native tsdz8 sensor in near future)
-
-cadence sensing on the PPM input
-
-interrupt-based timing for accurate pulse spacing
-
-a cadence-driven ERPM target (motor matches your legs)
-
-throttle always overrides PAS
-
-PAS only active when throttle is idle
-
-zero CPU-wasting loops
-
-Basically:
-The motor mirrors your pedaling speed.
-If I spin faster, it spins faster.
-If I stop, it stops.
-If I twist throttle, PAS shuts the hell up.
+Investigate torque-sensor feasibility
 
 
-Throttle remains king in this firmware.
-PAS never overrides or limits it.
 
-3. S100-Specific Tweaks
+
+GO-FOC S100-Specific Tweaks
 
 Things like:
 
