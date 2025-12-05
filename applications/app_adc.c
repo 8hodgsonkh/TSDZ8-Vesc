@@ -39,17 +39,29 @@
 #define RPM_FILTER_SAMPLES				8
 #define TC_DIFF_MAX_PASS				60  // TODO: move to app_conf
 #define PAS_THROTTLE_IDLE_GATE		0.05f
-#define PAS_FOLLOW_START_ROTATIONS	0.15f
-#define PAS_FOLLOW_IDLE_TIMEOUT_S	0.6f
-#define PAS_FOLLOW_BASE_CURRENT_FRAC	0.2f
-#define PAS_FOLLOW_BASE_RPM_FULL	40.0f
-#define PAS_FOLLOW_KP_A_PER_ERPM	0.01f
-#define PAS_FOLLOW_DEADBAND_ERPM	30.0f
-#define PAS_FOLLOW_TARGET_LEAD	1.08f
-#define PAS_FOLLOW_RAMP_UP_BASE_A_PER_S	5.0f
-#define PAS_FOLLOW_RAMP_UP_FULL_A_PER_S	25.0f
-#define PAS_FOLLOW_RAMP_UP_RISE_TIME_S	2.0f
-#define PAS_FOLLOW_RAMP_DOWN_A_PER_S	60.0f
+#define PAS_FOLLOW_START_ROTATIONS_DEFAULT	0.15f
+#define PAS_FOLLOW_IDLE_TIMEOUT_S_DEFAULT	0.6f
+#define PAS_FOLLOW_BASE_CURRENT_FRAC_DEFAULT	0.2f
+#define PAS_FOLLOW_BASE_RPM_FULL_DEFAULT	40.0f
+#define PAS_FOLLOW_KP_A_PER_ERPM_DEFAULT	0.01f
+#define PAS_FOLLOW_DEADBAND_ERPM_DEFAULT	30.0f
+#define PAS_FOLLOW_TARGET_LEAD_DEFAULT	1.08f
+#define PAS_FOLLOW_RAMP_UP_BASE_A_PER_S_DEFAULT	5.0f
+#define PAS_FOLLOW_RAMP_UP_FULL_A_PER_S_DEFAULT	25.0f
+#define PAS_FOLLOW_RAMP_UP_RISE_TIME_S_DEFAULT	2.0f
+#define PAS_FOLLOW_RAMP_DOWN_A_PER_S_DEFAULT	60.0f
+#define HAZ_THR_RELEASE_EPS_DEFAULT	0.01f
+#define HAZ_THR_DUTY_GATE_SPAN_DEFAULT	0.08f
+#define HAZ_THR_DUTY_GATE_MIN_SCALE_DEFAULT	0.35f
+#define HAZ_THR_LAUNCH_BOOST_REL_DEFAULT	0.08f
+#define HAZ_THR_LAUNCH_BOOST_THROTTLE_DEFAULT	0.15f
+#define HAZ_THR_LAUNCH_BOOST_RELEASE_DUTY_DEFAULT	0.12f
+#define HAZ_THR_LAUNCH_BOOST_RELEASE_ERPM_DEFAULT	250.0f
+#define HAZ_THR_RAMP_UP_MIN_A_DEFAULT	10.0f
+#define HAZ_THR_RAMP_UP_MAX_A_DEFAULT	40.0f
+#define HAZ_THR_RAMP_UP_LIMITED_A_DEFAULT	12.0f
+#define HAZ_THR_RAMP_DOWN_A_DEFAULT	40.0f
+#define HAZ_THR_FILTER_HZ_DEFAULT	12.0f
 
 #define CTRL_USES_BUTTON(ctrl_type)(\
 			ctrl_type == ADC_CTRL_TYPE_CURRENT_REV_BUTTON || \
@@ -58,6 +70,23 @@
 			ctrl_type == ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_BUTTON || \
 			ctrl_type == ADC_CTRL_TYPE_DUTY_REV_BUTTON || \
 			ctrl_type == ADC_CTRL_TYPE_PID_REV_BUTTON)
+
+	static float haz_conf_clamp(float value, float fallback, float min_value, float max_value) {
+		float out = isfinite(value) ? value : fallback;
+		if (!isfinite(out)) {
+			out = fallback;
+		}
+		if (max_value > min_value) {
+			utils_truncate_number(&out, min_value, max_value);
+		} else if (out < min_value) {
+			out = min_value;
+		}
+		return out;
+	}
+
+	static float haz_pas_conf_clamp(float value, float fallback, float min_value, float max_value) {
+		return haz_conf_clamp(value, fallback, min_value, max_value);
+	}
 
 // Threads
 static THD_FUNCTION(adc_thread, arg);
@@ -138,18 +167,72 @@ static float haz_throttle_step(float current, float target, float rate_per_s, fl
 }
 
 static float haz_throttle_process(float pwr_in, float dt_s) {
-	const float release_eps = 0.01f;
-	const float duty_gate_span = 0.08f;
-	const float duty_gate_min_scale = 0.35f;
-	const float launch_boost_rel = 0.08f;
-	const float launch_boost_throttle = 0.15f;
-	const float launch_boost_release_duty = 0.12f;
-	const float launch_boost_release_erpm = 250.0f;
-	const float ramp_up_min_a = 10.0f;
-	const float ramp_up_max_a = 40.0f;
-	const float ramp_up_limited_a = 12.0f;
-	const float ramp_down_a = 40.0f;
-	const float throttle_filter_hz = 12.0f;
+	const app_configuration *appconf = app_get_configuration();
+	const adc_config *adc_conf = &appconf->app_adc_conf;
+	const float release_eps = haz_conf_clamp(
+		adc_conf->haz_throttle_release_eps,
+		HAZ_THR_RELEASE_EPS_DEFAULT,
+		0.0f,
+		0.2f);
+	const float duty_gate_span = haz_conf_clamp(
+		adc_conf->haz_throttle_duty_gate_span,
+		HAZ_THR_DUTY_GATE_SPAN_DEFAULT,
+		0.0f,
+		0.5f);
+	const float duty_gate_min_scale = haz_conf_clamp(
+		adc_conf->haz_throttle_duty_gate_min_scale,
+		HAZ_THR_DUTY_GATE_MIN_SCALE_DEFAULT,
+		0.0f,
+		1.0f);
+	const float launch_boost_rel = haz_conf_clamp(
+		adc_conf->haz_throttle_launch_boost_rel,
+		HAZ_THR_LAUNCH_BOOST_REL_DEFAULT,
+		0.0f,
+		1.0f);
+	const float launch_boost_throttle = haz_conf_clamp(
+		adc_conf->haz_throttle_launch_boost_throttle,
+		HAZ_THR_LAUNCH_BOOST_THROTTLE_DEFAULT,
+		0.01f,
+		1.0f);
+	const float launch_boost_release_duty = haz_conf_clamp(
+		adc_conf->haz_throttle_launch_boost_release_duty,
+		HAZ_THR_LAUNCH_BOOST_RELEASE_DUTY_DEFAULT,
+		0.0f,
+		0.6f);
+	const float launch_boost_release_erpm = haz_conf_clamp(
+		adc_conf->haz_throttle_launch_boost_release_erpm,
+		HAZ_THR_LAUNCH_BOOST_RELEASE_ERPM_DEFAULT,
+		0.0f,
+		2000.0f);
+	float ramp_up_min_a = haz_conf_clamp(
+		adc_conf->haz_throttle_ramp_up_min_a,
+		HAZ_THR_RAMP_UP_MIN_A_DEFAULT,
+		0.0f,
+		200.0f);
+	float ramp_up_max_a = haz_conf_clamp(
+		adc_conf->haz_throttle_ramp_up_max_a,
+		HAZ_THR_RAMP_UP_MAX_A_DEFAULT,
+		ramp_up_min_a,
+		400.0f);
+	const float ramp_up_limited_a = haz_conf_clamp(
+		adc_conf->haz_throttle_ramp_up_limited_a,
+		HAZ_THR_RAMP_UP_LIMITED_A_DEFAULT,
+		0.0f,
+		400.0f);
+	const float ramp_down_a = haz_conf_clamp(
+		adc_conf->haz_throttle_ramp_down_a,
+		HAZ_THR_RAMP_DOWN_A_DEFAULT,
+		0.0f,
+		400.0f);
+	const float throttle_filter_hz = haz_conf_clamp(
+		adc_conf->haz_throttle_filter_hz,
+		HAZ_THR_FILTER_HZ_DEFAULT,
+		0.0f,
+		200.0f);
+
+	if (ramp_up_max_a < ramp_up_min_a) {
+		ramp_up_max_a = ramp_up_min_a;
+	}
 
 	if (pwr_in < 0.0f) {
 		// braking/regen path untouched, decay drive command quickly
@@ -183,7 +266,7 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 
 	float target_batt_a = mag * max_batt_a;
 	float duty_now = fabsf(mc_interface_get_duty_cycle_now());
-	if (duty_now < duty_gate_span) {
+	if (duty_gate_span > 1e-5f && duty_now < duty_gate_span) {
 		float ratio = duty_now / duty_gate_span;
 		utils_truncate_number(&ratio, 0.0f, 1.0f);
 		float scale = duty_gate_min_scale + (1.0f - duty_gate_min_scale) * ratio;
@@ -198,7 +281,7 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 	float rpm_now_abs = fabsf(mc_interface_get_rpm());
 	bool launch_boost_window = (duty_now < launch_boost_release_duty) &&
 		(rpm_now_abs < launch_boost_release_erpm);
-	if (launch_boost_window && mag > release_eps) {
+	if (launch_boost_window && mag > release_eps && launch_boost_throttle > 1e-4f) {
 		float boost_mix = 1.0f - (mag / launch_boost_throttle);
 		utils_truncate_number(&boost_mix, 0.0f, 1.0f);
 		float min_phase_a = launch_boost_rel * max_phase_a * boost_mix;
@@ -258,11 +341,70 @@ static float haz_pas_follow_process(float dt_s) {
 		return 0.0f;
 	}
 
+	const float start_rotations = haz_pas_conf_clamp(
+		pas_conf->pas_follow_start_rotations,
+		PAS_FOLLOW_START_ROTATIONS_DEFAULT,
+		0.01f,
+		2.0f);
+	const float idle_timeout_s = haz_pas_conf_clamp(
+		pas_conf->pas_follow_idle_timeout_s,
+		PAS_FOLLOW_IDLE_TIMEOUT_S_DEFAULT,
+		0.05f,
+		5.0f);
+	const float base_current_frac = haz_pas_conf_clamp(
+		pas_conf->pas_follow_base_current_frac,
+		PAS_FOLLOW_BASE_CURRENT_FRAC_DEFAULT,
+		0.0f,
+		1.0f);
+	const float base_rpm_full = haz_pas_conf_clamp(
+		pas_conf->pas_follow_base_rpm_full,
+		PAS_FOLLOW_BASE_RPM_FULL_DEFAULT,
+		1.0f,
+		200.0f);
+	const float kp_a_per_erpm = haz_pas_conf_clamp(
+		pas_conf->pas_follow_kp_a_per_erpm,
+		PAS_FOLLOW_KP_A_PER_ERPM_DEFAULT,
+		0.0f,
+		2.0f);
+	const float deadband_erpm = haz_pas_conf_clamp(
+		pas_conf->pas_follow_deadband_erpm,
+		PAS_FOLLOW_DEADBAND_ERPM_DEFAULT,
+		0.0f,
+		500.0f);
+	const float target_lead = haz_pas_conf_clamp(
+		pas_conf->pas_follow_target_lead,
+		PAS_FOLLOW_TARGET_LEAD_DEFAULT,
+		0.5f,
+		2.0f);
+	float ramp_up_base_a = haz_pas_conf_clamp(
+		pas_conf->pas_follow_ramp_up_base_a_per_s,
+		PAS_FOLLOW_RAMP_UP_BASE_A_PER_S_DEFAULT,
+		0.0f,
+		200.0f);
+	float ramp_up_full_a = haz_pas_conf_clamp(
+		pas_conf->pas_follow_ramp_up_full_a_per_s,
+		PAS_FOLLOW_RAMP_UP_FULL_A_PER_S_DEFAULT,
+		0.0f,
+		400.0f);
+	const float ramp_up_rise_time_s = haz_pas_conf_clamp(
+		pas_conf->pas_follow_ramp_up_rise_time_s,
+		PAS_FOLLOW_RAMP_UP_RISE_TIME_S_DEFAULT,
+		0.01f,
+		10.0f);
+	const float ramp_down_a = haz_pas_conf_clamp(
+		pas_conf->pas_follow_ramp_down_a_per_s,
+		PAS_FOLLOW_RAMP_DOWN_A_PER_S_DEFAULT,
+		0.0f,
+		400.0f);
+	if (ramp_up_full_a < ramp_up_base_a) {
+		ramp_up_full_a = ramp_up_base_a;
+	}
+
 	float target_erpm = app_pas_get_target_erpm();
 	float pedal_rpm = app_pas_get_pedal_rpm();
 	if (target_erpm <= 0.0f || pedal_rpm <= 0.1f) {
 		haz_pas_follow_ctx.idle_time += dt_s;
-		if (haz_pas_follow_ctx.idle_time > PAS_FOLLOW_IDLE_TIMEOUT_S) {
+		if (haz_pas_follow_ctx.idle_time > idle_timeout_s) {
 			haz_pas_follow_reset();
 		}
 		return 0.0f;
@@ -270,9 +412,9 @@ static float haz_pas_follow_process(float dt_s) {
 
 	haz_pas_follow_ctx.idle_time = 0.0f;
 	float rotations = (pedal_rpm / 60.0f) * dt_s;
-	haz_pas_follow_ctx.rotation_progress = fminf(haz_pas_follow_ctx.rotation_progress + rotations, PAS_FOLLOW_START_ROTATIONS);
+	haz_pas_follow_ctx.rotation_progress = fminf(haz_pas_follow_ctx.rotation_progress + rotations, start_rotations);
 	if (!haz_pas_follow_ctx.engaged) {
-		if (haz_pas_follow_ctx.rotation_progress >= PAS_FOLLOW_START_ROTATIONS) {
+		if (haz_pas_follow_ctx.rotation_progress >= start_rotations) {
 			haz_pas_follow_ctx.engaged = true;
 		} else {
 			return 0.0f;
@@ -300,17 +442,17 @@ static float haz_pas_follow_process(float dt_s) {
 		max_current = max_phase_a;
 	}
 
-	float target_erpm_lead = target_erpm * PAS_FOLLOW_TARGET_LEAD;
+	float target_erpm_lead = target_erpm * target_lead;
 	float erpm_now = mc_interface_get_rpm();
 	float erpm_err = target_erpm_lead - erpm_now;
-	if (fabsf(erpm_err) < PAS_FOLLOW_DEADBAND_ERPM) {
+	if (fabsf(erpm_err) < deadband_erpm) {
 		erpm_err = 0.0f;
 	}
 
-	float trim_current = erpm_err * PAS_FOLLOW_KP_A_PER_ERPM;
-	float base_current = max_current * PAS_FOLLOW_BASE_CURRENT_FRAC;
-	if (pedal_rpm < PAS_FOLLOW_BASE_RPM_FULL) {
-		float scale = pedal_rpm / PAS_FOLLOW_BASE_RPM_FULL;
+	float trim_current = erpm_err * kp_a_per_erpm;
+	float base_current = max_current * base_current_frac;
+	if (pedal_rpm < base_rpm_full) {
+		float scale = base_rpm_full > 1e-3f ? (pedal_rpm / base_rpm_full) : 0.0f;
 		utils_truncate_number(&scale, 0.0f, 1.0f);
 		base_current *= scale;
 	}
@@ -320,8 +462,8 @@ static float haz_pas_follow_process(float dt_s) {
 	float target_rel = target_current / max_phase_a;
 	if (target_rel >= haz_pas_follow_ctx.current_rel_cmd) {
 		haz_pas_follow_ctx.ramp_elapsed += dt_s;
-		if (haz_pas_follow_ctx.ramp_elapsed > PAS_FOLLOW_RAMP_UP_RISE_TIME_S) {
-			haz_pas_follow_ctx.ramp_elapsed = PAS_FOLLOW_RAMP_UP_RISE_TIME_S;
+		if (haz_pas_follow_ctx.ramp_elapsed > ramp_up_rise_time_s) {
+			haz_pas_follow_ctx.ramp_elapsed = ramp_up_rise_time_s;
 		}
 	} else {
 		haz_pas_follow_ctx.ramp_elapsed = 0.0f;
@@ -330,15 +472,14 @@ static float haz_pas_follow_process(float dt_s) {
 	float ramp_rate = 0.0f;
 	if (target_rel >= haz_pas_follow_ctx.current_rel_cmd) {
 		float ramp_ratio = 1.0f;
-		if (PAS_FOLLOW_RAMP_UP_RISE_TIME_S > 1e-3f) {
-			ramp_ratio = haz_pas_follow_ctx.ramp_elapsed / PAS_FOLLOW_RAMP_UP_RISE_TIME_S;
+		if (ramp_up_rise_time_s > 1e-3f) {
+			ramp_ratio = haz_pas_follow_ctx.ramp_elapsed / ramp_up_rise_time_s;
 		}
 		utils_truncate_number(&ramp_ratio, 0.0f, 1.0f);
-		float ramp_up_a = PAS_FOLLOW_RAMP_UP_BASE_A_PER_S +
-			(PAS_FOLLOW_RAMP_UP_FULL_A_PER_S - PAS_FOLLOW_RAMP_UP_BASE_A_PER_S) * ramp_ratio;
+		float ramp_up_a = ramp_up_base_a + (ramp_up_full_a - ramp_up_base_a) * ramp_ratio;
 		ramp_rate = ramp_up_a / max_phase_a;
 	} else {
-		ramp_rate = PAS_FOLLOW_RAMP_DOWN_A_PER_S / max_phase_a;
+		ramp_rate = ramp_down_a / max_phase_a;
 	}
 	haz_pas_follow_ctx.current_rel_cmd = haz_throttle_step(
 		haz_pas_follow_ctx.current_rel_cmd,

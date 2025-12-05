@@ -26,6 +26,10 @@
 #undef HAZZA_SHUTDOWN_TOGGLE_GUARD
 #define HAZZA_SHUTDOWN_TOGGLE_GUARD	1
 
+// Increase packet buffer size for hazza extended config fields
+// Stock mcconf is ~550 bytes, hazza adds ~110 bytes = ~660 bytes total
+#define PACKET_MAX_PL_LEN		1024
+
 // HW properties
 #define HW_HAS_3_SHUNTS
 #define INVERTED_SHUNT_POLARITY

@@ -384,6 +384,32 @@ typedef enum {
 } SAT_COMP_MODE;
 
 typedef struct {
+	float slack_erpm_max;
+	float slack_exit_erpm;
+	float erpm_slope_threshold;
+	float iq_overshoot_margin;
+	float iq_min_trigger;
+	float iq_jump_margin;
+	float mod_sat_trigger;
+	float angle_stall_rad;
+	float iq_slew_a_per_s;
+	float iq_slew_recovery_max;
+	float pi_scale_active_d_kp;
+	float pi_scale_active_d_ki;
+	float pi_scale_active_q_kp;
+	float pi_scale_active_q_ki;
+	float active_dwell_ms;
+	float recovery_time_ms;
+	float int_bleed_factor;
+	uint16_t int_bleed_cycles;
+	float precharge_exit_erpm;
+	float precharge_exit_time_s;
+	float precharge_reset_erpm;
+	float precharge_min_iq;
+	float precharge_iq_floor;
+} hazza_mid_configuration;
+
+typedef struct {
 	// Limits
 	float l_current_max;
 	float l_current_min;
@@ -583,6 +609,8 @@ typedef struct {
 	// BMS Configuration
 	bms_config bms;
 
+	hazza_mid_configuration hazza_mid_conf;
+
 	// Protect from flash corruption.
 	uint16_t crc;
 } mc_configuration;
@@ -710,6 +738,18 @@ typedef struct {
 	bool tc;
 	float tc_max_diff;
 	uint32_t update_rate_hz;
+	float haz_throttle_release_eps;
+	float haz_throttle_duty_gate_span;
+	float haz_throttle_duty_gate_min_scale;
+	float haz_throttle_launch_boost_rel;
+	float haz_throttle_launch_boost_throttle;
+	float haz_throttle_launch_boost_release_duty;
+	float haz_throttle_launch_boost_release_erpm;
+	float haz_throttle_ramp_up_min_a;
+	float haz_throttle_ramp_up_max_a;
+	float haz_throttle_ramp_up_limited_a;
+	float haz_throttle_ramp_down_a;
+	float haz_throttle_filter_hz;
 } adc_config;
 
 // Nunchuk control types
@@ -750,6 +790,17 @@ typedef struct {
 	float ramp_time_neg;
 	uint32_t update_rate_hz;
 	float max_current;
+	float pas_follow_start_rotations;
+	float pas_follow_idle_timeout_s;
+	float pas_follow_base_current_frac;
+	float pas_follow_base_rpm_full;
+	float pas_follow_kp_a_per_erpm;
+	float pas_follow_deadband_erpm;
+	float pas_follow_target_lead;
+	float pas_follow_ramp_up_base_a_per_s;
+	float pas_follow_ramp_up_full_a_per_s;
+	float pas_follow_ramp_up_rise_time_s;
+	float pas_follow_ramp_down_a_per_s;
 } pas_config;
 
 // NRF Datatypes

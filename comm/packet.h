@@ -25,7 +25,7 @@
 
 // Settings
 #ifndef PACKET_MAX_PL_LEN
-#define PACKET_MAX_PL_LEN		512
+#define PACKET_MAX_PL_LEN		1024
 #endif
 
 #define PACKET_BUFFER_LEN		(PACKET_MAX_PL_LEN + 8)
