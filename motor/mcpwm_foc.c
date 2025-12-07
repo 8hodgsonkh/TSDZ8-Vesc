@@ -4162,8 +4162,9 @@ static void timer_update(motor_all_state_t *motor, float dt) {
 	{
 		const float iq_input = motor->m_iq_set;
 		const bool detection_active = motor->m_state == MC_STATE_DETECTING;
+		const bool hazza_enabled = conf_now->hazza_mid_conf.enabled;
 
-		if (detection_active) {
+		if (detection_active || !hazza_enabled) {
 			motor->m_iq_set = iq_input;
 		} else {
 			volatile motor_state_t *state_h = &motor->m_motor_state;
@@ -4782,25 +4783,27 @@ static void control_current(motor_all_state_t *motor, float dt) {
 	}
 
 #if HAZZA_MIDDRIVE_TUNING
-	const hazza_slack_state_t hazza_state = (hazza_slack_state_t)motor->hazza_state;
-	const volatile hazza_mid_configuration *haz_conf = &conf_now->hazza_mid_conf;
-	if (hazza_state == HAZZA_SLACK_ACTIVE) {
-		kp_d *= haz_conf->pi_scale_active_d_kp;
-		ki_d *= haz_conf->pi_scale_active_d_ki;
-		kp_q *= haz_conf->pi_scale_active_q_kp;
-		ki_q *= haz_conf->pi_scale_active_q_ki;
-	} else if (hazza_state == HAZZA_SLACK_RECOVERING) {
-		const float recover_time = haz_conf->recovery_time_ms * 0.001f;
-		float t = recover_time > 0.0f ? motor->hazza_recovery_timer / recover_time : 1.0f;
-		utils_truncate_number(&t, 0.0f, 1.0f);
-		const float kp_d_scale = utils_map(t, 0.0f, 1.0f, haz_conf->pi_scale_active_d_kp, 1.0f);
-		const float ki_d_scale = utils_map(t, 0.0f, 1.0f, haz_conf->pi_scale_active_d_ki, 1.0f);
-		const float kp_q_scale = utils_map(t, 0.0f, 1.0f, haz_conf->pi_scale_active_q_kp, 1.0f);
-		const float ki_q_scale = utils_map(t, 0.0f, 1.0f, haz_conf->pi_scale_active_q_ki, 1.0f);
-		kp_d *= kp_d_scale;
-		ki_d *= ki_d_scale;
-		kp_q *= kp_q_scale;
-		ki_q *= ki_q_scale;
+	if (conf_now->hazza_mid_conf.enabled) {
+		const hazza_slack_state_t hazza_state = (hazza_slack_state_t)motor->hazza_state;
+		const volatile hazza_mid_configuration *haz_conf = &conf_now->hazza_mid_conf;
+		if (hazza_state == HAZZA_SLACK_ACTIVE) {
+			kp_d *= haz_conf->pi_scale_active_d_kp;
+			ki_d *= haz_conf->pi_scale_active_d_ki;
+			kp_q *= haz_conf->pi_scale_active_q_kp;
+			ki_q *= haz_conf->pi_scale_active_q_ki;
+		} else if (hazza_state == HAZZA_SLACK_RECOVERING) {
+			const float recover_time = haz_conf->recovery_time_ms * 0.001f;
+			float t = recover_time > 0.0f ? motor->hazza_recovery_timer / recover_time : 1.0f;
+			utils_truncate_number(&t, 0.0f, 1.0f);
+			const float kp_d_scale = utils_map(t, 0.0f, 1.0f, haz_conf->pi_scale_active_d_kp, 1.0f);
+			const float ki_d_scale = utils_map(t, 0.0f, 1.0f, haz_conf->pi_scale_active_d_ki, 1.0f);
+			const float kp_q_scale = utils_map(t, 0.0f, 1.0f, haz_conf->pi_scale_active_q_kp, 1.0f);
+			const float ki_q_scale = utils_map(t, 0.0f, 1.0f, haz_conf->pi_scale_active_q_ki, 1.0f);
+			kp_d *= kp_d_scale;
+			ki_d *= ki_d_scale;
+			kp_q *= kp_q_scale;
+			ki_q *= ki_q_scale;
+		}
 	}
 #endif
 

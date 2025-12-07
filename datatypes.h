@@ -384,6 +384,7 @@ typedef enum {
 } SAT_COMP_MODE;
 
 typedef struct {
+	bool enabled;
 	float slack_erpm_max;
 	float slack_exit_erpm;
 	float erpm_slope_threshold;

@@ -1625,7 +1625,11 @@ float mc_interface_get_speed(void) {
 		return m_wheel_speed_override_value;
 	} else {
 #ifdef HW_HAS_WHEEL_SPEED_SENSOR
-		return hw_get_speed();
+		// hw_get_speed() returns wheel revolutions per second
+		// Convert to m/s using wheel diameter from config
+		const volatile mc_configuration *conf = mc_interface_get_configuration();
+		float wheel_rps = hw_get_speed();
+		return wheel_rps * conf->si_wheel_diameter * M_PI;  // RPS * circumference = m/s
 #else
 		const volatile mc_configuration *conf = mc_interface_get_configuration();
 		const float rpm = mc_interface_get_rpm() / (conf->si_motor_poles / 2.0);

@@ -20,6 +20,8 @@
 #ifndef HW_100_250_H_
 #define HW_100_250_H_
 
+#include <stdint.h>
+
 #define HW_NAME					"Go-FOC S100/D100S"
 
 // Enable Hazza-specific guard so power-switch logic only runs in toggle mode
@@ -313,5 +315,28 @@
 float hw100_250_get_temp(void);
 
 bool hw_sample_shutdown_button(void);
+
+// Wheel speed sensor on motor temp pin (ADC-based threshold detection)
+// Enable this to use motor temp pin for wheel speed sensing instead of temperature
+#define HW_HAS_WHEEL_SPEED_SENSOR
+#define HW_WHEEL_SPEED_ADC_CH		ADC_IND_TEMP_MOTOR
+
+// Threshold for detecting pulse edges (0-4095 ADC range)
+// Hall sensor pulls low (~0) when magnet present, 10K pulls high (~3000+) otherwise
+// Set threshold at midpoint for reliable edge detection
+#define HW_WHEEL_SPEED_THRESH_HIGH	2000	// Above this = no magnet (high)
+#define HW_WHEEL_SPEED_THRESH_LOW	1000	// Below this = magnet present (low)
+
+// Number of magnets on wheel (pulses per revolution)
+#define HW_WHEEL_SPEED_MAGNETS		1
+
+// Standard VESC wheel speed interface (called from mc_interface.c)
+void hw_update_speed_sensor(void);
+float hw_get_speed(void);  // Returns wheel revs per second
+float hw_get_distance_abs(void);  // Returns distance in meters
+
+// Extra functions for debugging
+uint32_t hw_wheel_speed_get_pulses(void);
+uint16_t hw_wheel_speed_get_adc_raw(void);
 
 #endif /* HW_100_250_H_ */

@@ -210,6 +210,7 @@ int32_t confgenerator_serialize_mcconf(uint8_t *buffer, const mc_configuration *
 	buffer_append_float16(buffer, conf->bms.vmax_limit_start, 1000, &ind);
 	buffer_append_float16(buffer, conf->bms.vmax_limit_end, 1000, &ind);
 	buffer[ind++] = conf->bms.fwd_can_mode;
+	buffer[ind++] = conf->hazza_mid_conf.enabled;
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.slack_erpm_max, &ind);
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.slack_exit_erpm, &ind);
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.erpm_slope_threshold, &ind);
@@ -597,6 +598,7 @@ bool confgenerator_deserialize_mcconf(const uint8_t *buffer, mc_configuration *c
 	conf->bms.vmax_limit_start = buffer_get_float16(buffer, 1000, &ind);
 	conf->bms.vmax_limit_end = buffer_get_float16(buffer, 1000, &ind);
 	conf->bms.fwd_can_mode = buffer[ind++];
+	conf->hazza_mid_conf.enabled = buffer[ind++];
 	conf->hazza_mid_conf.slack_erpm_max = buffer_get_float32_auto(buffer, &ind);
 	conf->hazza_mid_conf.slack_exit_erpm = buffer_get_float32_auto(buffer, &ind);
 	conf->hazza_mid_conf.erpm_slope_threshold = buffer_get_float32_auto(buffer, &ind);
@@ -980,6 +982,7 @@ void confgenerator_set_defaults_mcconf(mc_configuration *conf) {
 	conf->bms.vmax_limit_start = MCCONF_BMS_VMAX_LIMIT_START;
 	conf->bms.vmax_limit_end = MCCONF_BMS_VMAX_LIMIT_END;
 	conf->bms.fwd_can_mode = MCCONF_BMS_FWD_CAN_MODE;
+	conf->hazza_mid_conf.enabled = MCCONF_HAZZA_ENABLED;
 	conf->hazza_mid_conf.slack_erpm_max = MCCONF_HAZZA_SLACK_ERPM_MAX;
 	conf->hazza_mid_conf.slack_exit_erpm = MCCONF_HAZZA_SLACK_EXIT_ERPM;
 	conf->hazza_mid_conf.erpm_slope_threshold = MCCONF_HAZZA_ERPMSLOPE_THRESHOLD;
