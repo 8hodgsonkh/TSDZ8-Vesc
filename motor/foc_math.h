@@ -22,6 +22,7 @@
 
 #include <stdint.h>
 #include "datatypes.h"
+#include "conf_general.h"
 
 #if HAZZA_MIDDRIVE_TUNING
 typedef enum {

@@ -401,6 +401,8 @@ typedef struct {
 	float recovery_time_ms;
 	// Precharge (startup torque smoothing)
 	float precharge_exit_erpm;
+	// PAS gear reduction (motor:chainring ratio, e.g. 38 for TSDZ8)
+	float gear_reduction;
 } hazza_mid_configuration;
 
 // Hardcoded detection heuristics (not worth tuning)

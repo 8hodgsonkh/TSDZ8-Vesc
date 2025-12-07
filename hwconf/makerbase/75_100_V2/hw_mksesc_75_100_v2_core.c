@@ -275,3 +275,6 @@ bool hw_sample_shutdown_button(void) {
 	return (bt_diff > 0.12);
 }
 #endif
+
+// Generic wheel speed sensor implementation for mid-drive support
+#include "../../hw_wheel_speed_generic.h"

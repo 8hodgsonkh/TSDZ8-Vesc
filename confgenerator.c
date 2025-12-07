@@ -374,6 +374,7 @@ int32_t confgenerator_serialize_appconf(uint8_t *buffer, const app_configuration
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.active_dwell_ms, &ind);
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.recovery_time_ms, &ind);
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.precharge_exit_erpm, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.gear_reduction, &ind);
 
 	return ind;
 }
@@ -752,6 +753,7 @@ bool confgenerator_deserialize_appconf(const uint8_t *buffer, app_configuration 
 	conf->hazza_mid_conf.active_dwell_ms = buffer_get_float32_auto(buffer, &ind);
 	conf->hazza_mid_conf.recovery_time_ms = buffer_get_float32_auto(buffer, &ind);
 	conf->hazza_mid_conf.precharge_exit_erpm = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.gear_reduction = buffer_get_float32_auto(buffer, &ind);
 
 	return true;
 }
@@ -1115,4 +1117,5 @@ void confgenerator_set_defaults_appconf(app_configuration *conf) {
 	conf->hazza_mid_conf.active_dwell_ms = APPCONF_HAZZA_ACTIVE_DWELL_MS;
 	conf->hazza_mid_conf.recovery_time_ms = APPCONF_HAZZA_RECOVERY_TIME_MS;
 	conf->hazza_mid_conf.precharge_exit_erpm = APPCONF_HAZZA_PRECHARGE_EXIT_ERPM;
+	conf->hazza_mid_conf.gear_reduction = APPCONF_HAZZA_GEAR_REDUCTION;
 }

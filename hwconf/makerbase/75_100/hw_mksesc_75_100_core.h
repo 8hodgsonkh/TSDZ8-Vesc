@@ -187,6 +187,30 @@
 #define HW_ICU_GPIO			    GPIOB
 #define HW_ICU_PIN			    6
 
+// PAS Sensor pins for TSDZ8 mid-drive
+// PAS1 uses PPM input (PB6), PAS2 uses ADC_EXT2 (PA6) for quadrature
+#define HW_USE_PAS2_DIGITAL_EXT2
+#ifndef HW_USE_PAS2_DIGITAL_EXT2
+#define HW_PAS1_PORT			GPIOB
+#define HW_PAS1_PIN				6
+#define HW_PAS2_PORT			GPIOA
+#define HW_PAS2_PIN				6
+#endif
+
+// EXTI config for single-pin PAS using PPM interrupt (PB6 = EXTI Line 6)
+#define HW_PAS_PPM_EXTI_PORTSRC	EXTI_PortSourceGPIOB
+#define HW_PAS_PPM_EXTI_PINSRC	EXTI_PinSource6
+#define HW_PAS_PPM_EXTI_LINE	EXTI_Line6
+#define HW_PAS_PPM_EXTI_CH		EXTI9_5_IRQn
+#define HW_PAS_PPM_EXTI_ISR_VEC	EXTI9_5_IRQHandler
+
+// Wheel speed sensor - repurpose motor temp ADC pin for hall-type speed sensor
+#define HW_HAS_WHEEL_SPEED_SENSOR
+#define HW_WHEEL_SPEED_ADC_CH		ADC_IND_TEMP_MOTOR
+#define HW_WHEEL_SPEED_THRESH_HIGH	2000	// Above this = no magnet (high)
+#define HW_WHEEL_SPEED_THRESH_LOW	1000	// Below this = magnet present (low)
+#define HW_WHEEL_SPEED_MAGNETS		1
+
 // I2C Peripheral
 #define HW_I2C_DEV			    I2CD2
 #define HW_I2C_GPIO_AF			GPIO_AF_I2C2
@@ -277,5 +301,14 @@
 #define HW_LIM_TEMP_FET			-40.0, 110.0
 
 // HW-specific functions
+
+// Wheel speed sensor function declarations for mid-drive support
+#ifdef HW_HAS_WHEEL_SPEED_SENSOR
+void hw_update_speed_sensor(void);
+float hw_get_speed(void);
+float hw_get_distance_abs(void);
+uint32_t hw_wheel_speed_get_pulses(void);
+uint16_t hw_wheel_speed_get_adc_raw(void);
+#endif
 
 #endif /* HW_MKSESC_75_100_CORE_H_ */

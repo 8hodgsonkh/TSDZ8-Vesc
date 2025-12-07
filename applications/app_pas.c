@@ -210,7 +210,9 @@ static float pas_get_assist_ceiling(void) {
 }
 
 static float pas_get_drive_reduction(void) {
-	float ratio = config.pedal_rpm_end;
+	// Use gear_reduction from hazza_mid_conf (motor:chainring ratio, e.g. 38 for TSDZ8)
+	const app_configuration *appconf = app_get_configuration();
+	float ratio = appconf->hazza_mid_conf.gear_reduction;
 	if (!isfinite(ratio) || ratio <= 0.0f) {
 		ratio = 1.0f;
 	}

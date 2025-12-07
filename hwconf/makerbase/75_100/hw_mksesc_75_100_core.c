@@ -242,3 +242,6 @@ void hw_try_restore_i2c(void) {
 		i2cReleaseBus(&HW_I2C_DEV);
 	}
 }
+
+// Generic wheel speed sensor implementation for mid-drive support
+#include "../../hw_wheel_speed_generic.h"
