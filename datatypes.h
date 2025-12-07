@@ -385,30 +385,36 @@ typedef enum {
 
 typedef struct {
 	bool enabled;
+	// Slack detection window
 	float slack_erpm_max;
 	float slack_exit_erpm;
+	// Detection sensitivity
 	float erpm_slope_threshold;
-	float iq_overshoot_margin;
-	float iq_min_trigger;
-	float iq_jump_margin;
-	float mod_sat_trigger;
-	float angle_stall_rad;
+	// Current slew control
 	float iq_slew_a_per_s;
 	float iq_slew_recovery_max;
+	// PI gain scaling during slack event (0.0-1.0 = reduce gains)
 	float pi_scale_active_d_kp;
-	float pi_scale_active_d_ki;
 	float pi_scale_active_q_kp;
-	float pi_scale_active_q_ki;
+	// Timing
 	float active_dwell_ms;
 	float recovery_time_ms;
-	float int_bleed_factor;
-	uint16_t int_bleed_cycles;
+	// Precharge (startup torque smoothing)
 	float precharge_exit_erpm;
-	float precharge_exit_time_s;
-	float precharge_reset_erpm;
-	float precharge_min_iq;
-	float precharge_iq_floor;
 } hazza_mid_configuration;
+
+// Hardcoded detection heuristics (not worth tuning)
+#define HAZZA_IQ_OVERSHOOT_MARGIN    15.0f
+#define HAZZA_IQ_MIN_TRIGGER         3.0f
+#define HAZZA_IQ_JUMP_MARGIN         10.0f
+#define HAZZA_MOD_SAT_TRIGGER        0.95f
+#define HAZZA_ANGLE_STALL_RAD        0.02f
+#define HAZZA_INT_BLEED_FACTOR       0.85f
+#define HAZZA_INT_BLEED_CYCLES       3
+#define HAZZA_PRECHARGE_EXIT_TIME_S  0.15f
+#define HAZZA_PRECHARGE_RESET_ERPM   50.0f
+#define HAZZA_PRECHARGE_MIN_IQ       1.0f
+#define HAZZA_PRECHARGE_IQ_FLOOR     5.0f
 
 typedef struct {
 	// Limits
@@ -609,8 +615,6 @@ typedef struct {
 
 	// BMS Configuration
 	bms_config bms;
-
-	hazza_mid_configuration hazza_mid_conf;
 
 	// Protect from flash corruption.
 	uint16_t crc;
@@ -989,6 +993,9 @@ typedef struct {
 
 	// IMU Settings
 	imu_config imu_conf;
+
+	// Hazza Mid Drive Tuning
+	hazza_mid_configuration hazza_mid_conf;
 
 	// Protect from flash corruption
 	uint16_t crc;

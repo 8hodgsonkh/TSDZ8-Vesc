@@ -81,6 +81,7 @@ static void(* volatile send_func)(unsigned char *data, unsigned int len) = 0;
 static void(* volatile send_func_blocking)(unsigned char *data, unsigned int len) = 0;
 static void(* volatile send_func_nrf)(unsigned char *data, unsigned int len) = 0;
 static void(* volatile send_func_can_fwd)(unsigned char *data, unsigned int len) = 0;
+static void(* volatile reply_func_last)(unsigned char *data, unsigned int len) = 0;
 static void(* volatile appdata_func)(unsigned char *data, unsigned int len) = 0;
 static void(* volatile hwdata_func)(unsigned char *data, unsigned int len) = 0;
 static disp_pos_mode display_position_mode;
@@ -215,6 +216,7 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 	} else {
 		if (packet_id != COMM_LISP_RMSG) {
 			send_func = reply_func;
+			reply_func_last = reply_func ? reply_func : reply_func_last;
 		}
 	}
 
@@ -1862,8 +1864,25 @@ void commands_send_mcconf(COMM_PACKET_ID packet_id, mc_configuration* mcconf, vo
 	uint8_t *send_buffer_global = mempools_get_packet_buffer();
 	send_buffer_global[0] = packet_id;
 	int32_t len = confgenerator_serialize_mcconf(send_buffer_global + 1, mcconf);
-	if (reply_func) {
-		reply_func(send_buffer_global, len + 1);
+	if (len <= 0) {
+		commands_printf("MCCONF serialize failed len=%d (sig=%u)", len, MCCONF_SIGNATURE);
+		mempools_free_packet_buffer(send_buffer_global);
+		return;
+	}
+
+	void(*tx_func)(unsigned char *, unsigned int) = reply_func;
+	if (!tx_func) {
+		tx_func = reply_func_last;
+	}
+	if (!tx_func) {
+		tx_func = send_func;
+	}
+
+	commands_printf("MCCONF send len=%d via %p (req=%p last=%p global=%p)",
+			len, tx_func, reply_func, reply_func_last, send_func);
+
+	if (tx_func) {
+		tx_func(send_buffer_global, len + 1);
 	} else {
 		commands_send_packet(send_buffer_global, len + 1);
 	}

@@ -210,30 +210,6 @@ int32_t confgenerator_serialize_mcconf(uint8_t *buffer, const mc_configuration *
 	buffer_append_float16(buffer, conf->bms.vmax_limit_start, 1000, &ind);
 	buffer_append_float16(buffer, conf->bms.vmax_limit_end, 1000, &ind);
 	buffer[ind++] = conf->bms.fwd_can_mode;
-	buffer[ind++] = conf->hazza_mid_conf.enabled;
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.slack_erpm_max, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.slack_exit_erpm, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.erpm_slope_threshold, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.iq_overshoot_margin, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.iq_min_trigger, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.iq_jump_margin, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.mod_sat_trigger, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.angle_stall_rad, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.iq_slew_a_per_s, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.iq_slew_recovery_max, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.pi_scale_active_d_kp, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.pi_scale_active_d_ki, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.pi_scale_active_q_kp, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.pi_scale_active_q_ki, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.active_dwell_ms, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.recovery_time_ms, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.int_bleed_factor, &ind);
-	buffer_append_uint16(buffer, conf->hazza_mid_conf.int_bleed_cycles, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.precharge_exit_erpm, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.precharge_exit_time_s, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.precharge_reset_erpm, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.precharge_min_iq, &ind);
-	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.precharge_iq_floor, &ind);
 
 	return ind;
 }
@@ -386,6 +362,18 @@ int32_t confgenerator_serialize_appconf(uint8_t *buffer, const app_configuration
 	buffer_append_float32_auto(buffer, conf->imu_conf.gyro_offsets[0], &ind);
 	buffer_append_float32_auto(buffer, conf->imu_conf.gyro_offsets[1], &ind);
 	buffer_append_float32_auto(buffer, conf->imu_conf.gyro_offsets[2], &ind);
+	// Hazza mid-drive config (reduced to 11 tunable params)
+	buffer[ind++] = conf->hazza_mid_conf.enabled;
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.slack_erpm_max, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.slack_exit_erpm, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.erpm_slope_threshold, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.iq_slew_a_per_s, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.iq_slew_recovery_max, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.pi_scale_active_d_kp, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.pi_scale_active_q_kp, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.active_dwell_ms, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.recovery_time_ms, &ind);
+	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.precharge_exit_erpm, &ind);
 
 	return ind;
 }
@@ -598,30 +586,6 @@ bool confgenerator_deserialize_mcconf(const uint8_t *buffer, mc_configuration *c
 	conf->bms.vmax_limit_start = buffer_get_float16(buffer, 1000, &ind);
 	conf->bms.vmax_limit_end = buffer_get_float16(buffer, 1000, &ind);
 	conf->bms.fwd_can_mode = buffer[ind++];
-	conf->hazza_mid_conf.enabled = buffer[ind++];
-	conf->hazza_mid_conf.slack_erpm_max = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.slack_exit_erpm = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.erpm_slope_threshold = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.iq_overshoot_margin = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.iq_min_trigger = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.iq_jump_margin = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.mod_sat_trigger = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.angle_stall_rad = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.iq_slew_a_per_s = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.iq_slew_recovery_max = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.pi_scale_active_d_kp = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.pi_scale_active_d_ki = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.pi_scale_active_q_kp = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.pi_scale_active_q_ki = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.active_dwell_ms = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.recovery_time_ms = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.int_bleed_factor = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.int_bleed_cycles = buffer_get_uint16(buffer, &ind);
-	conf->hazza_mid_conf.precharge_exit_erpm = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.precharge_exit_time_s = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.precharge_reset_erpm = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.precharge_min_iq = buffer_get_float32_auto(buffer, &ind);
-	conf->hazza_mid_conf.precharge_iq_floor = buffer_get_float32_auto(buffer, &ind);
 
 	return true;
 }
@@ -777,6 +741,17 @@ bool confgenerator_deserialize_appconf(const uint8_t *buffer, app_configuration 
 	conf->imu_conf.gyro_offsets[0] = buffer_get_float32_auto(buffer, &ind);
 	conf->imu_conf.gyro_offsets[1] = buffer_get_float32_auto(buffer, &ind);
 	conf->imu_conf.gyro_offsets[2] = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.enabled = buffer[ind++];
+	conf->hazza_mid_conf.slack_erpm_max = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.slack_exit_erpm = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.erpm_slope_threshold = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.iq_slew_a_per_s = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.iq_slew_recovery_max = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.pi_scale_active_d_kp = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.pi_scale_active_q_kp = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.active_dwell_ms = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.recovery_time_ms = buffer_get_float32_auto(buffer, &ind);
+	conf->hazza_mid_conf.precharge_exit_erpm = buffer_get_float32_auto(buffer, &ind);
 
 	return true;
 }
@@ -982,30 +957,6 @@ void confgenerator_set_defaults_mcconf(mc_configuration *conf) {
 	conf->bms.vmax_limit_start = MCCONF_BMS_VMAX_LIMIT_START;
 	conf->bms.vmax_limit_end = MCCONF_BMS_VMAX_LIMIT_END;
 	conf->bms.fwd_can_mode = MCCONF_BMS_FWD_CAN_MODE;
-	conf->hazza_mid_conf.enabled = MCCONF_HAZZA_ENABLED;
-	conf->hazza_mid_conf.slack_erpm_max = MCCONF_HAZZA_SLACK_ERPM_MAX;
-	conf->hazza_mid_conf.slack_exit_erpm = MCCONF_HAZZA_SLACK_EXIT_ERPM;
-	conf->hazza_mid_conf.erpm_slope_threshold = MCCONF_HAZZA_ERPMSLOPE_THRESHOLD;
-	conf->hazza_mid_conf.iq_overshoot_margin = MCCONF_HAZZA_IQ_OVERSHOOT_MARGIN;
-	conf->hazza_mid_conf.iq_min_trigger = MCCONF_HAZZA_IQ_MIN_TRIGGER;
-	conf->hazza_mid_conf.iq_jump_margin = MCCONF_HAZZA_IQ_JUMP_MARGIN;
-	conf->hazza_mid_conf.mod_sat_trigger = MCCONF_HAZZA_MOD_SAT_TRIGGER;
-	conf->hazza_mid_conf.angle_stall_rad = MCCONF_HAZZA_ANGLE_STALL_RAD;
-	conf->hazza_mid_conf.iq_slew_a_per_s = MCCONF_HAZZA_IQ_SLEW_A_PER_S;
-	conf->hazza_mid_conf.iq_slew_recovery_max = MCCONF_HAZZA_IQ_SLEW_RECOVERY_MAX;
-	conf->hazza_mid_conf.pi_scale_active_d_kp = MCCONF_HAZZA_PI_SCALE_ACTIVE_D_KP;
-	conf->hazza_mid_conf.pi_scale_active_d_ki = MCCONF_HAZZA_PI_SCALE_ACTIVE_D_KI;
-	conf->hazza_mid_conf.pi_scale_active_q_kp = MCCONF_HAZZA_PI_SCALE_ACTIVE_Q_KP;
-	conf->hazza_mid_conf.pi_scale_active_q_ki = MCCONF_HAZZA_PI_SCALE_ACTIVE_Q_KI;
-	conf->hazza_mid_conf.active_dwell_ms = MCCONF_HAZZA_ACTIVE_DWELL_MS;
-	conf->hazza_mid_conf.recovery_time_ms = MCCONF_HAZZA_RECOVERY_TIME_MS;
-	conf->hazza_mid_conf.int_bleed_factor = MCCONF_HAZZA_INT_BLEED_FACTOR;
-	conf->hazza_mid_conf.int_bleed_cycles = MCCONF_HAZZA_INT_BLEED_CYCLES;
-	conf->hazza_mid_conf.precharge_exit_erpm = MCCONF_HAZZA_PRECHARGE_EXIT_ERPM;
-	conf->hazza_mid_conf.precharge_exit_time_s = MCCONF_HAZZA_PRECHARGE_EXIT_TIME_S;
-	conf->hazza_mid_conf.precharge_reset_erpm = MCCONF_HAZZA_PRECHARGE_RESET_ERPM;
-	conf->hazza_mid_conf.precharge_min_iq = MCCONF_HAZZA_PRECHARGE_MIN_IQ;
-	conf->hazza_mid_conf.precharge_iq_floor = MCCONF_HAZZA_PRECHARGE_IQ_FLOOR;
 }
 
 void confgenerator_set_defaults_appconf(app_configuration *conf) {
@@ -1152,4 +1103,16 @@ void confgenerator_set_defaults_appconf(app_configuration *conf) {
 	conf->imu_conf.gyro_offsets[0] = APPCONF_IMU_G_OFFSET_0;
 	conf->imu_conf.gyro_offsets[1] = APPCONF_IMU_G_OFFSET_1;
 	conf->imu_conf.gyro_offsets[2] = APPCONF_IMU_G_OFFSET_2;
+	// Hazza mid-drive defaults (reduced to 11 tunable params)
+	conf->hazza_mid_conf.enabled = APPCONF_HAZZA_ENABLED;
+	conf->hazza_mid_conf.slack_erpm_max = APPCONF_HAZZA_SLACK_ERPM_MAX;
+	conf->hazza_mid_conf.slack_exit_erpm = APPCONF_HAZZA_SLACK_EXIT_ERPM;
+	conf->hazza_mid_conf.erpm_slope_threshold = APPCONF_HAZZA_ERPMSLOPE_THRESHOLD;
+	conf->hazza_mid_conf.iq_slew_a_per_s = APPCONF_HAZZA_IQ_SLEW_A_PER_S;
+	conf->hazza_mid_conf.iq_slew_recovery_max = APPCONF_HAZZA_IQ_SLEW_RECOVERY_MAX;
+	conf->hazza_mid_conf.pi_scale_active_d_kp = APPCONF_HAZZA_PI_SCALE_ACTIVE_D_KP;
+	conf->hazza_mid_conf.pi_scale_active_q_kp = APPCONF_HAZZA_PI_SCALE_ACTIVE_Q_KP;
+	conf->hazza_mid_conf.active_dwell_ms = APPCONF_HAZZA_ACTIVE_DWELL_MS;
+	conf->hazza_mid_conf.recovery_time_ms = APPCONF_HAZZA_RECOVERY_TIME_MS;
+	conf->hazza_mid_conf.precharge_exit_erpm = APPCONF_HAZZA_PRECHARGE_EXIT_ERPM;
 }

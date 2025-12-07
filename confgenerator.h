@@ -8,8 +8,8 @@
 #include <stdbool.h>
 
 // Constants
-#define MCCONF_SIGNATURE		2030253451
-#define APPCONF_SIGNATURE		608756439
+#define MCCONF_SIGNATURE		788332866
+#define APPCONF_SIGNATURE		1756572122  // Updated: reduced hazza params from 24 to 11
 
 // Functions
 int32_t confgenerator_serialize_mcconf(uint8_t *buffer, const mc_configuration *conf);
