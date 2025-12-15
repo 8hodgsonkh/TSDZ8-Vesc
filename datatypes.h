@@ -753,6 +753,8 @@ typedef struct {
 	float haz_throttle_launch_boost_release_duty;
 	float haz_throttle_launch_boost_release_erpm;
 	float haz_throttle_ramp_up_min_a;
+	float haz_throttle_ramp_up_mid_a;        // Ramp rate at mid throttle point
+	float haz_throttle_ramp_up_mid_throttle; // Throttle position for mid point (0-1)
 	float haz_throttle_ramp_up_max_a;
 	float haz_throttle_ramp_up_limited_a;
 	float haz_throttle_ramp_down_a;

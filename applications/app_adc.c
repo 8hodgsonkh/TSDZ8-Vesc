@@ -58,6 +58,8 @@
 #define HAZ_THR_LAUNCH_BOOST_RELEASE_DUTY_DEFAULT	0.12f
 #define HAZ_THR_LAUNCH_BOOST_RELEASE_ERPM_DEFAULT	250.0f
 #define HAZ_THR_RAMP_UP_MIN_A_DEFAULT	10.0f
+#define HAZ_THR_RAMP_UP_MID_A_DEFAULT	25.0f
+#define HAZ_THR_RAMP_UP_MID_THROTTLE_DEFAULT	0.5f
 #define HAZ_THR_RAMP_UP_MAX_A_DEFAULT	40.0f
 #define HAZ_THR_RAMP_UP_LIMITED_A_DEFAULT	12.0f
 #define HAZ_THR_RAMP_DOWN_A_DEFAULT	40.0f
@@ -209,6 +211,16 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 		HAZ_THR_RAMP_UP_MIN_A_DEFAULT,
 		0.0f,
 		200.0f);
+	float ramp_up_mid_a = haz_conf_clamp(
+		adc_conf->haz_throttle_ramp_up_mid_a,
+		HAZ_THR_RAMP_UP_MID_A_DEFAULT,
+		0.0f,
+		400.0f);
+	float ramp_up_mid_throttle = haz_conf_clamp(
+		adc_conf->haz_throttle_ramp_up_mid_throttle,
+		HAZ_THR_RAMP_UP_MID_THROTTLE_DEFAULT,
+		0.05f,
+		0.95f);
 	float ramp_up_max_a = haz_conf_clamp(
 		adc_conf->haz_throttle_ramp_up_max_a,
 		HAZ_THR_RAMP_UP_MAX_A_DEFAULT,
@@ -298,8 +310,18 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 	float batt_now = fabsf(mc_interface_get_tot_current_in_filtered());
 	bool phase_under = phase_now < max_phase_a;
 	bool batt_under = batt_now < max_batt_a;
-	float ramp_up_span_a = ramp_up_max_a - ramp_up_min_a;
-	float ramp_up_base_a = ramp_up_min_a + (ramp_up_span_a * mag);
+
+	// Two-segment ramp curve: min→mid→max based on throttle position
+	float ramp_up_base_a;
+	if (mag <= ramp_up_mid_throttle) {
+		// Lower segment: interpolate from min to mid
+		float t = mag / ramp_up_mid_throttle;
+		ramp_up_base_a = ramp_up_min_a + (ramp_up_mid_a - ramp_up_min_a) * t;
+	} else {
+		// Upper segment: interpolate from mid to max
+		float t = (mag - ramp_up_mid_throttle) / (1.0f - ramp_up_mid_throttle);
+		ramp_up_base_a = ramp_up_mid_a + (ramp_up_max_a - ramp_up_mid_a) * t;
+	}
 	if (ramp_up_base_a > ramp_up_max_a) {
 		ramp_up_base_a = ramp_up_max_a;
 	}

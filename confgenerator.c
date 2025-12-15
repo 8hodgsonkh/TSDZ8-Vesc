@@ -288,6 +288,8 @@ int32_t confgenerator_serialize_appconf(uint8_t *buffer, const app_configuration
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_launch_boost_release_duty, &ind);
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_launch_boost_release_erpm, &ind);
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_ramp_up_min_a, &ind);
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_ramp_up_mid_a, &ind);
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_ramp_up_mid_throttle, &ind);
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_ramp_up_max_a, &ind);
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_ramp_up_limited_a, &ind);
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_ramp_down_a, &ind);
@@ -668,6 +670,8 @@ bool confgenerator_deserialize_appconf(const uint8_t *buffer, app_configuration 
 	conf->app_adc_conf.haz_throttle_launch_boost_release_duty = buffer_get_float32_auto(buffer, &ind);
 	conf->app_adc_conf.haz_throttle_launch_boost_release_erpm = buffer_get_float32_auto(buffer, &ind);
 	conf->app_adc_conf.haz_throttle_ramp_up_min_a = buffer_get_float32_auto(buffer, &ind);
+	conf->app_adc_conf.haz_throttle_ramp_up_mid_a = buffer_get_float32_auto(buffer, &ind);
+	conf->app_adc_conf.haz_throttle_ramp_up_mid_throttle = buffer_get_float32_auto(buffer, &ind);
 	conf->app_adc_conf.haz_throttle_ramp_up_max_a = buffer_get_float32_auto(buffer, &ind);
 	conf->app_adc_conf.haz_throttle_ramp_up_limited_a = buffer_get_float32_auto(buffer, &ind);
 	conf->app_adc_conf.haz_throttle_ramp_down_a = buffer_get_float32_auto(buffer, &ind);
@@ -1031,6 +1035,8 @@ void confgenerator_set_defaults_appconf(app_configuration *conf) {
 	conf->app_adc_conf.haz_throttle_launch_boost_release_duty = APPCONF_ADC_HAZ_THROTTLE_LAUNCH_BOOST_RELEASE_DUTY;
 	conf->app_adc_conf.haz_throttle_launch_boost_release_erpm = APPCONF_ADC_HAZ_THROTTLE_LAUNCH_BOOST_RELEASE_ERPM;
 	conf->app_adc_conf.haz_throttle_ramp_up_min_a = APPCONF_ADC_HAZ_THROTTLE_RAMP_UP_MIN_A;
+	conf->app_adc_conf.haz_throttle_ramp_up_mid_a = APPCONF_ADC_HAZ_THROTTLE_RAMP_UP_MID_A;
+	conf->app_adc_conf.haz_throttle_ramp_up_mid_throttle = APPCONF_ADC_HAZ_THROTTLE_RAMP_UP_MID_THROTTLE;
 	conf->app_adc_conf.haz_throttle_ramp_up_max_a = APPCONF_ADC_HAZ_THROTTLE_RAMP_UP_MAX_A;
 	conf->app_adc_conf.haz_throttle_ramp_up_limited_a = APPCONF_ADC_HAZ_THROTTLE_RAMP_UP_LIMITED_A;
 	conf->app_adc_conf.haz_throttle_ramp_down_a = APPCONF_ADC_HAZ_THROTTLE_RAMP_DOWN_A;
