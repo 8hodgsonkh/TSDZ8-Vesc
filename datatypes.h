@@ -704,7 +704,8 @@ typedef enum {
 	ADC_CTRL_TYPE_DUTY_REV_BUTTON,
 	ADC_CTRL_TYPE_PID,
 	ADC_CTRL_TYPE_PID_REV_CENTER,
-	ADC_CTRL_TYPE_PID_REV_BUTTON
+	ADC_CTRL_TYPE_PID_REV_BUTTON,
+	ADC_CTRL_TYPE_CURRENT_HYBRID_DUTY  // Hazza: duty at low speed, current at high speed
 } adc_control_type;
 
 // PAS control types

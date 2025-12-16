@@ -937,6 +937,61 @@ static THD_FUNCTION(adc_thread, arg) {
 			}
 			break;
 
+		case ADC_CTRL_TYPE_CURRENT_HYBRID_DUTY:
+			// Hybrid mode: duty control at low speed, blend to current at higher speed
+			// Gives smooth chain engagement without torque spikes at standstill
+			{
+				const float duty_now = fabsf(mc_interface_get_duty_cycle_now());
+				const float hybrid_threshold = 0.15f;  // Start blending at 15% duty
+				const float hybrid_full = 0.30f;       // Full current control at 30% duty
+
+				if (fabsf(pwr) < 0.001) {
+					ms_without_power += (1000.0 * (float)sleep_time) / (float)CH_CFG_ST_FREQUENCY;
+				}
+
+				if (!(ms_without_power < MIN_MS_WITHOUT_POWER && config.safe_start)) {
+					if (duty_now < hybrid_threshold) {
+						// Pure duty mode at low speed - smooth engagement
+						if (pwr > 0.0f) {
+							mc_interface_set_throttle_limit_active(true);
+						}
+						mc_interface_set_duty(utils_map(pwr, -1.0, 1.0, -mcconf->l_max_duty, mcconf->l_max_duty));
+						send_duty = true;
+					} else if (duty_now >= hybrid_full) {
+						// Pure current mode at higher speed - full torque control
+						current_mode = true;
+						if (pwr >= 0.0f) {
+							current_rel = pwr;
+							if (pwr > 0.0f) {
+								mc_interface_set_throttle_limit_active(true);
+							}
+						} else {
+							current_rel = pwr;
+						}
+					} else {
+						// Blend zone: mix duty and current
+						float blend = (duty_now - hybrid_threshold) / (hybrid_full - hybrid_threshold);
+						utils_truncate_number(&blend, 0.0f, 1.0f);
+
+						// Apply duty component (diminishing)
+						float duty_cmd = utils_map(pwr, -1.0, 1.0, -mcconf->l_max_duty, mcconf->l_max_duty);
+						mc_interface_set_duty(duty_cmd * (1.0f - blend));
+
+						// Apply current component (increasing)
+						current_mode = true;
+						if (pwr >= 0.0f) {
+							current_rel = pwr * blend;
+							if (pwr > 0.0f) {
+								mc_interface_set_throttle_limit_active(true);
+							}
+						} else {
+							current_rel = pwr * blend;
+						}
+					}
+				}
+			}
+			break;
+
 		case ADC_CTRL_TYPE_PID:
 		case ADC_CTRL_TYPE_PID_REV_CENTER:
 		case ADC_CTRL_TYPE_PID_REV_BUTTON:
