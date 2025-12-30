@@ -9,7 +9,7 @@
 
 // Constants
 #define MCCONF_SIGNATURE		788332866
-#define APPCONF_SIGNATURE		3996761963  // Must match VESC Tool calculated signature
+#define APPCONF_SIGNATURE		1404213502  // Must match VESC Tool calculated signature
 
 // Functions
 int32_t confgenerator_serialize_mcconf(uint8_t *buffer, const mc_configuration *conf);

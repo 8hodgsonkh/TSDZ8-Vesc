@@ -3635,15 +3635,25 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		// Apply current limits
 		// TODO: Consider D axis current for the input current as well. Currently this is done using
 		// l_in_current_map_start in update_override_limits.
+		// 
+		// HAZZA FIX: Use commanded current sign (m_iq_set) instead of mod_q for limit direction.
+		// This prevents observer confusion from flipping current limits and causing reverse torque.
+		// When observer is confused, mod_q can go wrong sign, but user intent (m_iq_set) is known.
+		const float iq_cmd_sign = motor_now->m_iq_set;  // User's commanded current direction
+		
 		if (mod_q > 0.001) {
 			utils_truncate_number(&iq_set_tmp, conf_now->lo_in_current_min / mod_q, conf_now->lo_in_current_max / mod_q);
 		} else if (mod_q < -0.001) {
 			utils_truncate_number(&iq_set_tmp, conf_now->lo_in_current_max / mod_q, conf_now->lo_in_current_min / mod_q);
 		}
 
-		if (mod_q > 0.0) {
+		// Use commanded current sign instead of mod_q for phase current limits
+		// This ensures user intent drives limit selection, not potentially-confused observer
+		if (iq_cmd_sign >= 0.0) {
+			// User wants forward/coast - apply forward limits
 			utils_truncate_number(&iq_set_tmp, conf_now->lo_current_min, conf_now->lo_current_max);
 		} else {
+			// User wants brake/regen - apply brake limits  
 			utils_truncate_number(&iq_set_tmp, -conf_now->lo_current_max, -conf_now->lo_current_min);
 		}
 
