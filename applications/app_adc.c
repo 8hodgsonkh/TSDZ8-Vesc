@@ -52,8 +52,8 @@
 #define PAS_FOLLOW_RAMP_DOWN_A_PER_S_DEFAULT	60.0f
 #define HAZ_THR_RELEASE_EPS_DEFAULT	0.01f
 #define HAZ_THR_DUTY_GATE_SPAN_DEFAULT	0.08f
-#define HAZ_THR_DUTY_GATE_MIN_SCALE_DEFAULT	0.35f
-#define HAZ_THR_LAUNCH_BOOST_REL_DEFAULT	0.08f
+#define HAZ_THR_DUTY_GATE_MIN_SCALE_DEFAULT	0.60f
+#define HAZ_THR_LAUNCH_BOOST_REL_DEFAULT	0.15f
 #define HAZ_THR_LAUNCH_BOOST_THROTTLE_DEFAULT	0.15f
 #define HAZ_THR_LAUNCH_BOOST_RELEASE_DUTY_DEFAULT	0.12f
 #define HAZ_THR_LAUNCH_BOOST_RELEASE_ERPM_DEFAULT	250.0f
@@ -115,10 +115,15 @@ static volatile bool range_ok = true;
 // Hazza throttle state (current control)
 typedef struct {
 	float current_rel_cmd;
+	// Street mode ERPM-follow state
+	float target_erpm;
+	float erpm_integral;
 } haz_throttle_ctx_t;
 
 static haz_throttle_ctx_t haz_throttle_ctx = {
-	.current_rel_cmd = 0.0f
+	.current_rel_cmd = 0.0f,
+	.target_erpm = 0.0f,
+	.erpm_integral = 0.0f
 };
 
 static float haz_throttle_filtered = 0.0f;
@@ -149,6 +154,7 @@ static bool haz_throttle_is_current_ctrl(adc_control_type ctrl) {
 	case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_BUTTON:
 	case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_ADC:
 	case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_ADC:
+		// Note: HYBRID_DUTY removed - it's now pure duty ramping mode
 		return true;
 	default:
 		return false;
@@ -311,6 +317,110 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 	bool phase_under = phase_now < max_phase_a;
 	bool batt_under = batt_now < max_batt_a;
 
+	// =========================================================================
+	// SAFETY: Wheel speed sensor bypass detection (anti-pig feature)
+	// If motor running in street mode for 3+ seconds with no wheel pulse, CUT IT
+	// =========================================================================
+	if (mc_street_mode_sensor_bypass_detected()) {
+		// Sensor bypass detected - kill throttle output
+		haz_throttle_ctx.target_erpm = 0.0f;
+		haz_throttle_ctx.erpm_integral = 0.0f;
+		return 0.0f;  // No power for you, pig!
+	}
+
+	// =========================================================================
+	// STREET MODE: ERPM-FOLLOW (like PAS but for throttle)
+	// Instead of ramping current which overshoots the limit, we follow a target
+	// ERPM smoothly using PI control - just like the PAS algorithm.
+	// This is only active when NOT in offroad mode.
+	// Uses STREET_MODE_THROTTLE_ERPM_LIMIT (2000 = ~4 mph) not the PAS limit.
+	// =========================================================================
+	float erpm_limit = mc_get_throttle_erpm_limit();  // Throttle-specific limit (4 mph)
+	// rpm_now_abs already defined above for launch boost
+	
+	if (erpm_limit > 0.0f && !mc_interface_is_offroad_mode()) {
+		// ERPM-FOLLOW MODE: Throttle position maps to target ERPM
+		// This naturally respects the limit without any overshoot/pulsing
+		
+		// Map throttle to target ERPM (0% = 0, 100% = erpm_limit)
+		float new_target_erpm = mag * erpm_limit;
+		
+		// Smooth the target ERPM change (prevents jerky response)
+		float target_slew_rate = erpm_limit * 2.0f;  // Can reach full speed in 0.5s
+		float target_step = target_slew_rate * dt_s;
+		if (new_target_erpm > haz_throttle_ctx.target_erpm) {
+			haz_throttle_ctx.target_erpm += target_step;
+			if (haz_throttle_ctx.target_erpm > new_target_erpm) {
+				haz_throttle_ctx.target_erpm = new_target_erpm;
+			}
+		} else {
+			haz_throttle_ctx.target_erpm -= target_step * 2.0f;  // Faster decel
+			if (haz_throttle_ctx.target_erpm < new_target_erpm) {
+				haz_throttle_ctx.target_erpm = new_target_erpm;
+			}
+		}
+		if (haz_throttle_ctx.target_erpm < 0.0f) {
+			haz_throttle_ctx.target_erpm = 0.0f;
+		}
+		
+		// PI controller to track target ERPM (like PAS speed matching)
+		float erpm_error = haz_throttle_ctx.target_erpm - rpm_now_abs;
+		
+		// PI gains (tuned for smooth response)
+		const float kp = 0.0015f;  // Proportional: current per ERPM error
+		const float ki = 0.0003f;  // Integral: accumulates for steady-state
+		const float integral_limit = 0.5f;  // Max integral contribution (prevents windup)
+		
+		// Update integral with anti-windup
+		haz_throttle_ctx.erpm_integral += erpm_error * dt_s;
+		utils_truncate_number(&haz_throttle_ctx.erpm_integral, -integral_limit / ki, integral_limit / ki);
+		
+		// Reset integral if throttle released
+		if (mag < release_eps) {
+			haz_throttle_ctx.erpm_integral = 0.0f;
+			haz_throttle_ctx.target_erpm = 0.0f;
+		}
+		
+		// Calculate current command from PI
+		float pi_output = kp * erpm_error + ki * haz_throttle_ctx.erpm_integral;
+		
+		// Add feedforward based on throttle position (gives instant response)
+		float feedforward = mag * 0.3f;  // 30% of max current as baseline
+		
+		target_rel = feedforward + pi_output;
+		utils_truncate_number(&target_rel, 0.0f, 1.0f);
+		
+		// Smooth the output (prevents any remaining jerkiness)
+		float smooth_rate = 3.0f;  // Relative units per second
+		if (target_rel > haz_throttle_ctx.current_rel_cmd) {
+			haz_throttle_ctx.current_rel_cmd += smooth_rate * dt_s;
+			if (haz_throttle_ctx.current_rel_cmd > target_rel) {
+				haz_throttle_ctx.current_rel_cmd = target_rel;
+			}
+		} else {
+			haz_throttle_ctx.current_rel_cmd -= smooth_rate * 2.0f * dt_s;
+			if (haz_throttle_ctx.current_rel_cmd < target_rel) {
+				haz_throttle_ctx.current_rel_cmd = target_rel;
+			}
+		}
+		
+		if (haz_throttle_ctx.current_rel_cmd < 0.0f) {
+			haz_throttle_ctx.current_rel_cmd = 0.0f;
+		}
+		if (haz_throttle_ctx.current_rel_cmd > 1.0f) {
+			haz_throttle_ctx.current_rel_cmd = 1.0f;
+		}
+		
+		return haz_throttle_ctx.current_rel_cmd;
+	}
+	
+	// =========================================================================
+	// OFFROAD MODE: Original current ramping behavior
+	// =========================================================================
+	// Reset ERPM-follow state when entering offroad
+	haz_throttle_ctx.target_erpm = 0.0f;
+	haz_throttle_ctx.erpm_integral = 0.0f;
+
 	// Two-segment ramp curve: min→mid→max based on throttle position
 	float ramp_up_base_a;
 	if (mag <= ramp_up_mid_throttle) {
@@ -328,6 +438,7 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 	if (ramp_up_base_a < ramp_up_min_a) {
 		ramp_up_base_a = ramp_up_min_a;
 	}
+	
 	float ramp_up_a = (phase_under && batt_under) ? ramp_up_base_a : fminf(ramp_up_base_a, ramp_up_limited_a);
 	float ramp_rate = ramp_up_a / max_phase_a;
 	float ramp_down_rate = ramp_down_a / max_phase_a;
@@ -938,56 +1049,87 @@ static THD_FUNCTION(adc_thread, arg) {
 			break;
 
 		case ADC_CTRL_TYPE_CURRENT_HYBRID_DUTY:
-			// Hybrid mode: duty control at low speed, blend to current at higher speed
-			// Gives smooth chain engagement without torque spikes at standstill
+			// OSF-style duty ramping: Throttle position = duty TARGET
+			// Ramp speed depends on gap between current and target duty
+			// PAS takes over with current control ONLY when throttle is idle
+			// NEVER applies both duty and current simultaneously
 			{
-				const float duty_now = fabsf(mc_interface_get_duty_cycle_now());
-				const float hybrid_threshold = 0.15f;  // Start blending at 15% duty
-				const float hybrid_full = 0.30f;       // Full current control at 30% duty
+				static float osf_duty_ramped = 0.0f;
+				const float dt_s = (float)sleep_time / (float)CH_CFG_ST_FREQUENCY;
 
-				if (fabsf(pwr) < 0.001) {
-					ms_without_power += (1000.0 * (float)sleep_time) / (float)CH_CFG_ST_FREQUENCY;
+				float throttle_mag = fabsf(pwr);
+				if (throttle_mag > 1.0f) throttle_mag = 1.0f;
+
+				// Throttle ALWAYS takes priority - PAS only when throttle is truly zero
+				bool throttle_active = (throttle_mag > 0.001f);
+				
+				// Reset PAS if throttle is being used at all
+				if (throttle_active) {
+					haz_pas_follow_reset();
+				}
+
+				if (throttle_mag < 0.001f) {
+					ms_without_power += (1000.0f * (float)sleep_time) / (float)CH_CFG_ST_FREQUENCY;
 				}
 
 				if (!(ms_without_power < MIN_MS_WITHOUT_POWER && config.safe_start)) {
-					if (duty_now < hybrid_threshold) {
-						// Pure duty mode at low speed - smooth engagement
-						if (pwr > 0.0f) {
+					if (throttle_active) {
+						// THROTTLE MODE: pure duty ramping, NO current ever
+						float duty_target = throttle_mag * mcconf->l_max_duty;
+						float duty_gap = fabsf(duty_target - osf_duty_ramped);
+
+						// Ramp rate depends on gap - bigger gap = faster ramp
+						const float ramp_min = 0.3f;    // Minimum ramp when close to target
+						const float ramp_max = 2.0f;    // Maximum ramp when far from target
+						const float ramp_down_base = 2.5f;  // Base ramp down speed
+						const float ramp_down_max = 5.0f;   // Max ramp down when gap is huge
+
+						// Scale ramp by how far we are from target
+						float gap_ratio = duty_gap / mcconf->l_max_duty;
+						if (gap_ratio > 1.0f) gap_ratio = 1.0f;
+
+						if (duty_target > osf_duty_ramped) {
+							// Ramping UP
+							float ramp_rate = ramp_min + (ramp_max - ramp_min) * gap_ratio;
+							osf_duty_ramped += ramp_rate * dt_s;
+							if (osf_duty_ramped > duty_target) osf_duty_ramped = duty_target;
+						} else {
+							// Ramping DOWN
+							float ramp_rate = ramp_down_base + (ramp_down_max - ramp_down_base) * gap_ratio;
+							osf_duty_ramped -= ramp_rate * dt_s;
+							if (osf_duty_ramped < duty_target) osf_duty_ramped = duty_target;
+						}
+
+						// Clamp
+						if (osf_duty_ramped < 0.0f) osf_duty_ramped = 0.0f;
+						if (osf_duty_ramped > mcconf->l_max_duty) osf_duty_ramped = mcconf->l_max_duty;
+
+						if (osf_duty_ramped > 0.001f) {
 							mc_interface_set_throttle_limit_active(true);
-						}
-						mc_interface_set_duty(utils_map(pwr, -1.0, 1.0, -mcconf->l_max_duty, mcconf->l_max_duty));
-						send_duty = true;
-					} else if (duty_now >= hybrid_full) {
-						// Pure current mode at higher speed - full torque control
-						current_mode = true;
-						if (pwr >= 0.0f) {
-							current_rel = pwr;
-							if (pwr > 0.0f) {
-								mc_interface_set_throttle_limit_active(true);
-							}
+							mc_interface_set_duty(pwr >= 0.0f ? osf_duty_ramped : -osf_duty_ramped);
+							send_duty = true;
 						} else {
-							current_rel = pwr;
+							mc_interface_release_motor();
 						}
+						// current_mode stays FALSE - no current applied
 					} else {
-						// Blend zone: mix duty and current
-						float blend = (duty_now - hybrid_threshold) / (hybrid_full - hybrid_threshold);
-						utils_truncate_number(&blend, 0.0f, 1.0f);
-
-						// Apply duty component (diminishing)
-						float duty_cmd = utils_map(pwr, -1.0, 1.0, -mcconf->l_max_duty, mcconf->l_max_duty);
-						mc_interface_set_duty(duty_cmd * (1.0f - blend));
-
-						// Apply current component (increasing)
-						current_mode = true;
-						if (pwr >= 0.0f) {
-							current_rel = pwr * blend;
-							if (pwr > 0.0f) {
-								mc_interface_set_throttle_limit_active(true);
-							}
+						// PAS MODE: throttle is zero, check for pedaling
+						float pas_current_rel = haz_pas_follow_process(dt_s);
+						if (pas_current_rel > 0.0f) {
+							// PAS active - use current control
+							osf_duty_ramped = fabsf(mc_interface_get_duty_cycle_now());
+							current_mode = true;
+							current_rel = pas_current_rel;
+							mc_interface_set_throttle_limit_active(true);
+							// send_duty stays FALSE - no duty applied
 						} else {
-							current_rel = pwr * blend;
+							// Nothing - release motor
+							mc_interface_release_motor();
+							osf_duty_ramped = 0.0f;
 						}
 					}
+				} else {
+					osf_duty_ramped = 0.0f;
 				}
 			}
 			break;

@@ -890,6 +890,16 @@ static THD_FUNCTION(pas_thread, arg) {
 			ms_without_power = 0;
 		}
 
+		// Safety: wheel speed sensor bypass detection (anti-pig feature)
+		if (mc_street_mode_sensor_bypass_detected()) {
+			if (primary_output == true) {
+				mc_interface_set_current_rel(0.0);
+			} else {
+				output_current_rel = 0.0;
+			}
+			continue;  // No power for you, pig!
+		}
+
 		if (app_is_output_disabled()) {
 			continue;
 		}

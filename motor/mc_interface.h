@@ -97,7 +97,11 @@ float mc_interface_get_speed(void);
 float mc_interface_get_distance(void);
 float mc_interface_get_distance_abs(void);
 void mc_interface_override_wheel_speed(bool ovr, float speed);
-float mc_get_active_erpm_limit(void);
+float mc_get_throttle_erpm_limit(void);  // Throttle-specific limit (~4 mph)
+float mc_get_active_erpm_limit(void);    // General limit (PAS uses this)
+float mc_get_street_mode_speed_limit(void);
+float mc_get_wheel_speed_limit_scale(void);
+bool mc_street_mode_sensor_bypass_detected(void);  // Safety: wheel sensor missing?
 void mc_interface_set_offroad_mode(bool enabled);
 bool mc_interface_is_offroad_mode(void);
 void mc_interface_set_throttle_limit_active(bool active);

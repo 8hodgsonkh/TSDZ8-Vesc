@@ -388,6 +388,15 @@ uint32_t hw_wheel_speed_get_pulses(void) {
 	return wheel_pulse_count;
 }
 
+// Returns milliseconds since last wheel speed pulse (0 = never had a pulse)
+uint32_t hw_wheel_speed_get_pulse_age_ms(void) {
+	if (wheel_last_pulse_time == 0) {
+		return 0;  // Never had a pulse
+	}
+	uint32_t now_us = chVTGetSystemTimeX() * (1000000 / CH_CFG_ST_FREQUENCY);
+	return (now_us - wheel_last_pulse_time) / 1000;
+}
+
 uint16_t hw_wheel_speed_get_adc_raw(void) {
 	return ADC_Value[HW_WHEEL_SPEED_ADC_CH];
 }

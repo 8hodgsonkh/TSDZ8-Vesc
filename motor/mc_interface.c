@@ -55,11 +55,23 @@
 // STREET_MODE_THROTTLE_ERPM_LIMIT is an optional lower clamp that only engages while the
 // throttle app is actively requesting torque; PAS and off-road behavior still use the main cap.
 #ifndef STREET_MODE_ERPM_LIMIT
-#define STREET_MODE_ERPM_LIMIT	7500.0f
+#define STREET_MODE_ERPM_LIMIT	7500.0f  // PAS limit = ~15 mph in max gear
 #endif
 
 #ifndef STREET_MODE_THROTTLE_ERPM_LIMIT
-#define STREET_MODE_THROTTLE_ERPM_LIMIT	2000.0f
+#define STREET_MODE_THROTTLE_ERPM_LIMIT	2000.0f  // Throttle limit = ~4 mph in max gear
+#endif
+
+// Street mode wheel speed limit (m/s) - 6.7 m/s = 24 km/h = 15 mph (for PAS)
+// Set to 0 to disable wheel speed limiting and only use ERPM
+#ifndef STREET_MODE_WHEEL_SPEED_LIMIT
+#define STREET_MODE_WHEEL_SPEED_LIMIT	6.7f
+#endif
+
+// Safety: If motor runs for this long (ms) in street mode without a wheel pulse, cut motor
+// Prevents bypassing speed limit by removing the speed sensor
+#ifndef STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS
+#define STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS	3000
 #endif
 
 // Safety fallbacks if the overrides above are disabled or zeroed by mistake.
@@ -1671,6 +1683,57 @@ void mc_interface_override_wheel_speed(bool ovr, float speed) {
 	m_wheel_speed_override_value = speed;
 }
 
+// Get throttle-specific ERPM limit (lower than PAS limit, ~4 mph)
+float mc_get_throttle_erpm_limit(void) {
+	if (m_offroad_mode) {
+		// Offroad = no throttle limit, use full ERPM
+		const volatile mc_configuration *mcconf = mc_interface_get_configuration();
+		if (mcconf) {
+			float base = fabsf(mcconf->l_max_erpm);
+			if (isfinite(base) && base > 0.0f) {
+				return base;
+			}
+		}
+		return STREET_MODE_ERPM_LIMIT;  // Fallback
+	}
+	// Street mode: use the lower throttle limit
+	float limit = STREET_MODE_THROTTLE_ERPM_LIMIT;
+	if (!isfinite(limit) || limit <= 0.0f) {
+		limit = STREET_MODE_THROTTLE_ERPM_FALLBACK;
+	}
+	return limit;
+}
+
+// Safety check: returns true if motor should be cut due to missing wheel sensor
+// Prevents bypassing street mode by removing the speed sensor
+bool mc_street_mode_sensor_bypass_detected(void) {
+#ifdef HW_HAS_WHEEL_SPEED_SENSOR
+	// Only applies in street mode
+	if (m_offroad_mode) {
+		return false;
+	}
+	
+	// Check if motor is actually running (ERPM > ~100)
+	float rpm_abs = fabsf(mc_interface_get_rpm());
+	if (rpm_abs < 100.0f) {
+		return false;  // Motor not really running, no bypass concern
+	}
+	
+	// Check time since last wheel speed pulse
+	uint32_t pulse_age_ms = hw_wheel_speed_get_pulse_age_ms();
+	
+	// If we've never had a pulse (age = 0), that's suspicious if motor is running
+	// If pulse is too old, also suspicious
+	if (pulse_age_ms == 0 || pulse_age_ms > STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS) {
+		return true;  // Sensor bypass detected!
+	}
+	
+	return false;
+#else
+	return false;  // No wheel sensor = can't do this check
+#endif
+}
+
 float mc_get_active_erpm_limit(void) {
 	const volatile mc_configuration *mcconf = mc_interface_get_configuration();
 	if (!mcconf) {
@@ -1710,6 +1773,52 @@ float mc_get_active_erpm_limit(void) {
 	}
 
 	return fminf(base_limit, street_limit);
+}
+
+/**
+ * Get the street mode wheel speed limit in m/s.
+ * Returns 0 if disabled or in offroad mode.
+ */
+float mc_get_street_mode_speed_limit(void) {
+	if (m_offroad_mode) {
+		return 0.0f;
+	}
+	float limit = STREET_MODE_WHEEL_SPEED_LIMIT;
+	if (!isfinite(limit) || limit <= 0.0f) {
+		return 0.0f;
+	}
+	return limit;
+}
+
+/**
+ * Get a scale factor (0.0-1.0) based on how close we are to the wheel speed limit.
+ * Used by throttle code for smooth limiting.
+ * Returns 1.0 if no limit, or in offroad mode, or speed is below soft limit.
+ * Returns 0.0-1.0 as we approach/exceed the limit.
+ */
+float mc_get_wheel_speed_limit_scale(void) {
+	if (m_offroad_mode) {
+		return 1.0f;
+	}
+	
+	float limit = STREET_MODE_WHEEL_SPEED_LIMIT;
+	if (!isfinite(limit) || limit <= 0.0f) {
+		return 1.0f;  // No wheel speed limit configured
+	}
+	
+	float speed = fabsf(mc_interface_get_speed());
+	float soft_start = limit * 0.9f;  // Start limiting at 90% of limit
+	
+	if (speed < soft_start) {
+		return 1.0f;
+	}
+	
+	if (speed >= limit) {
+		return 0.0f;
+	}
+	
+	// Linear scale from 1.0 at soft_start to 0.0 at limit
+	return (limit - speed) / (limit - soft_start);
 }
 
 void mc_interface_set_offroad_mode(bool enabled) {

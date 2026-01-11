@@ -3636,10 +3636,13 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		// TODO: Consider D axis current for the input current as well. Currently this is done using
 		// l_in_current_map_start in update_override_limits.
 		// 
-		// HAZZA FIX: Use commanded current sign (m_iq_set) instead of mod_q for limit direction.
-		// This prevents observer confusion from flipping current limits and causing reverse torque.
-		// When observer is confused, mod_q can go wrong sign, but user intent (m_iq_set) is known.
+		// HAZZA FIX: Use commanded current sign (m_iq_set) instead of mod_q for limit direction
+		// in CURRENT modes. This prevents observer confusion from flipping current limits.
+		// For DUTY mode, m_iq_set is 0, so fall back to mod_q which is correct for duty control.
 		const float iq_cmd_sign = motor_now->m_iq_set;  // User's commanded current direction
+		const bool is_duty_mode = (motor_now->m_control_mode == CONTROL_MODE_DUTY ||
+		                           motor_now->m_control_mode == CONTROL_MODE_OPENLOOP_DUTY ||
+		                           motor_now->m_control_mode == CONTROL_MODE_OPENLOOP_DUTY_PHASE);
 		
 		if (mod_q > 0.001) {
 			utils_truncate_number(&iq_set_tmp, conf_now->lo_in_current_min / mod_q, conf_now->lo_in_current_max / mod_q);
@@ -3647,13 +3650,14 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			utils_truncate_number(&iq_set_tmp, conf_now->lo_in_current_max / mod_q, conf_now->lo_in_current_min / mod_q);
 		}
 
-		// Use commanded current sign instead of mod_q for phase current limits
-		// This ensures user intent drives limit selection, not potentially-confused observer
-		if (iq_cmd_sign >= 0.0) {
-			// User wants forward/coast - apply forward limits
+		// For duty mode, use mod_q (actual motor state) for limit direction
+		// For current mode, use m_iq_set (user intent) to avoid observer confusion
+		float limit_sign_ref = is_duty_mode ? mod_q : iq_cmd_sign;
+		if (limit_sign_ref >= 0.0) {
+			// Forward/coast - apply forward limits
 			utils_truncate_number(&iq_set_tmp, conf_now->lo_current_min, conf_now->lo_current_max);
 		} else {
-			// User wants brake/regen - apply brake limits  
+			// Brake/regen - apply brake limits  
 			utils_truncate_number(&iq_set_tmp, -conf_now->lo_current_max, -conf_now->lo_current_min);
 		}
 

@@ -337,6 +337,7 @@ float hw_get_distance_abs(void);  // Returns distance in meters
 
 // Extra functions for debugging
 uint32_t hw_wheel_speed_get_pulses(void);
+uint32_t hw_wheel_speed_get_pulse_age_ms(void);  // MS since last pulse (0 = never)
 uint16_t hw_wheel_speed_get_adc_raw(void);
 
 #endif /* HW_100_250_H_ */
