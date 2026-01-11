@@ -50,34 +50,6 @@
 // Macros
 #define DIR_MULT		(motor_now()->m_conf.m_invert_direction ? -1.0 : 1.0)
 
-// Street-mode ERPM caps; override in hwconf or build flags if local rules differ.
-// STREET_MODE_ERPM_LIMIT applies to every app (PAS, PID, etc.) when off-road mode is disabled.
-// STREET_MODE_THROTTLE_ERPM_LIMIT is an optional lower clamp that only engages while the
-// throttle app is actively requesting torque; PAS and off-road behavior still use the main cap.
-#ifndef STREET_MODE_ERPM_LIMIT
-#define STREET_MODE_ERPM_LIMIT	7500.0f  // PAS limit = ~15 mph in max gear
-#endif
-
-#ifndef STREET_MODE_THROTTLE_ERPM_LIMIT
-#define STREET_MODE_THROTTLE_ERPM_LIMIT	2000.0f  // Throttle limit = ~4 mph in max gear
-#endif
-
-// Street mode wheel speed limit (m/s) - 6.7 m/s = 24 km/h = 15 mph (for PAS)
-// Set to 0 to disable wheel speed limiting and only use ERPM
-#ifndef STREET_MODE_WHEEL_SPEED_LIMIT
-#define STREET_MODE_WHEEL_SPEED_LIMIT	6.7f
-#endif
-
-// Safety: If motor runs for this long (ms) in street mode without a wheel pulse, cut motor
-// Prevents bypassing speed limit by removing the speed sensor
-#ifndef STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS
-#define STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS	3000
-#endif
-
-// Safety fallbacks if the overrides above are disabled or zeroed by mistake.
-#define STREET_MODE_ERPM_FALLBACK	7500.0f
-#define STREET_MODE_THROTTLE_ERPM_FALLBACK	2000.0f
-
 // Global variables
 volatile uint16_t ADC_Value[HW_ADC_CHANNELS + HW_ADC_CHANNELS_EXTRA];
 volatile float ADC_curr_norm_value[6];
@@ -114,7 +86,6 @@ typedef struct {
 	float m_gate_driver_voltage;
 	float m_motor_current_unbalance;
 	float m_motor_current_unbalance_error_rate;
-	float m_f_samp_now;
 	float m_input_voltage_filtered;
 	float m_input_voltage_filtered_slower;
 	float m_temp_override;
@@ -160,8 +131,6 @@ static volatile bool m_sample_is_second_motor;
 static volatile gnss_data m_gnss = {0};
 static volatile bool m_wheel_speed_override = false;
 static volatile float m_wheel_speed_override_value = 0.0;
-static volatile bool m_offroad_mode = false;
-static volatile bool m_throttle_limit_active = false;
 
 typedef struct {
 	bool is_second_motor;
@@ -1385,7 +1354,7 @@ float mc_interface_get_last_inj_adc_isr_duration(void) {
 		break;
 
 	case MOTOR_TYPE_FOC:
-		ret = mcpwm_foc_get_last_adc_isr_duration();
+		ret = -1.0;
 		break;
 
 	default:
@@ -1637,11 +1606,7 @@ float mc_interface_get_speed(void) {
 		return m_wheel_speed_override_value;
 	} else {
 #ifdef HW_HAS_WHEEL_SPEED_SENSOR
-		// hw_get_speed() returns wheel revolutions per second
-		// Convert to m/s using wheel diameter from config
-		const volatile mc_configuration *conf = mc_interface_get_configuration();
-		float wheel_rps = hw_get_speed();
-		return wheel_rps * conf->si_wheel_diameter * M_PI;  // RPS * circumference = m/s
+		return hw_get_speed();
 #else
 		const volatile mc_configuration *conf = mc_interface_get_configuration();
 		const float rpm = mc_interface_get_rpm() / (conf->si_motor_poles / 2.0);
@@ -1681,156 +1646,6 @@ float mc_interface_get_distance_abs(void) {
 void mc_interface_override_wheel_speed(bool ovr, float speed) {
 	m_wheel_speed_override = ovr;
 	m_wheel_speed_override_value = speed;
-}
-
-// Get throttle-specific ERPM limit (lower than PAS limit, ~4 mph)
-float mc_get_throttle_erpm_limit(void) {
-	if (m_offroad_mode) {
-		// Offroad = no throttle limit, use full ERPM
-		const volatile mc_configuration *mcconf = mc_interface_get_configuration();
-		if (mcconf) {
-			float base = fabsf(mcconf->l_max_erpm);
-			if (isfinite(base) && base > 0.0f) {
-				return base;
-			}
-		}
-		return STREET_MODE_ERPM_LIMIT;  // Fallback
-	}
-	// Street mode: use the lower throttle limit
-	float limit = STREET_MODE_THROTTLE_ERPM_LIMIT;
-	if (!isfinite(limit) || limit <= 0.0f) {
-		limit = STREET_MODE_THROTTLE_ERPM_FALLBACK;
-	}
-	return limit;
-}
-
-// Safety check: returns true if motor should be cut due to missing wheel sensor
-// Prevents bypassing street mode by removing the speed sensor
-bool mc_street_mode_sensor_bypass_detected(void) {
-#ifdef HW_HAS_WHEEL_SPEED_SENSOR
-	// Only applies in street mode
-	if (m_offroad_mode) {
-		return false;
-	}
-	
-	// Check if motor is actually running (ERPM > ~100)
-	float rpm_abs = fabsf(mc_interface_get_rpm());
-	if (rpm_abs < 100.0f) {
-		return false;  // Motor not really running, no bypass concern
-	}
-	
-	// Check time since last wheel speed pulse
-	uint32_t pulse_age_ms = hw_wheel_speed_get_pulse_age_ms();
-	
-	// If we've never had a pulse (age = 0), that's suspicious if motor is running
-	// If pulse is too old, also suspicious
-	if (pulse_age_ms == 0 || pulse_age_ms > STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS) {
-		return true;  // Sensor bypass detected!
-	}
-	
-	return false;
-#else
-	return false;  // No wheel sensor = can't do this check
-#endif
-}
-
-float mc_get_active_erpm_limit(void) {
-	const volatile mc_configuration *mcconf = mc_interface_get_configuration();
-	if (!mcconf) {
-		return 0.0f;
-	}
-
-	float base_limit = fabsf(mcconf->l_max_erpm);
-	if (!isfinite(base_limit) || base_limit <= 0.0f) {
-		base_limit = 0.0f;
-	}
-
-	if (m_offroad_mode) {
-		return base_limit > 0.0f ? base_limit : STREET_MODE_ERPM_LIMIT;
-	}
-
-	float street_limit = STREET_MODE_ERPM_LIMIT;
-	if (!isfinite(street_limit) || street_limit <= 0.0f) {
-		street_limit = STREET_MODE_ERPM_FALLBACK;
-	}
-	if (street_limit <= 0.0f) {
-		street_limit = STREET_MODE_ERPM_FALLBACK;
-	}
-
-	if (m_throttle_limit_active) {
-		float throttle_limit = STREET_MODE_THROTTLE_ERPM_LIMIT;
-		if (!isfinite(throttle_limit) || throttle_limit <= 0.0f) {
-			throttle_limit = STREET_MODE_THROTTLE_ERPM_FALLBACK;
-		}
-		if (throttle_limit <= 0.0f) {
-			throttle_limit = STREET_MODE_THROTTLE_ERPM_FALLBACK;
-		}
-		street_limit = fminf(street_limit, throttle_limit);
-	}
-
-	if (base_limit <= 0.0f) {
-		return street_limit;
-	}
-
-	return fminf(base_limit, street_limit);
-}
-
-/**
- * Get the street mode wheel speed limit in m/s.
- * Returns 0 if disabled or in offroad mode.
- */
-float mc_get_street_mode_speed_limit(void) {
-	if (m_offroad_mode) {
-		return 0.0f;
-	}
-	float limit = STREET_MODE_WHEEL_SPEED_LIMIT;
-	if (!isfinite(limit) || limit <= 0.0f) {
-		return 0.0f;
-	}
-	return limit;
-}
-
-/**
- * Get a scale factor (0.0-1.0) based on how close we are to the wheel speed limit.
- * Used by throttle code for smooth limiting.
- * Returns 1.0 if no limit, or in offroad mode, or speed is below soft limit.
- * Returns 0.0-1.0 as we approach/exceed the limit.
- */
-float mc_get_wheel_speed_limit_scale(void) {
-	if (m_offroad_mode) {
-		return 1.0f;
-	}
-	
-	float limit = STREET_MODE_WHEEL_SPEED_LIMIT;
-	if (!isfinite(limit) || limit <= 0.0f) {
-		return 1.0f;  // No wheel speed limit configured
-	}
-	
-	float speed = fabsf(mc_interface_get_speed());
-	float soft_start = limit * 0.9f;  // Start limiting at 90% of limit
-	
-	if (speed < soft_start) {
-		return 1.0f;
-	}
-	
-	if (speed >= limit) {
-		return 0.0f;
-	}
-	
-	// Linear scale from 1.0 at soft_start to 0.0 at limit
-	return (limit - speed) / (limit - soft_start);
-}
-
-void mc_interface_set_offroad_mode(bool enabled) {
-	m_offroad_mode = enabled;
-}
-
-bool mc_interface_is_offroad_mode(void) {
-	return m_offroad_mode;
-}
-
-void mc_interface_set_throttle_limit_active(bool active) {
-	m_throttle_limit_active = active;
 }
 
 setup_values mc_interface_get_setup_values(void) {
@@ -2044,8 +1859,9 @@ void mc_interface_fault_stop(mc_fault_code fault, bool is_second_motor, bool is_
 #pragma GCC pop_options
 
 void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
-	FOC_PROFILE_LINE();
+	FOC_PROFILE_LINE_FINE()
 	ledpwm_update_pwm();
+	FOC_PROFILE_LINE_FINE()
 
 #ifdef HW_HAS_DUAL_MOTORS
 	motor_if_state_t *motor = is_second_motor ? (motor_if_state_t*)&m_motor_2 : (motor_if_state_t*)&m_motor_1;
@@ -2057,6 +1873,8 @@ void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
 	mc_configuration *conf_now = (mc_configuration*)&motor->m_conf;
 	const float input_voltage = GET_INPUT_VOLTAGE();
 	UTILS_LP_FAST(motor->m_input_voltage_filtered, input_voltage, 0.02);
+
+	FOC_PROFILE_LINE_FINE()
 
 	// Check for faults that should stop the motor
 
@@ -2088,6 +1906,8 @@ void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
 		}
 	}
 
+	FOC_PROFILE_LINE_FINE()
+
 	// Fetch these values in a config-specific way to avoid some overhead of the general
 	// functions. That will make this interrupt run a bit faster.
 	mc_state state;
@@ -2111,6 +1931,8 @@ void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
 		abs_current = mcpwm_get_tot_current();
 		abs_current_filtered = current_filtered;
 	}
+
+	FOC_PROFILE_LINE_FINE()
 
 	// Additional input current filter for the mapped current limit
 	UTILS_LP_FAST(motor->m_i_in_filter, current_in_filtered, motor->m_conf.l_in_current_map_filter);
@@ -2151,6 +1973,8 @@ void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
 		}
 	}
 
+	FOC_PROFILE_LINE_FINE()
+
 	// DRV fault code
 #ifdef HW_HAS_DUAL_PARALLEL
 	if (IS_DRV_FAULT() || IS_DRV_FAULT_2()) {
@@ -2187,31 +2011,14 @@ void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
 	}
 #endif
 
-	float t_samp = dt;
-	if (dt > 0.0f) {
-		motor->m_f_samp_now = 1.0f / dt;
-	}
-
 	// Watt and ah counters
 	if (fabsf(current_filtered) > 1.0) {
-		// Some extra filtering
-		static float curr_diff_sum = 0.0;
-		static float curr_diff_samples = 0;
-
-		curr_diff_sum += current_in_filtered * t_samp;
-		curr_diff_samples += t_samp;
-
-		if (curr_diff_samples >= 0.01) {
-			if (curr_diff_sum > 0.0) {
-				motor->m_amp_seconds += curr_diff_sum;
-				motor->m_watt_seconds += curr_diff_sum * input_voltage;
-			} else {
-				motor->m_amp_seconds_charged -= curr_diff_sum;
-				motor->m_watt_seconds_charged -= curr_diff_sum * input_voltage;
-			}
-
-			curr_diff_samples = 0.0;
-			curr_diff_sum = 0.0;
+		if (current_in_filtered > 0.0) {
+			motor->m_amp_seconds += current_in_filtered * dt;
+			motor->m_watt_seconds += current_in_filtered * dt * input_voltage;
+		} else {
+			motor->m_amp_seconds_charged -= current_in_filtered * dt;
+			motor->m_watt_seconds_charged -= current_in_filtered * dt * input_voltage;
 		}
 	}
 
@@ -2219,6 +2026,8 @@ void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
 	debug_sampling_mode sample_mode =
 			m_sample_is_second_motor == is_second_motor ?
 					m_sample_mode : DEBUG_SAMPLING_OFF;
+
+	FOC_PROFILE_LINE_FINE()
 
 	switch (sample_mode) {
 	case DEBUG_SAMPLING_NOW:
@@ -2380,7 +2189,7 @@ void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
 
 			m_vzero_samples[m_sample_now] = zero;
 			m_curr_fir_samples[m_sample_now] = (int16_t)(current * (8.0 / FAC_CURRENT));
-			m_f_sw_samples[m_sample_now] = (int16_t)(0.1 / t_samp / m_sample_int);
+			m_f_sw_samples[m_sample_now] = (int16_t)(0.1 / dt / m_sample_int);
 			m_status_samples[m_sample_now] = mcpwm_get_comm_step() | (mcpwm_read_hall_phase() << 3);
 
 			m_sample_now++;
@@ -2389,7 +2198,7 @@ void mc_interface_mc_timer_isr(bool is_second_motor, float dt) {
 		}
 	}
 
-	FOC_PROFILE_LINE();
+	FOC_PROFILE_LINE_FINE()
 }
 
 void mc_interface_adc_inj_int_handler(void) {
@@ -2586,9 +2395,8 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 
 	// RPM max
 	float lo_max_rpm = 0.0;
-	const float erpm_limit = mc_get_active_erpm_limit();
-	const float rpm_pos_cut_start = erpm_limit * conf->l_erpm_start;
-	const float rpm_pos_cut_end = erpm_limit;
+	const float rpm_pos_cut_start = conf->l_max_erpm * conf->l_erpm_start;
+	const float rpm_pos_cut_end = conf->l_max_erpm;
 	if (rpm_now < (rpm_pos_cut_start + 0.1)) {
 		lo_max_rpm = l_current_max_tmp;
 	} else if (rpm_now > (rpm_pos_cut_end - 0.1)) {
@@ -2738,8 +2546,6 @@ static void run_timer_tasks(volatile motor_if_state_t *motor) {
 		g_backup.runtime += runtime - m_motor_1.m_runtime_last;
 		m_motor_1.m_runtime_last = runtime;
 	}
-
-	motor->m_f_samp_now = mc_interface_get_sampling_frequency_now();
 
 	// Decrease fault iterations
 	if (motor->m_ignore_iterations > 0) {

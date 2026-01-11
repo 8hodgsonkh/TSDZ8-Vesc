@@ -2117,7 +2117,8 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 		set_duty_cycle_ll(dutycycle_now);
 	}
 
-	const float dt = 1.0 / switching_frequency_now;
+	float dt = 1.0 / switching_frequency_now;
+
 	mc_interface_mc_timer_isr(false, dt);
 
 	if (encoder_is_configured()) {

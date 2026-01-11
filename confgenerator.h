@@ -8,8 +8,8 @@
 #include <stdbool.h>
 
 // Constants
-#define MCCONF_SIGNATURE		788332866
-#define APPCONF_SIGNATURE		1404213502  // Must match VESC Tool calculated signature
+#define MCCONF_SIGNATURE		3644254386
+#define APPCONF_SIGNATURE		2099347128
 
 // Functions
 int32_t confgenerator_serialize_mcconf(uint8_t *buffer, const mc_configuration *conf);
