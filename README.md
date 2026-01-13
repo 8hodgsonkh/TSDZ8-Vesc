@@ -1,251 +1,148 @@
-Welcome page
-TSDZ8 VESC Firmware (Hazza Edition)
-Firmware source can be found under branches.
+# VESC firmware
 
-A cursed science project disguised as an ebike controller.
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Travis CI Status](https://travis-ci.com/vedderb/bldc.svg?branch=master)](https://travis-ci.com/vedderb/bldc)
+[![Codacy Badge](https://api.codacy.com/project/badge/Grade/75e90ffbd46841a3a7be2a9f7a94c242)](https://www.codacy.com/app/vedderb/bldc?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=vedderb/bldc&amp;utm_campaign=Badge_Grade)
+[![Contributors](https://img.shields.io/github/contributors/vedderb/bldc.svg)](https://github.com/vedderb/bldc/graphs/contributors)
+[![Watchers](https://img.shields.io/github/watchers/vedderb/bldc.svg)](https://github.com/vedderb/bldc/watchers)
+[![Stars](https://img.shields.io/github/stars/vedderb/bldc.svg)](https://github.com/vedderb/bldc/stargazers)
+[![Forks](https://img.shields.io/github/forks/vedderb/bldc.svg)](https://github.com/vedderb/bldc/network/members)
 
-⚡ What This Repo Is
+An open source motor controller firmware.
 
-This is my custom fork of the VESC firmware for the Go-FOC S100 / VESC 100/250, modified to run more sane on my TSDZ8 mid-drive, i got tired of faulty original controllers and had a vesc lying around.
+This is the source code for the VESC DC/BLDC/FOC controller. Read more at
+[https://vesc-project.com/](https://vesc-project.com/)
 
-This is not your normal typical firmware.
-This is tinker-fuel — expect experiments, PAS logic rewrites, custom logic rewrites, and things that may or may not scream when compiled.
+## Supported boards
 
-✅ 1. What This Project Is Building
-1.1 Current-control throttle that behaves on a chain-driven mid-drive
+All of them!
 
-– Smooth low-speed torque.
-– No “chain slap → BANG BANG → nylon gear screaming REEEEE.”
-– Adaptive ramping.
-– Predictable launches.
+Check the supported boards by typing `make`
 
-Status: ✔ Fully implemented
-Notes: Uses haz_throttle_process().
+```
+[Firmware]
+     fw   - Build firmware for default target
+                            supported boards are: 100_250 100_250_no_limits 100_500...
+```
 
-1.2 PAS sensor support (generic 3-wire cadence + throttle + UART)
+There are also many other options that can be changed in [conf_general.h](conf_general.h).
 
-– PAS and throttle run simultaneously.
-– PAS only active when throttle = idle.
-– Cadence → ERPM mapping.
-– Interrupt-based timing on single sensor mode. quad mode still polling.
-– Clean override logic.
+## Prerequisites
 
-Status: ✔ Fully implemented
-Future: Integrate native TSDZ8 torque+cadence sensor if hardware feasibility works out.
+### On Ubuntu (Linux)/macOS
+- Tools: `git`, `wget`, and `make`
+- Additional Linux requirements: `libgl-dev` and `libxcb-xinerama0`
+- Helpful Ubuntu commands:
+```bash
+sudo apt install git build-essential libgl-dev libxcb-xinerama0 wget git-gui
+```
+- Helpful macOS tools: 
 
-1.3 Explore native TSDZ8 torque sensor
+```bash
+brew install stlink
+brew install openocd
+```
 
-– Original torque sensor requires specialised signal conditioning.
-– I have a small PCB from a dead controller that may provide the missing analog stages.
+### On Windows
+- Chocolately: https://chocolatey.org/install
+- Git: https://git-scm.com/download/win. Make sure to click any boxes to add Git to your Environment (aka PATH)
 
-Status: ❌ Not implemented (hardware dependent)
+## Install Dev environment and build
 
-1.4 Mid-drive-optimised FOC logic (“Hazza Mid-Drive Tuning”)
+### On Ubuntu (Linux)/MacOS
+Open up a terminal
+1.  `git clone http://github.com/vedderb/bldc.git`
+2.  `cd bldc`
+3.  Continue with [On all platforms](#on-all-platforms)
 
-Chain slack kills normal FOC. This logic:
+### On Windows
 
-– Detects backlash (ERPM collapse, Iq overshoot, angle stall, mod saturation).
-– Softens PI gains on impact.
-– Slew-limits torque re-application.
-– Gradually recovers stiffness.
-– Eliminates bang-dead-bang FOC instability.
+1.  Open up a Windows Powershell terminal (Resist the urge to run Powershell as administrator, that will break things)
+2.  Type `choco install make`
+3.  `git clone http://github.com/vedderb/bldc`
+4.  `cd bldc`
+5.  Continue with [On all platforms](#on-all-platforms)
 
-Status: ✔ Implemented (tuning ongoing)
-Flag: Enable with #define HAZZA_MIDDRIVE_TUNING 1
+### On all platforms
 
-1.5 External speed sensor support
+1.  `git checkout origin/master`
+2.  `make arm_sdk_install`
+3.  `make` <-- Pick out the name of your target device from the supported boards list. For instance, I have a Trampa **VESC 100/250**, so my target is `100_250`
+4.   `make 100_250` <-- This will build the **VESC 100/250** firmware and place it into the `bldc/builds/100_250/` directory
 
-Goal:
-Use leftover pins  to support the TSDZ8 wheel speed sensor.
+## Other tools
 
-Status: ❌ Not implemented (pin constraints)
-Past attempts:
-– Tried using MCU temp input → failed
-– ADC2 with pull-up hack works for PAS, may be repurposed later
+**Linux Optional - Add udev rules to use the stlink v2 programmer without being root**
+```bash
+wget vedder.se/Temp/49-stlinkv2.rules
+sudo mv 49-stlinkv2.rules /etc/udev/rules.d/
+sudo udevadm trigger
+```
 
-1.6 Street/Off-road mode via power button (boot-time toggle)
+## IDE
+### Prerequisites
+#### On macOS/Linux
 
-– Street mode: throttle ERPM cap + PAS ERPM cap for UK legality
-– Off-road mode: full power
-– Uses power button like a TF2 Spycicle, gives some time immunity to P.C. pyro checking your bike
-– Tap at boot = disguise as Heavy
-– Hold for ~15 sec = Scout speed
+- `python3`, and `pip`
 
-Status: ✔ Fully implemented
-Notes: Now protected so it can’t soft-brick the controller again.
+#### On Windows
+- Python 3: https://www.python.org/downloads/. Make sure to click the box to add Python3 to your Environment.
 
-1.7 Custom VESC Tool fork (future)
+### All platforms
 
-Goal: expose all Hazza variables cleanly:
+1.  `pip install aqtinstall`
+2.  `make qt_install`
+3.  Open Qt Creator IDE installed in `tools/Qt/Tools/QtCreator/bin/qtcreator`
+4.  With Qt Creator, open the vesc firmware Qt Creator project, named vesc.pro. You will find it in `Project/Qt Creator/vesc.pro`
+5.  The IDE is configured by default to build 100_250 firmware, this can be changed in the bottom of the left panel, there you will find all hardware variants supported by VESC
 
-– PAS tuneables → PAS App page
-– Throttle ramp tuneables → ADC App page
-– Mid-drive FOC tuneables → new “Hazza Mid-Drive Tuning” dropdown
-– Street/off-road config (but NOT speed limits) → UART tab
-– Maintain full compatibility with stock VESC Tool
-– Add new serialization fields only at the end to avoid breaking existing layouts
-– Ensure stock VESC Tool can still write configs without trashing Hazza options
+## Upload to VESC
+### Method 1 - Flash it using an STLink SWD debugger
 
-Status: 🔄 In planning
-Android build: planning
+1.  Build and flash the [bootloader](https://github.com/vedderb/bldc-bootloader) first
+2.  Then `_flash` to the target of your choice. So for instance, for the VESC 100/250: 
+```bash
+make 100_250_flash
+```
 
-🔥 2. What Has Already Been Implemented (Technical Breakdown)
-2.1 Custom Throttle Logic (haz_throttle_process)
+### Method 2 - Upload Firmware via VESC tool through USB
 
-✔ 12 Hz low-pass filter to remove jitter
-✔ Normalizes request against batt + phase current limits
-✔ Low-duty torque scaling (prevents instant chain snap at 0–8% duty)
-✔ Launch-boost zone (<12% duty & <250 ERPM)
-✔ Asymmetric ramping:
+1.  Clone and build the firmware in **.bin** format as in the above Build instructions
 
-Ramp-up 10–30 A/s adaptive
+In VESC tool
 
-Ramp-down 40 A/s hard
-✔ Regen bypasses fancy logic
-✔ Smooth, predictable starts
+2.  Connect to the VESC
+3.  Navigate to the Firmware tab on the left side menu 
+4.  Click on Custom file tab
+5.  Click on the folder icon to select the built firmware in .bin format (e.g. `build/100_250/100_250.bin`)
 
-2.2 PAS Logic (Generic Cadence Sensor)
+##### [ Reminder : It is normal to see VESC disconnects during the firmware upload process ]  
+#####  **[ Warning : DO NOT DISCONNECT POWER/USB to VESC during the upload process, or you will risk bricking your VESC ]**  
+#####  **[ Warning : ONLY DISCONNECT your VESC 10s after the upload loading bar completed and "FW Upload DONE" ]**
 
-✔ Runs on PPM pin via interrupts
-✔ Accurate cadence → ERPM mapping
-✔ Throttle override
-✔ PAS only active when throttle idle
-✔ Zero busy loops
-✔ Safe for high RPM cadence sensors
-✔ Works with Bluetooth UART active simultaneously
+6.  Press the upload firmware button (downward arrow) on the bottom right to start upload the selected firmware.
+7.  Wait for **10s** after the loading bar completed (Warning: unplug sooner will risk bricking your VESC)
+8.  The VESC will disconnect itself after new firmware is uploaded.
 
-2.3 Mid-Drive Safe FOC Logic
+## In case you bricked your VESC
+you will need to upload a new working firmware to the VESC.  
+However, to upload a firmware to a bricked VESC, you have to use a SWD Debugger.
 
-Implemented under the compile-time flag:
 
-#define HAZZA_MIDDRIVE_TUNING 1
+## Contribute
 
-Core behaviour:
+Head to the [forums](https://vesc-project.com/forum) to get involved and improve this project.
+Join the [Discord](https://discord.gg/JgvV5NwYts) for real-time support and chat
 
-✔ Detects chain slap via:
-– ERPM collapse
-– Iq overshoot
-– Modulation saturation
-– Angle stall
-– Iq jump events
-✔ Switches through 3 states:
-– IDLE → normal
-– ACTIVE → torque heavily limited
-– RECOVERING → gradual ramp-out
-✔ Integrator bleed to prevent torque rebound
-✔ PI gains reduced in ACTIVE
-✔ PI gains interpolated in RECOVERING
-✔ Holds halls authoritative
-✔ Prevents observer from breaking traction control
+## Tags
 
-🧩 3. Future Work Roadmap
+Every firmware release has a tag. They are created as follows:
 
-Reduce Iq slew rates to match mid-drive power levels (40–70 A/s).
+```bash
+git tag -a [version] [commit] -m "VESC Firmware Version [version]"
+git push --tags
+```
 
-Integrate tuneables into custom VESC Tool.
+## License
 
-
-Support multiple hardware targets (not only MakerX GO-FOC S100).
-
-Add native speed sensor (TSDZ8)
-
-Investigate torque-sensor feasibility
-
-
-
-
-GO-FOC S100-Specific Tweaks
-
-Things like:
-
-board pin mappings
-
-ADC behavior
-
-hardware flags
-
-whatever else the S100 needs to behave with a mid-drive instead of a hub motor
-
-🧩 Why TSDZ8 + VESC Firmware?
-
-To be clear:
-I didn’t jump ship because the original TSDZ8+OSF setup was weak.
-I actually had my own custom fork of OSF(thanks to mstrens for porting it from TSDZ2), tuned hard, stable, and genuinely strong — but at the end of the day it was still boxed in by the MCU.
-Great firmware on a tiny chip only gets you so far.
-
-The real reason I ended up here is way less dramatic:
-
-my original TSDZ8 controller died,
-
-every cheap aliexpress replacement controller I tried after that was failing because of questionable build quality
-
-after my 3rd replacement I got tired of playing “Will today’s controller die?”
-
-VESC fixes that in the most overkill way possible:
-
-stable hardware
-
-transparent motor control
-
-open source support
-
-PAS logic I can rebuild from scratch
-
-
-The maker x GO-FOC S100 is cheap, mod-friendly, and powerful enough to treat a mid-drive like a science project — so it just made sense to go all-in.
-
-Perfect excuse to experiment, learn, and make the TSDZ8 behave exactly the way I want.
-
-Expect more modules as PAS logic evolves.
-
-🛠️ How to Build (S100 / VESC 100/250)
-
-
-For now, you need:
-
-arm-none-eabi-gcc
-
-make
-
-the usual VESC toolchain
-
-And then:
-
-make go_foc_s100(replace with your hardware configuration)
-
-
-Flash bin using vesc tool.
-
-
-⚠️ Warnings
-
-This firmware can:
-
-behave weird
-
-blow up if misconfigured
-
-spin your cranks like a demon
-
-make your mid-drive forget it’s not a motorcycle
-
-Don’t run this on anyone else’s bike.
-Test lightly.
-Expect chaos until stable.
-
-🧩 Credits
-
-VESC Project (Benjamin + contributors)
-
-Go-FOC S100 hardware folks
-
-mstrens (OSF 860C / TSDZ8 OSF fork) — genuinely helped me understand the hardware side of the TSDZ8, especially how the motor, sensors, and current paths actually work. The OSF project is the reason I even knew what I was poking at when I started rewriting things here.
-
-MakerX — for the GO-FOC S100 hardware and the hwconf files this whole thing stands on.
-
-My own questionable ideas
-
-💬 Contact
-
-If you want to talk mid-drive firmware, or you’re modding a TSDZ8 with VESC too,
-I’m usually somewhere online breaking things.
+The software is released under the GNU General Public License version 3.0
