@@ -30,6 +30,7 @@
 #include "utils_sys.h"
 #include "comm_can.h"
 #include "hw.h"
+#include "app_gear_detect.h"
 #include <math.h>
 
 // Settings
@@ -1053,8 +1054,12 @@ static THD_FUNCTION(adc_thread, arg) {
 			// Ramp speed depends on gap between current and target duty
 			// PAS takes over with current control ONLY when throttle is idle
 			// NEVER applies both duty and current simultaneously
+			// Freewheel catch: spin motor to match wheel speed before engaging drivetrain
 			{
 				static float osf_duty_ramped = 0.0f;
+				static int freewheel_catch_state = 0;  // 0=normal, 1=spinning up, 2=engaged
+				static float freewheel_catch_duty = 0.0f;
+				static int freewheel_catch_gear = 0;
 				const float dt_s = (float)sleep_time / (float)CH_CFG_ST_FREQUENCY;
 
 				float throttle_mag = fabsf(pwr);
@@ -1072,46 +1077,127 @@ static THD_FUNCTION(adc_thread, arg) {
 					ms_without_power += (1000.0f * (float)sleep_time) / (float)CH_CFG_ST_FREQUENCY;
 				}
 
+				// Freewheel catch logic
+				const bool fwc_enabled = config.haz_freewheel_catch_enabled;
+				const float fwc_current_threshold = config.haz_freewheel_catch_current_threshold;
+				const float fwc_erpm_offset = config.haz_freewheel_catch_erpm_offset;
+				const float fwc_final_rate = config.haz_freewheel_catch_final_rate;
+				const float fwc_modifier = config.haz_freewheel_catch_modifier;
+				
+				float current_erpm = fabsf(mc_interface_get_rpm());
+				float motor_current = fabsf(mc_interface_get_tot_current_filtered());
+				float wheel_speed_kph = mc_interface_get_speed() * 3.6f;  // m/s to km/h
+				
+				// Get or remember gear for freewheel catch
+				int current_gear = app_gear_detect_get_last_gear();
+				if (throttle_active && freewheel_catch_gear == 0 && current_gear > 0) {
+					freewheel_catch_gear = current_gear;
+				}
+				if (!throttle_active) {
+					// Not throttling - update gear from current detection if available
+					int detected = app_gear_detect_get_current();
+					if (detected > 0) {
+						freewheel_catch_gear = detected;
+					}
+					freewheel_catch_state = 0;  // Reset state when throttle released
+					freewheel_catch_duty = 0.0f;
+				}
+
 				if (!(ms_without_power < MIN_MS_WITHOUT_POWER && config.safe_start)) {
 					if (throttle_active) {
-						// THROTTLE MODE: pure duty ramping, NO current ever
-						float duty_target = throttle_mag * mcconf->l_max_duty;
-						float duty_gap = fabsf(duty_target - osf_duty_ramped);
-
-						// Ramp rate depends on gap - bigger gap = faster ramp
-						const float ramp_min = 0.3f;    // Minimum ramp when close to target
-						const float ramp_max = 2.0f;    // Maximum ramp when far from target
-						const float ramp_down_base = 2.5f;  // Base ramp down speed
-						const float ramp_down_max = 5.0f;   // Max ramp down when gap is huge
-
-						// Scale ramp by how far we are from target
-						float gap_ratio = duty_gap / mcconf->l_max_duty;
-						if (gap_ratio > 1.0f) gap_ratio = 1.0f;
-
-						if (duty_target > osf_duty_ramped) {
-							// Ramping UP
-							float ramp_rate = ramp_min + (ramp_max - ramp_min) * gap_ratio;
-							osf_duty_ramped += ramp_rate * dt_s;
-							if (osf_duty_ramped > duty_target) osf_duty_ramped = duty_target;
-						} else {
-							// Ramping DOWN
-							float ramp_rate = ramp_down_base + (ramp_down_max - ramp_down_base) * gap_ratio;
-							osf_duty_ramped -= ramp_rate * dt_s;
-							if (osf_duty_ramped < duty_target) osf_duty_ramped = duty_target;
+						// Check if freewheel catch should activate
+						float target_erpm = 0.0f;
+						bool fwc_active = false;
+						
+						if (fwc_enabled && freewheel_catch_gear > 0 && wheel_speed_kph > 3.0f) {
+							target_erpm = app_gear_detect_target_erpm(wheel_speed_kph, freewheel_catch_gear) * fwc_modifier;
+							
+							// Freewheel condition: motor ERPM much lower than target (chain slack)
+							bool is_freewheel = (current_erpm < target_erpm * 0.5f) && (freewheel_catch_state < 2);
+							
+							if (is_freewheel && freewheel_catch_state == 0) {
+								// Start catch sequence
+								freewheel_catch_state = 1;
+								freewheel_catch_duty = fabsf(mc_interface_get_duty_cycle_now());
+							}
+							
+							if (freewheel_catch_state == 1) {
+								// Spinning up to catch wheel
+								fwc_active = true;
+								
+								// Calculate duty ramp rate based on ERPM gap
+								float erpm_gap = target_erpm - current_erpm;
+								float ramp_rate;
+								
+								if (erpm_gap > fwc_erpm_offset) {
+									// Far from target - use fast ramp (normal hybrid ramp up fast)
+									ramp_rate = config.haz_hybrid_ramp_up_fast;
+								} else {
+									// Close to target - use slow final approach
+									ramp_rate = fwc_final_rate;
+								}
+								
+								freewheel_catch_duty += ramp_rate * dt_s;
+								if (freewheel_catch_duty > mcconf->l_max_duty * throttle_mag) {
+									freewheel_catch_duty = mcconf->l_max_duty * throttle_mag;
+								}
+								
+								// Check for engagement (current spike)
+								if (motor_current > fwc_current_threshold && current_erpm > target_erpm * 0.8f) {
+									// Chain engaged! Transition to normal control
+									freewheel_catch_state = 2;
+									osf_duty_ramped = freewheel_catch_duty;
+								}
+								
+								// Apply catch duty
+								mc_interface_set_throttle_limit_active(true);
+								mc_interface_set_duty(pwr >= 0.0f ? freewheel_catch_duty : -freewheel_catch_duty);
+								send_duty = true;
+							}
 						}
+						
+						if (!fwc_active) {
+							// NORMAL THROTTLE MODE: pure duty ramping
+							// Apply street mode speed limit
+							float speed_scale = mc_get_wheel_speed_limit_scale();
+							float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale;
+							float duty_gap = fabsf(duty_target - osf_duty_ramped);
 
-						// Clamp
-						if (osf_duty_ramped < 0.0f) osf_duty_ramped = 0.0f;
-						if (osf_duty_ramped > mcconf->l_max_duty) osf_duty_ramped = mcconf->l_max_duty;
+							// Configurable ramp rates (duty/s)
+							const float ramp_up_slow = config.haz_hybrid_ramp_up_slow;
+							const float ramp_up_fast = config.haz_hybrid_ramp_up_fast;
+							const float ramp_down_slow = config.haz_hybrid_ramp_down_slow;
+							const float ramp_down_fast = config.haz_hybrid_ramp_down_fast;
 
-						if (osf_duty_ramped > 0.001f) {
-							mc_interface_set_throttle_limit_active(true);
-							mc_interface_set_duty(pwr >= 0.0f ? osf_duty_ramped : -osf_duty_ramped);
-							send_duty = true;
-						} else {
-							mc_interface_release_motor();
+							// Scale ramp by how far we are from target
+							float gap_ratio = duty_gap / mcconf->l_max_duty;
+							if (gap_ratio > 1.0f) gap_ratio = 1.0f;
+
+							if (duty_target > osf_duty_ramped) {
+								// Ramping UP
+								float ramp_rate = ramp_up_slow + (ramp_up_fast - ramp_up_slow) * gap_ratio;
+								osf_duty_ramped += ramp_rate * dt_s;
+								if (osf_duty_ramped > duty_target) osf_duty_ramped = duty_target;
+							} else {
+								// Ramping DOWN
+								float ramp_rate = ramp_down_slow + (ramp_down_fast - ramp_down_slow) * gap_ratio;
+								osf_duty_ramped -= ramp_rate * dt_s;
+								if (osf_duty_ramped < duty_target) osf_duty_ramped = duty_target;
+							}
+
+							// Clamp
+							if (osf_duty_ramped < 0.0f) osf_duty_ramped = 0.0f;
+							if (osf_duty_ramped > mcconf->l_max_duty) osf_duty_ramped = mcconf->l_max_duty;
+
+							if (osf_duty_ramped > 0.001f) {
+								mc_interface_set_throttle_limit_active(true);
+								mc_interface_set_duty(pwr >= 0.0f ? osf_duty_ramped : -osf_duty_ramped);
+								send_duty = true;
+							} else {
+								mc_interface_release_motor();
+							}
+							// current_mode stays FALSE - no current applied
 						}
-						// current_mode stays FALSE - no current applied
 					} else {
 						// PAS MODE: throttle is zero, check for pedaling
 						float pas_current_rel = haz_pas_follow_process(dt_s);
@@ -1130,6 +1216,8 @@ static THD_FUNCTION(adc_thread, arg) {
 					}
 				} else {
 					osf_duty_ramped = 0.0f;
+					freewheel_catch_state = 0;
+					freewheel_catch_duty = 0.0f;
 				}
 			}
 			break;

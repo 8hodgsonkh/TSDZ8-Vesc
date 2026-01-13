@@ -116,6 +116,13 @@ typedef enum {
 	MOTOR_TYPE_FOC
 } mc_motor_type;
 
+// TSDZ8 PWM calculation modes
+typedef enum {
+	TSDZ8_PWM_MODE_FLOAT = 0,
+	TSDZ8_PWM_MODE_TABLE_4096,
+	TSDZ8_PWM_MODE_TABLE_256
+} tsdz8_pwm_mode;
+
 // FOC current controller decoupling mode.
 typedef enum {
 	FOC_CC_DECOUPLING_DISABLED = 0,
@@ -405,6 +412,22 @@ typedef struct {
 	float gear_reduction;
 } hazza_mid_configuration;
 
+// Gear detection configuration (for derailleur gear indicator)
+// Calculates current gear from motor ERPM vs wheel speed using known gear ratios
+#define GEAR_MAX_GEARS 12
+typedef struct {
+	bool enabled;                        // Enable gear detection
+	uint8_t num_gears;                   // Number of gears in cassette (1-12)
+	uint8_t chainring_teeth;             // Front chainring teeth (e.g. 42)
+	uint8_t motor_poles;                 // Motor pole pairs (e.g. 8)
+	float internal_ratio;                // Motor internal gear reduction (e.g. 38.0)
+	uint16_t wheel_diameter_mm;          // Wheel diameter in mm (e.g. 700)
+	uint8_t cassette_teeth[GEAR_MAX_GEARS]; // Cassette tooth counts, largest to smallest
+	float detect_tolerance;              // Detection tolerance (e.g. 0.12 = 12%)
+	float min_speed_kph;                 // Min speed for detection (e.g. 2.0)
+	int32_t min_erpm;                    // Min ERPM for detection (e.g. 500)
+} gear_detection_config;
+
 // Hardcoded detection heuristics (not worth tuning)
 #define HAZZA_IQ_OVERSHOOT_MARGIN    15.0f
 #define HAZZA_IQ_MIN_TRIGGER         3.0f
@@ -605,6 +628,22 @@ typedef struct {
 	int m_batt_filter_const;
 	float m_ntcx_ptcx_temp_base;
 	float m_ntcx_ptcx_res;
+
+	// TSDZ8 motor control params (inactive, for future use)
+	uint8_t tsdz8_ramp_up_inv_step;      // Inverse step for ramp up timing (higher = slower, default 194)
+	uint8_t tsdz8_ramp_down_inv_step;    // Inverse step for ramp down timing (higher = slower, default 73)
+	uint8_t tsdz8_gap_threshold_fast;    // Gap threshold for fast ramp (default 16)
+	uint8_t tsdz8_gap_threshold_med;     // Gap threshold for medium ramp (default 8)
+	uint8_t tsdz8_step_up_fast;          // Duty step when gap >= fast threshold (default 4)
+	uint8_t tsdz8_step_up_med;           // Duty step when gap >= med threshold (default 2)
+	uint8_t tsdz8_step_up_slow;          // Duty step when gap < med threshold (default 1)
+	uint8_t tsdz8_step_down_fast;        // Duty step for fast ramp down (default 2)
+	uint8_t tsdz8_step_down_slow;        // Duty step for slow ramp down (default 1)
+	uint8_t tsdz8_startup_duty;          // Initial duty when starting (0-255, default 30)
+	uint8_t tsdz8_max_duty;              // Maximum duty limit (0-255, default 254)
+	uint8_t tsdz8_hall_ref_angle;        // Hall reference angle offset (default 66)
+	tsdz8_pwm_mode tsdz8_pwm_mode;       // PWM calculation mode (float/4096table/256table)
+
 	// Setup info
 	uint8_t si_motor_poles;
 	float si_gear_ratio;
@@ -759,6 +798,17 @@ typedef struct {
 	float haz_throttle_ramp_up_limited_a;
 	float haz_throttle_ramp_down_a;
 	float haz_throttle_filter_hz;
+	// Hybrid Duty mode params (duty-based throttle like OSF)
+	float haz_hybrid_ramp_up_slow;     // Duty/s when close to target (fine control)
+	float haz_hybrid_ramp_up_fast;     // Duty/s when far from target (responsive launch)
+	float haz_hybrid_ramp_down_slow;   // Duty/s for gentle throttle release
+	float haz_hybrid_ramp_down_fast;   // Duty/s for hard brake / quick release
+	// Freewheel catch - spin motor to match wheel before engaging
+	bool haz_freewheel_catch_enabled;
+	float haz_freewheel_catch_current_threshold;  // Current (A) spike = chain engaged
+	float haz_freewheel_catch_erpm_offset;        // ERPM before target to start slowing
+	float haz_freewheel_catch_final_rate;         // Duty/s for last gentle approach
+	float haz_freewheel_catch_modifier;           // Tweak timing (1.0=normal, <1=earlier)
 } adc_config;
 
 // Nunchuk control types
@@ -1000,6 +1050,9 @@ typedef struct {
 
 	// Hazza Mid Drive Tuning
 	hazza_mid_configuration hazza_mid_conf;
+
+	// Gear Detection (derailleur gear indicator)
+	gear_detection_config gear_detect_conf;
 
 	// Protect from flash corruption
 	uint16_t crc;

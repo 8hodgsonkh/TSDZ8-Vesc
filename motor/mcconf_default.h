@@ -657,5 +657,44 @@
 #ifndef MCCONF_BMS_FWD_CAN_MODE
 #define MCCONF_BMS_FWD_CAN_MODE			BMS_FWD_CAN_MODE_DISABLED
 #endif
-
+// TSDZ8 motor control params (inactive, for future use)
+#ifndef MCCONF_TSDZ8_RAMP_UP_INV_STEP
+#define MCCONF_TSDZ8_RAMP_UP_INV_STEP           194
+#endif
+#ifndef MCCONF_TSDZ8_RAMP_DOWN_INV_STEP
+#define MCCONF_TSDZ8_RAMP_DOWN_INV_STEP         73
+#endif
+#ifndef MCCONF_TSDZ8_GAP_THRESHOLD_FAST
+#define MCCONF_TSDZ8_GAP_THRESHOLD_FAST         16
+#endif
+#ifndef MCCONF_TSDZ8_GAP_THRESHOLD_MED
+#define MCCONF_TSDZ8_GAP_THRESHOLD_MED          8
+#endif
+#ifndef MCCONF_TSDZ8_STEP_UP_FAST
+#define MCCONF_TSDZ8_STEP_UP_FAST               4
+#endif
+#ifndef MCCONF_TSDZ8_STEP_UP_MED
+#define MCCONF_TSDZ8_STEP_UP_MED                2
+#endif
+#ifndef MCCONF_TSDZ8_STEP_UP_SLOW
+#define MCCONF_TSDZ8_STEP_UP_SLOW               1
+#endif
+#ifndef MCCONF_TSDZ8_STEP_DOWN_FAST
+#define MCCONF_TSDZ8_STEP_DOWN_FAST             2
+#endif
+#ifndef MCCONF_TSDZ8_STEP_DOWN_SLOW
+#define MCCONF_TSDZ8_STEP_DOWN_SLOW             1
+#endif
+#ifndef MCCONF_TSDZ8_STARTUP_DUTY
+#define MCCONF_TSDZ8_STARTUP_DUTY               30
+#endif
+#ifndef MCCONF_TSDZ8_MAX_DUTY
+#define MCCONF_TSDZ8_MAX_DUTY                   254
+#endif
+#ifndef MCCONF_TSDZ8_HALL_REF_ANGLE
+#define MCCONF_TSDZ8_HALL_REF_ANGLE             66
+#endif
+#ifndef MCCONF_TSDZ8_PWM_MODE
+#define MCCONF_TSDZ8_PWM_MODE                   TSDZ8_PWM_MODE_FLOAT
+#endif
 #endif /* MCCONF_DEFAULT_H_ */

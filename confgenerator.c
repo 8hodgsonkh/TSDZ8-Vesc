@@ -191,6 +191,19 @@ int32_t confgenerator_serialize_mcconf(uint8_t *buffer, const mc_configuration *
 	buffer_append_float16(buffer, conf->m_ntcx_ptcx_temp_base, 10, &ind);
 	buffer[ind++] = (uint8_t)conf->m_hall_extra_samples;
 	buffer[ind++] = (uint8_t)conf->m_batt_filter_const;
+	buffer[ind++] = conf->tsdz8_ramp_up_inv_step;
+	buffer[ind++] = conf->tsdz8_ramp_down_inv_step;
+	buffer[ind++] = conf->tsdz8_gap_threshold_fast;
+	buffer[ind++] = conf->tsdz8_gap_threshold_med;
+	buffer[ind++] = conf->tsdz8_step_up_fast;
+	buffer[ind++] = conf->tsdz8_step_up_med;
+	buffer[ind++] = conf->tsdz8_step_up_slow;
+	buffer[ind++] = conf->tsdz8_step_down_fast;
+	buffer[ind++] = conf->tsdz8_step_down_slow;
+	buffer[ind++] = conf->tsdz8_startup_duty;
+	buffer[ind++] = conf->tsdz8_max_duty;
+	buffer[ind++] = conf->tsdz8_hall_ref_angle;
+	buffer[ind++] = conf->tsdz8_pwm_mode;
 	buffer[ind++] = (uint8_t)conf->si_motor_poles;
 	buffer_append_float32_auto(buffer, conf->si_gear_ratio, &ind);
 	buffer_append_float32_auto(buffer, conf->si_wheel_diameter, &ind);
@@ -293,6 +306,17 @@ int32_t confgenerator_serialize_appconf(uint8_t *buffer, const app_configuration
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_ramp_up_limited_a, &ind);
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_ramp_down_a, &ind);
 	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_throttle_filter_hz, &ind);
+	// Hybrid Duty mode params
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_hybrid_ramp_up_slow, &ind);
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_hybrid_ramp_up_fast, &ind);
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_hybrid_ramp_down_slow, &ind);
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_hybrid_ramp_down_fast, &ind);
+	// Freewheel catch params
+	buffer[ind++] = conf->app_adc_conf.haz_freewheel_catch_enabled;
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_freewheel_catch_current_threshold, &ind);
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_freewheel_catch_erpm_offset, &ind);
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_freewheel_catch_final_rate, &ind);
+	buffer_append_float32_auto(buffer, conf->app_adc_conf.haz_freewheel_catch_modifier, &ind);
 	buffer_append_uint32(buffer, conf->app_uart_baudrate, &ind);
 	buffer[ind++] = conf->app_chuk_conf.ctrl_type;
 	buffer_append_float32_auto(buffer, conf->app_chuk_conf.hyst, &ind);
@@ -376,6 +400,19 @@ int32_t confgenerator_serialize_appconf(uint8_t *buffer, const app_configuration
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.recovery_time_ms, &ind);
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.precharge_exit_erpm, &ind);
 	buffer_append_float32_auto(buffer, conf->hazza_mid_conf.gear_reduction, &ind);
+	// Gear detection config
+	buffer[ind++] = conf->gear_detect_conf.enabled;
+	buffer[ind++] = conf->gear_detect_conf.num_gears;
+	buffer[ind++] = conf->gear_detect_conf.chainring_teeth;
+	buffer[ind++] = conf->gear_detect_conf.motor_poles;
+	buffer_append_float32_auto(buffer, conf->gear_detect_conf.internal_ratio, &ind);
+	buffer_append_uint16(buffer, conf->gear_detect_conf.wheel_diameter_mm, &ind);
+	for (int i = 0; i < GEAR_MAX_GEARS; i++) {
+		buffer[ind++] = conf->gear_detect_conf.cassette_teeth[i];
+	}
+	buffer_append_float32_auto(buffer, conf->gear_detect_conf.detect_tolerance, &ind);
+	buffer_append_float32_auto(buffer, conf->gear_detect_conf.min_speed_kph, &ind);
+	buffer_append_int32(buffer, conf->gear_detect_conf.min_erpm, &ind);
 
 	return ind;
 }
@@ -569,6 +606,19 @@ bool confgenerator_deserialize_mcconf(const uint8_t *buffer, mc_configuration *c
 	conf->m_ntcx_ptcx_temp_base = buffer_get_float16(buffer, 10, &ind);
 	conf->m_hall_extra_samples = buffer[ind++];
 	conf->m_batt_filter_const = buffer[ind++];
+	conf->tsdz8_ramp_up_inv_step = buffer[ind++];
+	conf->tsdz8_ramp_down_inv_step = buffer[ind++];
+	conf->tsdz8_gap_threshold_fast = buffer[ind++];
+	conf->tsdz8_gap_threshold_med = buffer[ind++];
+	conf->tsdz8_step_up_fast = buffer[ind++];
+	conf->tsdz8_step_up_med = buffer[ind++];
+	conf->tsdz8_step_up_slow = buffer[ind++];
+	conf->tsdz8_step_down_fast = buffer[ind++];
+	conf->tsdz8_step_down_slow = buffer[ind++];
+	conf->tsdz8_startup_duty = buffer[ind++];
+	conf->tsdz8_max_duty = buffer[ind++];
+	conf->tsdz8_hall_ref_angle = buffer[ind++];
+	conf->tsdz8_pwm_mode = buffer[ind++];
 	conf->si_motor_poles = buffer[ind++];
 	conf->si_gear_ratio = buffer_get_float32_auto(buffer, &ind);
 	conf->si_wheel_diameter = buffer_get_float32_auto(buffer, &ind);
@@ -674,6 +724,17 @@ bool confgenerator_deserialize_appconf(const uint8_t *buffer, app_configuration 
 	conf->app_adc_conf.haz_throttle_ramp_up_limited_a = buffer_get_float32_auto(buffer, &ind);
 	conf->app_adc_conf.haz_throttle_ramp_down_a = buffer_get_float32_auto(buffer, &ind);
 	conf->app_adc_conf.haz_throttle_filter_hz = buffer_get_float32_auto(buffer, &ind);
+	// Hybrid Duty mode params
+	conf->app_adc_conf.haz_hybrid_ramp_up_slow = buffer_get_float32_auto(buffer, &ind);
+	conf->app_adc_conf.haz_hybrid_ramp_up_fast = buffer_get_float32_auto(buffer, &ind);
+	conf->app_adc_conf.haz_hybrid_ramp_down_slow = buffer_get_float32_auto(buffer, &ind);
+	conf->app_adc_conf.haz_hybrid_ramp_down_fast = buffer_get_float32_auto(buffer, &ind);
+	// Freewheel catch params
+	conf->app_adc_conf.haz_freewheel_catch_enabled = buffer[ind++];
+	conf->app_adc_conf.haz_freewheel_catch_current_threshold = buffer_get_float32_auto(buffer, &ind);
+	conf->app_adc_conf.haz_freewheel_catch_erpm_offset = buffer_get_float32_auto(buffer, &ind);
+	conf->app_adc_conf.haz_freewheel_catch_final_rate = buffer_get_float32_auto(buffer, &ind);
+	conf->app_adc_conf.haz_freewheel_catch_modifier = buffer_get_float32_auto(buffer, &ind);
 	conf->app_uart_baudrate = buffer_get_uint32(buffer, &ind);
 	conf->app_chuk_conf.ctrl_type = buffer[ind++];
 	conf->app_chuk_conf.hyst = buffer_get_float32_auto(buffer, &ind);
@@ -756,6 +817,19 @@ bool confgenerator_deserialize_appconf(const uint8_t *buffer, app_configuration 
 	conf->hazza_mid_conf.recovery_time_ms = buffer_get_float32_auto(buffer, &ind);
 	conf->hazza_mid_conf.precharge_exit_erpm = buffer_get_float32_auto(buffer, &ind);
 	conf->hazza_mid_conf.gear_reduction = buffer_get_float32_auto(buffer, &ind);
+	// Gear detection config
+	conf->gear_detect_conf.enabled = buffer[ind++];
+	conf->gear_detect_conf.num_gears = buffer[ind++];
+	conf->gear_detect_conf.chainring_teeth = buffer[ind++];
+	conf->gear_detect_conf.motor_poles = buffer[ind++];
+	conf->gear_detect_conf.internal_ratio = buffer_get_float32_auto(buffer, &ind);
+	conf->gear_detect_conf.wheel_diameter_mm = buffer_get_uint16(buffer, &ind);
+	for (int i = 0; i < GEAR_MAX_GEARS; i++) {
+		conf->gear_detect_conf.cassette_teeth[i] = buffer[ind++];
+	}
+	conf->gear_detect_conf.detect_tolerance = buffer_get_float32_auto(buffer, &ind);
+	conf->gear_detect_conf.min_speed_kph = buffer_get_float32_auto(buffer, &ind);
+	conf->gear_detect_conf.min_erpm = buffer_get_int32(buffer, &ind);
 
 	return true;
 }
@@ -942,6 +1016,19 @@ void confgenerator_set_defaults_mcconf(mc_configuration *conf) {
 	conf->m_ntcx_ptcx_temp_base = MCCONF_M_NTCX_PTCX_BASE_TEMP;
 	conf->m_hall_extra_samples = MCCONF_M_HALL_EXTRA_SAMPLES;
 	conf->m_batt_filter_const = MCCONF_M_BATT_FILTER_CONST;
+	conf->tsdz8_ramp_up_inv_step = MCCONF_TSDZ8_RAMP_UP_INV_STEP;
+	conf->tsdz8_ramp_down_inv_step = MCCONF_TSDZ8_RAMP_DOWN_INV_STEP;
+	conf->tsdz8_gap_threshold_fast = MCCONF_TSDZ8_GAP_THRESHOLD_FAST;
+	conf->tsdz8_gap_threshold_med = MCCONF_TSDZ8_GAP_THRESHOLD_MED;
+	conf->tsdz8_step_up_fast = MCCONF_TSDZ8_STEP_UP_FAST;
+	conf->tsdz8_step_up_med = MCCONF_TSDZ8_STEP_UP_MED;
+	conf->tsdz8_step_up_slow = MCCONF_TSDZ8_STEP_UP_SLOW;
+	conf->tsdz8_step_down_fast = MCCONF_TSDZ8_STEP_DOWN_FAST;
+	conf->tsdz8_step_down_slow = MCCONF_TSDZ8_STEP_DOWN_SLOW;
+	conf->tsdz8_startup_duty = MCCONF_TSDZ8_STARTUP_DUTY;
+	conf->tsdz8_max_duty = MCCONF_TSDZ8_MAX_DUTY;
+	conf->tsdz8_hall_ref_angle = MCCONF_TSDZ8_HALL_REF_ANGLE;
+	conf->tsdz8_pwm_mode = MCCONF_TSDZ8_PWM_MODE;
 	conf->si_motor_poles = MCCONF_SI_MOTOR_POLES;
 	conf->si_gear_ratio = MCCONF_SI_GEAR_RATIO;
 	conf->si_wheel_diameter = MCCONF_SI_WHEEL_DIAMETER;
@@ -1038,6 +1125,17 @@ void confgenerator_set_defaults_appconf(app_configuration *conf) {
 	conf->app_adc_conf.haz_throttle_ramp_up_limited_a = APPCONF_ADC_HAZ_THROTTLE_RAMP_UP_LIMITED_A;
 	conf->app_adc_conf.haz_throttle_ramp_down_a = APPCONF_ADC_HAZ_THROTTLE_RAMP_DOWN_A;
 	conf->app_adc_conf.haz_throttle_filter_hz = APPCONF_ADC_HAZ_THROTTLE_FILTER_HZ;
+	// Hybrid Duty mode defaults
+	conf->app_adc_conf.haz_hybrid_ramp_up_slow = APPCONF_ADC_HAZ_HYBRID_RAMP_UP_SLOW;
+	conf->app_adc_conf.haz_hybrid_ramp_up_fast = APPCONF_ADC_HAZ_HYBRID_RAMP_UP_FAST;
+	conf->app_adc_conf.haz_hybrid_ramp_down_slow = APPCONF_ADC_HAZ_HYBRID_RAMP_DOWN_SLOW;
+	conf->app_adc_conf.haz_hybrid_ramp_down_fast = APPCONF_ADC_HAZ_HYBRID_RAMP_DOWN_FAST;
+	// Freewheel catch defaults
+	conf->app_adc_conf.haz_freewheel_catch_enabled = APPCONF_ADC_HAZ_FREEWHEEL_CATCH_ENABLED;
+	conf->app_adc_conf.haz_freewheel_catch_current_threshold = APPCONF_ADC_HAZ_FREEWHEEL_CATCH_CURRENT_THRESHOLD;
+	conf->app_adc_conf.haz_freewheel_catch_erpm_offset = APPCONF_ADC_HAZ_FREEWHEEL_CATCH_ERPM_OFFSET;
+	conf->app_adc_conf.haz_freewheel_catch_final_rate = APPCONF_ADC_HAZ_FREEWHEEL_CATCH_FINAL_RATE;
+	conf->app_adc_conf.haz_freewheel_catch_modifier = APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER;
 	conf->app_uart_baudrate = APPCONF_UART_BAUDRATE;
 	conf->app_chuk_conf.ctrl_type = APPCONF_CHUK_CTRL_TYPE;
 	conf->app_chuk_conf.hyst = APPCONF_CHUK_HYST;
@@ -1121,4 +1219,27 @@ void confgenerator_set_defaults_appconf(app_configuration *conf) {
 	conf->hazza_mid_conf.recovery_time_ms = APPCONF_HAZZA_RECOVERY_TIME_MS;
 	conf->hazza_mid_conf.precharge_exit_erpm = APPCONF_HAZZA_PRECHARGE_EXIT_ERPM;
 	conf->hazza_mid_conf.gear_reduction = APPCONF_HAZZA_GEAR_REDUCTION;
+	// Gear detection defaults
+	conf->gear_detect_conf.enabled = APPCONF_GEAR_DETECT_ENABLED;
+	conf->gear_detect_conf.num_gears = APPCONF_GEAR_DETECT_NUM_GEARS;
+	conf->gear_detect_conf.chainring_teeth = APPCONF_GEAR_DETECT_CHAINRING_TEETH;
+	conf->gear_detect_conf.motor_poles = APPCONF_GEAR_DETECT_MOTOR_POLES;
+	conf->gear_detect_conf.internal_ratio = APPCONF_GEAR_DETECT_INTERNAL_RATIO;
+	conf->gear_detect_conf.wheel_diameter_mm = APPCONF_GEAR_DETECT_WHEEL_DIA_MM;
+	// Default 11-speed cassette (42-36-32-28-25-22-19-17-15-13-11)
+	conf->gear_detect_conf.cassette_teeth[0] = 42;  // Gear 1 - easiest
+	conf->gear_detect_conf.cassette_teeth[1] = 36;
+	conf->gear_detect_conf.cassette_teeth[2] = 32;
+	conf->gear_detect_conf.cassette_teeth[3] = 28;
+	conf->gear_detect_conf.cassette_teeth[4] = 25;
+	conf->gear_detect_conf.cassette_teeth[5] = 22;
+	conf->gear_detect_conf.cassette_teeth[6] = 19;
+	conf->gear_detect_conf.cassette_teeth[7] = 17;
+	conf->gear_detect_conf.cassette_teeth[8] = 15;
+	conf->gear_detect_conf.cassette_teeth[9] = 13;
+	conf->gear_detect_conf.cassette_teeth[10] = 11; // Gear 11 - hardest
+	conf->gear_detect_conf.cassette_teeth[11] = 0;  // Unused
+	conf->gear_detect_conf.detect_tolerance = APPCONF_GEAR_DETECT_TOLERANCE;
+	conf->gear_detect_conf.min_speed_kph = APPCONF_GEAR_DETECT_MIN_SPEED_KPH;
+	conf->gear_detect_conf.min_erpm = APPCONF_GEAR_DETECT_MIN_ERPM;
 }

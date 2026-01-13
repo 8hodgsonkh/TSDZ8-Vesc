@@ -62,10 +62,10 @@
 #define STREET_MODE_THROTTLE_ERPM_LIMIT 2000.0f  // Throttle limit = ~4 mph in max gear
 #endif
 
-// Street mode wheel speed limit (m/s) - 6.7 m/s = 24 km/h = 15 mph (for PAS)
+// Street mode wheel speed limit (m/s) - 1.34 m/s = 4.8 km/h = 3 mph (for testing)
 // Set to 0 to disable wheel speed limiting and only use ERPM
 #ifndef STREET_MODE_WHEEL_SPEED_LIMIT
-#define STREET_MODE_WHEEL_SPEED_LIMIT   6.7f
+#define STREET_MODE_WHEEL_SPEED_LIMIT   1.34f
 #endif
 
 // Safety: If motor runs for this long (ms) in street mode without a wheel pulse, cut motor

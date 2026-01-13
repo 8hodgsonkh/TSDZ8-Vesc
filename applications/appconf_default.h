@@ -176,6 +176,38 @@
 #ifndef APPCONF_ADC_HAZ_THROTTLE_FILTER_HZ
 #define APPCONF_ADC_HAZ_THROTTLE_FILTER_HZ	12.0f
 #endif
+
+// Hybrid Duty mode - duty-based throttle ramping (like OSF/TSDZ8 style)
+// Values are in duty/second. Duty ranges 0-1, so 0.3 = takes ~3s to go from 0 to full
+#ifndef APPCONF_ADC_HAZ_HYBRID_RAMP_UP_SLOW
+#define APPCONF_ADC_HAZ_HYBRID_RAMP_UP_SLOW		0.3f	// Fine control when close to target
+#endif
+#ifndef APPCONF_ADC_HAZ_HYBRID_RAMP_UP_FAST
+#define APPCONF_ADC_HAZ_HYBRID_RAMP_UP_FAST		2.0f	// Responsive launch when far from target
+#endif
+#ifndef APPCONF_ADC_HAZ_HYBRID_RAMP_DOWN_SLOW
+#define APPCONF_ADC_HAZ_HYBRID_RAMP_DOWN_SLOW	2.5f	// Gentle coast when throttle released
+#endif
+#ifndef APPCONF_ADC_HAZ_HYBRID_RAMP_DOWN_FAST
+#define APPCONF_ADC_HAZ_HYBRID_RAMP_DOWN_FAST	5.0f	// Quick stop when fully releasing
+#endif
+// Freewheel catch defaults - spin motor to match wheel before drivetrain engages
+#ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_ENABLED
+#define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_ENABLED			false
+#endif
+#ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_CURRENT_THRESHOLD
+#define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_CURRENT_THRESHOLD	2.0f	// Current spike when chain engages (A)
+#endif
+#ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_ERPM_OFFSET
+#define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_ERPM_OFFSET		500.0f	// How far from target ERPM to slow down
+#endif
+#ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_FINAL_RATE
+#define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_FINAL_RATE		0.5f	// Duty ramp rate for final approach
+#endif
+#ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER
+#define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER		1.0f	// Global feel modifier (higher = earlier catch)
+#endif
+
 #ifndef APPCONF_PPM_SMART_REV_MAX_DUTY
 #define APPCONF_PPM_SMART_REV_MAX_DUTY		0.07
 #endif
@@ -520,6 +552,35 @@
 #endif
 #ifndef APPCONF_HAZZA_GEAR_REDUCTION
 #define APPCONF_HAZZA_GEAR_REDUCTION	38.0f  // Motor:chainring ratio (TSDZ8 default)
+#endif
+
+// Gear Detection - calculates current derailleur gear from ERPM vs wheel speed
+#ifndef APPCONF_GEAR_DETECT_ENABLED
+#define APPCONF_GEAR_DETECT_ENABLED			false
+#endif
+#ifndef APPCONF_GEAR_DETECT_NUM_GEARS
+#define APPCONF_GEAR_DETECT_NUM_GEARS		11		// 11-speed cassette
+#endif
+#ifndef APPCONF_GEAR_DETECT_CHAINRING_TEETH
+#define APPCONF_GEAR_DETECT_CHAINRING_TEETH	42		// Front chainring
+#endif
+#ifndef APPCONF_GEAR_DETECT_MOTOR_POLES
+#define APPCONF_GEAR_DETECT_MOTOR_POLES		8		// TSDZ8 poles
+#endif
+#ifndef APPCONF_GEAR_DETECT_INTERNAL_RATIO
+#define APPCONF_GEAR_DETECT_INTERNAL_RATIO	38.0f	// Internal gear reduction
+#endif
+#ifndef APPCONF_GEAR_DETECT_WHEEL_DIA_MM
+#define APPCONF_GEAR_DETECT_WHEEL_DIA_MM	700		// 700c / 29er wheel
+#endif
+#ifndef APPCONF_GEAR_DETECT_TOLERANCE
+#define APPCONF_GEAR_DETECT_TOLERANCE		0.12f	// 12% match tolerance
+#endif
+#ifndef APPCONF_GEAR_DETECT_MIN_SPEED_KPH
+#define APPCONF_GEAR_DETECT_MIN_SPEED_KPH	2.0f	// Min speed for detection
+#endif
+#ifndef APPCONF_GEAR_DETECT_MIN_ERPM
+#define APPCONF_GEAR_DETECT_MIN_ERPM		500		// Min ERPM for detection
 #endif
 
 #endif /* APPCONF_DEFAULT_H_ */

@@ -368,9 +368,11 @@ void hw_update_speed_sensor(void) {
 	}
 }
 
-// Standard VESC interface - returns wheel revs per second
+// Standard VESC interface - returns speed in m/s
 float hw_get_speed(void) {
-	return wheel_speed_rps;
+	const volatile mc_configuration *conf = mc_interface_get_configuration();
+	// wheel_speed_rps * circumference = m/s
+	return wheel_speed_rps * conf->si_wheel_diameter * M_PI;
 }
 
 // Returns absolute distance in meters (requires wheel diameter from config)
