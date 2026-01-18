@@ -191,6 +191,9 @@
 #ifndef APPCONF_ADC_HAZ_HYBRID_RAMP_DOWN_FAST
 #define APPCONF_ADC_HAZ_HYBRID_RAMP_DOWN_FAST	5.0f	// Quick stop when fully releasing
 #endif
+#ifndef APPCONF_ADC_HAZ_HYBRID_RAMP_RISE_TIME
+#define APPCONF_ADC_HAZ_HYBRID_RAMP_RISE_TIME	0.3f	// Time to blend slow->fast ramp
+#endif
 // Freewheel catch defaults - spin motor to match wheel before drivetrain engages
 #ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_ENABLED
 #define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_ENABLED			false
@@ -206,6 +209,31 @@
 #endif
 #ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER
 #define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER		1.0f	// Global feel modifier (higher = earlier catch)
+#endif
+// Hazza PAS Duty - sexy duty-based PAS control
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_ENABLED
+#define APPCONF_ADC_HAZ_PAS_DUTY_ENABLED			false
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_VARIATION_THRESHOLD
+#define APPCONF_ADC_HAZ_PAS_DUTY_VARIATION_THRESHOLD	0.15f	// Cadence variation threshold
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_ERPM_BOOST
+#define APPCONF_ADC_HAZ_PAS_DUTY_ERPM_BOOST			1.1f	// Target ERPM multiplier
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_EFFORT_GAIN
+#define APPCONF_ADC_HAZ_PAS_DUTY_EFFORT_GAIN			1.0f	// Effort gain
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP
+#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP			0.5f	// Duty/s ramp up
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN
+#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN			1.0f	// Duty/s ramp down
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_RISE_TIME
+#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_RISE_TIME		0.3f	// Time to blend slow->fast ramp
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_IDLE_TIMEOUT
+#define APPCONF_ADC_HAZ_PAS_DUTY_IDLE_TIMEOUT			0.5f	// Idle timeout (s)
 #endif
 
 #ifndef APPCONF_PPM_SMART_REV_MAX_DUTY
@@ -516,44 +544,6 @@
 #define APPCONF_IMU_G_OFFSET_2				0.0
 #endif
 
-// Hazza Mid Drive Tuning Configuration
-#ifndef APPCONF_HAZZA_ENABLED
-#define APPCONF_HAZZA_ENABLED	true
-#endif
-#ifndef APPCONF_HAZZA_SLACK_ERPM_MAX
-#define APPCONF_HAZZA_SLACK_ERPM_MAX	5500.0f
-#endif
-#ifndef APPCONF_HAZZA_SLACK_EXIT_ERPM
-#define APPCONF_HAZZA_SLACK_EXIT_ERPM	7500.0f
-#endif
-#ifndef APPCONF_HAZZA_ERPMSLOPE_THRESHOLD
-#define APPCONF_HAZZA_ERPMSLOPE_THRESHOLD	100.0f
-#endif
-#ifndef APPCONF_HAZZA_IQ_SLEW_A_PER_S
-#define APPCONF_HAZZA_IQ_SLEW_A_PER_S	40.0f
-#endif
-#ifndef APPCONF_HAZZA_IQ_SLEW_RECOVERY_MAX
-#define APPCONF_HAZZA_IQ_SLEW_RECOVERY_MAX	200.0f
-#endif
-#ifndef APPCONF_HAZZA_PI_SCALE_ACTIVE_D_KP
-#define APPCONF_HAZZA_PI_SCALE_ACTIVE_D_KP	0.60f
-#endif
-#ifndef APPCONF_HAZZA_PI_SCALE_ACTIVE_Q_KP
-#define APPCONF_HAZZA_PI_SCALE_ACTIVE_Q_KP	0.60f
-#endif
-#ifndef APPCONF_HAZZA_ACTIVE_DWELL_MS
-#define APPCONF_HAZZA_ACTIVE_DWELL_MS	30.0f
-#endif
-#ifndef APPCONF_HAZZA_RECOVERY_TIME_MS
-#define APPCONF_HAZZA_RECOVERY_TIME_MS	200.0f
-#endif
-#ifndef APPCONF_HAZZA_PRECHARGE_EXIT_ERPM
-#define APPCONF_HAZZA_PRECHARGE_EXIT_ERPM	1500.0f
-#endif
-#ifndef APPCONF_HAZZA_GEAR_REDUCTION
-#define APPCONF_HAZZA_GEAR_REDUCTION	38.0f  // Motor:chainring ratio (TSDZ8 default)
-#endif
-
 // Gear Detection - calculates current derailleur gear from ERPM vs wheel speed
 #ifndef APPCONF_GEAR_DETECT_ENABLED
 #define APPCONF_GEAR_DETECT_ENABLED			false
@@ -581,6 +571,43 @@
 #endif
 #ifndef APPCONF_GEAR_DETECT_MIN_ERPM
 #define APPCONF_GEAR_DETECT_MIN_ERPM		500		// Min ERPM for detection
+#endif
+// Cassette cog teeth counts (11-speed 11-42T default)
+#ifndef APPCONF_GEAR_DETECT_COG_1
+#define APPCONF_GEAR_DETECT_COG_1		42
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_2
+#define APPCONF_GEAR_DETECT_COG_2		36
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_3
+#define APPCONF_GEAR_DETECT_COG_3		32
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_4
+#define APPCONF_GEAR_DETECT_COG_4		28
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_5
+#define APPCONF_GEAR_DETECT_COG_5		25
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_6
+#define APPCONF_GEAR_DETECT_COG_6		22
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_7
+#define APPCONF_GEAR_DETECT_COG_7		19
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_8
+#define APPCONF_GEAR_DETECT_COG_8		17
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_9
+#define APPCONF_GEAR_DETECT_COG_9		15
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_10
+#define APPCONF_GEAR_DETECT_COG_10		13
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_11
+#define APPCONF_GEAR_DETECT_COG_11		11
+#endif
+#ifndef APPCONF_GEAR_DETECT_COG_12
+#define APPCONF_GEAR_DETECT_COG_12		0		// Unused for 11-speed
 #endif
 
 #endif /* APPCONF_DEFAULT_H_ */

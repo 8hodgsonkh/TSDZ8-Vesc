@@ -27,6 +27,25 @@ static int s_last_gear = 0;
 static int s_pending_gear = 0;
 static int s_consecutive_count = 0;
 
+// Helper to get cassette teeth by index (0-11)
+static inline uint8_t get_cassette_teeth(const gear_detection_config *conf, int idx) {
+    switch (idx) {
+        case 0:  return conf->cassette_teeth_1;
+        case 1:  return conf->cassette_teeth_2;
+        case 2:  return conf->cassette_teeth_3;
+        case 3:  return conf->cassette_teeth_4;
+        case 4:  return conf->cassette_teeth_5;
+        case 5:  return conf->cassette_teeth_6;
+        case 6:  return conf->cassette_teeth_7;
+        case 7:  return conf->cassette_teeth_8;
+        case 8:  return conf->cassette_teeth_9;
+        case 9:  return conf->cassette_teeth_10;
+        case 10: return conf->cassette_teeth_11;
+        case 11: return conf->cassette_teeth_12;
+        default: return 0;
+    }
+}
+
 /**
  * @brief Calculate current gear from motor ERPM and wheel speed
  * 
@@ -70,10 +89,11 @@ static int detect_gear_raw(float speed_kph, int32_t erpm, const gear_detection_c
     float best_diff = 999.0f;
     
     for (int g = 0; g < conf->num_gears && g < GEAR_MAX_GEARS; g++) {
-        if (conf->cassette_teeth[g] == 0) continue;
+        uint8_t cog_teeth = get_cassette_teeth(conf, g);
+        if (cog_teeth == 0) continue;
         
-        float diff = fabsf(observed_cog_teeth - (float)conf->cassette_teeth[g]) / 
-                     (float)conf->cassette_teeth[g];
+        float diff = fabsf(observed_cog_teeth - (float)cog_teeth) / 
+                     (float)cog_teeth;
         if (diff < best_diff && diff < conf->detect_tolerance) {
             best_diff = diff;
             best_gear = g + 1;  // 1-indexed gears
@@ -164,7 +184,7 @@ float app_gear_detect_target_erpm(float speed_kph, int gear) {
         return 0.0f;
     }
     
-    uint8_t cassette_teeth = conf->cassette_teeth[gear - 1];  // 0-indexed array
+    uint8_t cassette_teeth = get_cassette_teeth(conf, gear - 1);  // 0-indexed
     if (cassette_teeth == 0) {
         return 0.0f;
     }

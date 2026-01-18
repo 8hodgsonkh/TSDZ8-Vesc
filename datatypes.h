@@ -390,28 +390,6 @@ typedef enum {
 	SAT_COMP_LAMBDA_AND_FACTOR
 } SAT_COMP_MODE;
 
-typedef struct {
-	bool enabled;
-	// Slack detection window
-	float slack_erpm_max;
-	float slack_exit_erpm;
-	// Detection sensitivity
-	float erpm_slope_threshold;
-	// Current slew control
-	float iq_slew_a_per_s;
-	float iq_slew_recovery_max;
-	// PI gain scaling during slack event (0.0-1.0 = reduce gains)
-	float pi_scale_active_d_kp;
-	float pi_scale_active_q_kp;
-	// Timing
-	float active_dwell_ms;
-	float recovery_time_ms;
-	// Precharge (startup torque smoothing)
-	float precharge_exit_erpm;
-	// PAS gear reduction (motor:chainring ratio, e.g. 38 for TSDZ8)
-	float gear_reduction;
-} hazza_mid_configuration;
-
 // Gear detection configuration (for derailleur gear indicator)
 // Calculates current gear from motor ERPM vs wheel speed using known gear ratios
 #define GEAR_MAX_GEARS 12
@@ -422,7 +400,18 @@ typedef struct {
 	uint8_t motor_poles;                 // Motor pole pairs (e.g. 8)
 	float internal_ratio;                // Motor internal gear reduction (e.g. 38.0)
 	uint16_t wheel_diameter_mm;          // Wheel diameter in mm (e.g. 700)
-	uint8_t cassette_teeth[GEAR_MAX_GEARS]; // Cassette tooth counts, largest to smallest
+	uint8_t cassette_teeth_1;            // Cog 1 teeth (largest)
+	uint8_t cassette_teeth_2;
+	uint8_t cassette_teeth_3;
+	uint8_t cassette_teeth_4;
+	uint8_t cassette_teeth_5;
+	uint8_t cassette_teeth_6;
+	uint8_t cassette_teeth_7;
+	uint8_t cassette_teeth_8;
+	uint8_t cassette_teeth_9;
+	uint8_t cassette_teeth_10;
+	uint8_t cassette_teeth_11;
+	uint8_t cassette_teeth_12;           // Cog 12 teeth (smallest)
 	float detect_tolerance;              // Detection tolerance (e.g. 0.12 = 12%)
 	float min_speed_kph;                 // Min speed for detection (e.g. 2.0)
 	int32_t min_erpm;                    // Min ERPM for detection (e.g. 500)
@@ -803,12 +792,22 @@ typedef struct {
 	float haz_hybrid_ramp_up_fast;     // Duty/s when far from target (responsive launch)
 	float haz_hybrid_ramp_down_slow;   // Duty/s for gentle throttle release
 	float haz_hybrid_ramp_down_fast;   // Duty/s for hard brake / quick release
+	float haz_hybrid_ramp_rise_time;   // Time (s) to blend from slow to fast ramp
 	// Freewheel catch - spin motor to match wheel before engaging
 	bool haz_freewheel_catch_enabled;
 	float haz_freewheel_catch_current_threshold;  // Current (A) spike = chain engaged
 	float haz_freewheel_catch_erpm_offset;        // ERPM before target to start slowing
 	float haz_freewheel_catch_final_rate;         // Duty/s for last gentle approach
 	float haz_freewheel_catch_modifier;           // Tweak timing (1.0=normal, <1=earlier)
+	// PAS Duty - sexy duty-based PAS control
+	bool haz_pas_duty_enabled;
+	float haz_pas_duty_variation_threshold;
+	float haz_pas_duty_erpm_boost;
+	float haz_pas_duty_effort_gain;
+	float haz_pas_duty_ramp_up;
+	float haz_pas_duty_ramp_down;
+	float haz_pas_duty_ramp_rise_time;
+	float haz_pas_duty_idle_timeout;
 } adc_config;
 
 // Nunchuk control types
@@ -915,7 +914,9 @@ typedef struct {
 	NRF_RETR_DELAY retry_delay;
 	unsigned char retries;
 	unsigned char channel;
-	unsigned char address[3];
+	unsigned char address_0;
+	unsigned char address_1;
+	unsigned char address_2;
 	bool send_crc_ack;
 } nrf_config;
 
@@ -970,8 +971,12 @@ typedef struct {
 	float rot_roll;
 	float rot_pitch;
 	float rot_yaw;
-	float accel_offsets[3];
-	float gyro_offsets[3];
+	float accel_offsets_0;
+	float accel_offsets_1;
+	float accel_offsets_2;
+	float gyro_offsets_0;
+	float gyro_offsets_1;
+	float gyro_offsets_2;
 } imu_config;
 
 typedef enum {
@@ -1047,9 +1052,6 @@ typedef struct {
 
 	// IMU Settings
 	imu_config imu_conf;
-
-	// Hazza Mid Drive Tuning
-	hazza_mid_configuration hazza_mid_conf;
 
 	// Gear Detection (derailleur gear indicator)
 	gear_detection_config gear_detect_conf;
