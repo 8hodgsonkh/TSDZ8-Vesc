@@ -610,6 +610,10 @@ float app_pas_get_time_since_real_step(void) {
 	return pas_time_since_last_real_step;
 }
 
+float app_pas_get_event_period(void) {
+	return pas_quad_state.event_period;
+}
+
 bool app_pas_is_forced_idle(void) {
 	return pas_force_idle;
 }

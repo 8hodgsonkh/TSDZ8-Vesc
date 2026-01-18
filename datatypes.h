@@ -914,9 +914,7 @@ typedef struct {
 	NRF_RETR_DELAY retry_delay;
 	unsigned char retries;
 	unsigned char channel;
-	unsigned char address_0;
-	unsigned char address_1;
-	unsigned char address_2;
+	unsigned char address[3];
 	bool send_crc_ack;
 } nrf_config;
 
@@ -971,12 +969,8 @@ typedef struct {
 	float rot_roll;
 	float rot_pitch;
 	float rot_yaw;
-	float accel_offsets_0;
-	float accel_offsets_1;
-	float accel_offsets_2;
-	float gyro_offsets_0;
-	float gyro_offsets_1;
-	float gyro_offsets_2;
+	float accel_offsets[3];
+	float gyro_offsets[3];
 } imu_config;
 
 typedef enum {

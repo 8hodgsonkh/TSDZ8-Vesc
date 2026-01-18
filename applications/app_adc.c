@@ -145,6 +145,242 @@ static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
 	.ramp_elapsed = 0.0f
 };
 
+// PAS Follow with Duty Control + Effort Juice
+// Matches motor ERPM to pedal ERPM using DUTY commands (not current!)
+// Then adds effort "juice" - push hard = motor speeds up, freewheel = stick to speed
+typedef struct {
+	float duty_cmd;              // Current duty output (ramped)
+	float effort_smooth;         // Smoothed effort estimate (0 to 1)
+	float rotation_progress;     // Accumulated rotations for startup delay
+	float idle_time;             // Time since last pedal activity
+	float ramp_elapsed;          // Time since ramp started (for ramp rise)
+	bool engaged;                // PAS currently providing power
+	uint32_t last_step_count;    // Track PAS steps for activity detection
+} haz_pas_duty_ctx_t;
+
+static haz_pas_duty_ctx_t haz_pas_duty_ctx = {
+	.duty_cmd = 0.0f,
+	.effort_smooth = 0.0f,
+	.rotation_progress = 0.0f,
+	.idle_time = 0.0f,
+	.ramp_elapsed = 0.0f,
+	.engaged = false,
+	.last_step_count = 0
+};
+
+static void haz_pas_duty_reset(void) {
+	haz_pas_duty_ctx.duty_cmd = 0.0f;
+	haz_pas_duty_ctx.effort_smooth = 0.0f;
+	haz_pas_duty_ctx.rotation_progress = 0.0f;
+	haz_pas_duty_ctx.idle_time = 0.0f;
+	haz_pas_duty_ctx.ramp_elapsed = 0.0f;
+	haz_pas_duty_ctx.engaged = false;
+}
+
+// PAS Follow with Duty - matches motor to pedals using duty, with effort juice on top
+// Base = whatever duty needed to match pedal ERPM (pure ERPM tracking)
+// Effort juice = push hard → target faster than pedals, cruise → stick to pedal speed
+static float haz_pas_duty_process(const adc_config *conf, float dt_s) {
+	if (!conf->haz_pas_duty_enabled) {
+		haz_pas_duty_reset();
+		return 0.0f;
+	}
+
+	// Check if PAS is active
+	if (!app_pas_is_running()) {
+		haz_pas_duty_reset();
+		return 0.0f;
+	}
+
+	// Get PAS config for gear ratio etc
+	const app_configuration *appconf = app_get_configuration();
+	const pas_config *pas_conf = &appconf->app_pas_conf;
+	if (pas_conf->ctrl_type == PAS_CTRL_TYPE_NONE) {
+		haz_pas_duty_reset();
+		return 0.0f;
+	}
+
+	// Get motor config for max duty
+	const volatile mc_configuration *mcconf = mc_interface_get_configuration();
+	float max_duty = mcconf->l_max_duty;
+	if (max_duty < 0.1f) max_duty = 0.95f;
+
+	// Check for pedal activity via step count
+	uint32_t step_count = app_pas_get_step_count();
+	bool has_activity = (step_count != haz_pas_duty_ctx.last_step_count);
+	haz_pas_duty_ctx.last_step_count = step_count;
+
+	float pedal_rpm = app_pas_get_pedal_rpm();
+	float target_erpm = app_pas_get_target_erpm();  // From PAS - already gear-ratio scaled!
+	bool is_pedaling = (pedal_rpm > 3.0f && target_erpm > 0.0f);
+
+	// Config params
+	const float var_threshold = conf->haz_pas_duty_variation_threshold;
+	const float erpm_boost = conf->haz_pas_duty_erpm_boost;     // At max effort, target = pedal * (1 + boost)
+	const float effort_gain = conf->haz_pas_duty_effort_gain;   // Effort signal amplification
+	const float ramp_up_target = conf->haz_pas_duty_ramp_up;    // Target ramp rate
+	const float ramp_down = conf->haz_pas_duty_ramp_down;
+	const float ramp_rise_time = conf->haz_pas_duty_ramp_rise_time;  // Time for ramp to reach full speed
+	const float idle_timeout = conf->haz_pas_duty_idle_timeout;
+
+	// Idle timeout handling
+	if (!has_activity && !is_pedaling) {
+		haz_pas_duty_ctx.idle_time += dt_s;
+		if (haz_pas_duty_ctx.idle_time > idle_timeout) {
+			// Timeout - ramp down and disengage
+			haz_pas_duty_ctx.engaged = false;
+			haz_pas_duty_ctx.ramp_elapsed = 0.0f;  // Reset ramp rise for next engagement
+			float ramp = ramp_down > 0.1f ? ramp_down : 0.5f;
+			haz_pas_duty_ctx.duty_cmd -= ramp * dt_s;
+			if (haz_pas_duty_ctx.duty_cmd < 0.0f) {
+				haz_pas_duty_ctx.duty_cmd = 0.0f;
+				haz_pas_duty_ctx.effort_smooth = 0.0f;
+				haz_pas_duty_ctx.rotation_progress = 0.0f;
+			}
+			return haz_pas_duty_ctx.duty_cmd;
+		}
+	} else {
+		haz_pas_duty_ctx.idle_time = 0.0f;
+	}
+
+	if (!is_pedaling) {
+		return haz_pas_duty_ctx.duty_cmd;
+	}
+
+	// Startup delay - need some rotation before engaging (like PAS follow)
+	const float start_rotations = 0.15f;  // ~15% of a pedal revolution
+	float rotations = (pedal_rpm / 60.0f) * dt_s;
+	haz_pas_duty_ctx.rotation_progress = fminf(haz_pas_duty_ctx.rotation_progress + rotations, start_rotations);
+	if (!haz_pas_duty_ctx.engaged) {
+		if (haz_pas_duty_ctx.rotation_progress >= start_rotations) {
+			haz_pas_duty_ctx.engaged = true;
+			haz_pas_duty_ctx.ramp_elapsed = 0.0f;  // Start ramp rise fresh
+		} else {
+			return haz_pas_duty_ctx.duty_cmd;
+		}
+	}
+
+	// ============ EFFORT JUICE (via event period variation) ============
+	// Torque sensing via pedal cadence variation:
+	// - Smooth pedaling (low variation) = cruising, low effort
+	// - Choppy pedaling (high variation) = pushing hard, high effort
+	// The event_period is the time between PAS sensor pulses
+	// When you push hard, the period varies more as the drivetrain loads up
+	
+	float effort = 0.0f;
+	float event_period = app_pas_get_event_period();
+	
+	// Track event period variation using LP filter approach
+	static float period_smooth = 0.0f;
+	static float period_var_smooth = 0.0f;
+	
+	if (event_period > 0.001f && event_period < 2.0f) {
+		// Update smoothed period
+		const float period_alpha = 0.15f;
+		UTILS_LP_FAST(period_smooth, event_period, period_alpha);
+		
+		// Calculate variation (deviation from smoothed)
+		float period_deviation = fabsf(event_period - period_smooth);
+		float period_variation = (period_smooth > 0.01f) ? (period_deviation / period_smooth) : 0.0f;
+		
+		// Smooth the variation signal
+		const float var_alpha = 0.08f;
+		UTILS_LP_FAST(period_var_smooth, period_variation, var_alpha);
+		
+		// Map variation to effort (0-1)
+		// var_threshold: below this = cruising (0 effort)
+		// Above threshold: linearly ramp to max effort
+		float var_above_thresh = period_var_smooth - var_threshold;
+		if (var_above_thresh > 0.0f) {
+			effort = var_above_thresh * effort_gain;
+			utils_truncate_number(&effort, 0.0f, 1.0f);
+		}
+	}
+	
+	// Fallback: if no good period data but pedaling, give small base effort
+	if (effort < 0.01f && pedal_rpm > 20.0f) {
+		effort = 0.15f;  // Small base effort when pedaling but no variation detected
+	}
+
+	// Smooth the effort signal
+	const float effort_filter = 0.12f;
+	UTILS_LP_FAST(haz_pas_duty_ctx.effort_smooth, effort, effort_filter);
+
+	// ============ ERPM MATCHING WITH DUTY ============
+	// The base is ALWAYS matching pedal ERPM - no fixed "base duty"
+	// Effort juice modifies the TARGET erpm
+	//   effort=0 → target = pedal ERPM (cruise/match)
+	//   effort=1 → target = pedal ERPM * (1 + erpm_boost) (accelerate!)
+
+	float effort_multiplier = 1.0f + haz_pas_duty_ctx.effort_smooth * erpm_boost;
+	float target_erpm_with_juice = target_erpm * effort_multiplier;
+
+	// Get current motor ERPM
+	float erpm_now = mc_interface_get_rpm();
+
+	// P-controller for ERPM tracking → outputs DUTY
+	// This is the key: we're NOT setting a fixed base duty
+	// We're calculating what duty is needed to reach target ERPM
+	const float kp_duty_per_erpm = 0.00008f;  // ~0.08 duty per 1000 ERPM error
+	const float deadband_erpm = 150.0f;
+
+	float erpm_err = target_erpm_with_juice - erpm_now;
+	if (fabsf(erpm_err) < deadband_erpm) {
+		erpm_err = 0.0f;
+	}
+
+	// Target duty = P-controller output
+	// Positive error (motor too slow) → positive duty
+	// Negative error (motor too fast) → reduce/coast
+	float duty_target = kp_duty_per_erpm * erpm_err;
+
+	// Add a small base to overcome static friction when starting
+	if (duty_target > 0.0f && haz_pas_duty_ctx.duty_cmd < 0.05f) {
+		duty_target += 0.03f;  // Small kick to get moving
+	}
+
+	// Clamp to valid range
+	if (duty_target < 0.0f) duty_target = 0.0f;
+	if (duty_target > max_duty) duty_target = max_duty;
+
+	// ============ RAMP WITH RISE TIME (the new ramp-of-ramp!) ============
+	// Ramp rate starts at 0 and linearly increases to ramp_up_target over ramp_rise_time
+	// This gives a soft start feel
+
+	if (duty_target > haz_pas_duty_ctx.duty_cmd) {
+		// Ramping UP - apply the ramp rise
+		haz_pas_duty_ctx.ramp_elapsed += dt_s;
+		if (haz_pas_duty_ctx.ramp_elapsed > ramp_rise_time) {
+			haz_pas_duty_ctx.ramp_elapsed = ramp_rise_time;
+		}
+
+		// Calculate current ramp rate (0 → ramp_up_target over ramp_rise_time)
+		float ramp_ratio = 1.0f;
+		if (ramp_rise_time > 0.01f) {
+			ramp_ratio = haz_pas_duty_ctx.ramp_elapsed / ramp_rise_time;
+		}
+		float current_ramp_rate = ramp_up_target * ramp_ratio;
+
+		haz_pas_duty_ctx.duty_cmd += current_ramp_rate * dt_s;
+		if (haz_pas_duty_ctx.duty_cmd > duty_target) {
+			haz_pas_duty_ctx.duty_cmd = duty_target;
+		}
+	} else {
+		// Ramping DOWN - use full ramp down rate (no rise time needed)
+		haz_pas_duty_ctx.ramp_elapsed = 0.0f;  // Reset for next ramp up
+		haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
+		if (haz_pas_duty_ctx.duty_cmd < duty_target) {
+			haz_pas_duty_ctx.duty_cmd = duty_target;
+		}
+	}
+
+	// Final clamp
+	if (haz_pas_duty_ctx.duty_cmd < 0.0f) haz_pas_duty_ctx.duty_cmd = 0.0f;
+	if (haz_pas_duty_ctx.duty_cmd > max_duty) haz_pas_duty_ctx.duty_cmd = max_duty;
+
+	return haz_pas_duty_ctx.duty_cmd;
+}
+
 static bool haz_throttle_is_current_ctrl(adc_control_type ctrl) {
 	switch (ctrl) {
 	case ADC_CTRL_TYPE_CURRENT:
@@ -1200,18 +1436,30 @@ static THD_FUNCTION(adc_thread, arg) {
 						}
 					} else {
 						// PAS MODE: throttle is zero, check for pedaling
-						float pas_current_rel = haz_pas_follow_process(dt_s);
-						if (pas_current_rel > 0.0f) {
-							// PAS active - use current control
-							osf_duty_ramped = fabsf(mc_interface_get_duty_cycle_now());
-							current_mode = true;
-							current_rel = pas_current_rel;
+						// Try duty-based PAS first (effort-emulating, torque sensing feel!)
+						float pas_duty = haz_pas_duty_process(&config, dt_s);
+						if (pas_duty > 0.001f) {
+							// PAS Duty active - use DUTY control (not current!)
+							osf_duty_ramped = pas_duty;
 							mc_interface_set_throttle_limit_active(true);
-							// send_duty stays FALSE - no duty applied
+							mc_interface_set_duty(pas_duty);
+							send_duty = true;
+							// current_mode stays FALSE - pure duty mode!
 						} else {
-							// Nothing - release motor
-							mc_interface_release_motor();
-							osf_duty_ramped = 0.0f;
+							// Fall back to current-based PAS follow
+							float pas_current_rel = haz_pas_follow_process(dt_s);
+							if (pas_current_rel > 0.0f) {
+								// PAS active - use current control
+								osf_duty_ramped = fabsf(mc_interface_get_duty_cycle_now());
+								current_mode = true;
+								current_rel = pas_current_rel;
+								mc_interface_set_throttle_limit_active(true);
+								// send_duty stays FALSE - no duty applied
+							} else {
+								// Nothing - release motor
+								mc_interface_release_motor();
+								osf_duty_ramped = 0.0f;
+							}
 						}
 					}
 				} else {

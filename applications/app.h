@@ -90,6 +90,7 @@ int app_pas_get_pas1_level(void);
 int app_pas_get_pas2_level(void);
 uint32_t app_pas_get_step_count(void);
 float app_pas_get_time_since_real_step(void);
+float app_pas_get_event_period(void);
 bool app_pas_is_forced_idle(void);
 void app_pas_set_current_sub_scaling(float current_sub_scaling);
 void app_pas_pas_irq_handler(void);
