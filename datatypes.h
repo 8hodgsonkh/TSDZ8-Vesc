@@ -116,13 +116,6 @@ typedef enum {
 	MOTOR_TYPE_FOC
 } mc_motor_type;
 
-// TSDZ8 PWM calculation modes
-typedef enum {
-	TSDZ8_PWM_MODE_FLOAT = 0,
-	TSDZ8_PWM_MODE_TABLE_4096,
-	TSDZ8_PWM_MODE_TABLE_256
-} tsdz8_pwm_mode;
-
 // FOC current controller decoupling mode.
 typedef enum {
 	FOC_CC_DECOUPLING_DISABLED = 0,
@@ -618,21 +611,6 @@ typedef struct {
 	float m_ntcx_ptcx_temp_base;
 	float m_ntcx_ptcx_res;
 
-	// TSDZ8 motor control params (inactive, for future use)
-	uint8_t tsdz8_ramp_up_inv_step;      // Inverse step for ramp up timing (higher = slower, default 194)
-	uint8_t tsdz8_ramp_down_inv_step;    // Inverse step for ramp down timing (higher = slower, default 73)
-	uint8_t tsdz8_gap_threshold_fast;    // Gap threshold for fast ramp (default 16)
-	uint8_t tsdz8_gap_threshold_med;     // Gap threshold for medium ramp (default 8)
-	uint8_t tsdz8_step_up_fast;          // Duty step when gap >= fast threshold (default 4)
-	uint8_t tsdz8_step_up_med;           // Duty step when gap >= med threshold (default 2)
-	uint8_t tsdz8_step_up_slow;          // Duty step when gap < med threshold (default 1)
-	uint8_t tsdz8_step_down_fast;        // Duty step for fast ramp down (default 2)
-	uint8_t tsdz8_step_down_slow;        // Duty step for slow ramp down (default 1)
-	uint8_t tsdz8_startup_duty;          // Initial duty when starting (0-255, default 30)
-	uint8_t tsdz8_max_duty;              // Maximum duty limit (0-255, default 254)
-	uint8_t tsdz8_hall_ref_angle;        // Hall reference angle offset (default 66)
-	tsdz8_pwm_mode tsdz8_pwm_mode;       // PWM calculation mode (float/4096table/256table)
-
 	// Setup info
 	uint8_t si_motor_poles;
 	float si_gear_ratio;
@@ -914,7 +892,9 @@ typedef struct {
 	NRF_RETR_DELAY retry_delay;
 	unsigned char retries;
 	unsigned char channel;
-	unsigned char address[3];
+	unsigned char address_0;
+	unsigned char address_1;
+	unsigned char address_2;
 	bool send_crc_ack;
 } nrf_config;
 
@@ -969,8 +949,12 @@ typedef struct {
 	float rot_roll;
 	float rot_pitch;
 	float rot_yaw;
-	float accel_offsets[3];
-	float gyro_offsets[3];
+	float accel_offsets_0;
+	float accel_offsets_1;
+	float accel_offsets_2;
+	float gyro_offsets_0;
+	float gyro_offsets_1;
+	float gyro_offsets_2;
 } imu_config;
 
 typedef enum {

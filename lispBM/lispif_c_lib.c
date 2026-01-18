@@ -453,12 +453,12 @@ static float lib_get_cfg_float(CFG_PARAM p) {
 		case CFG_PARAM_IMU_rot_roll: res = appconf->imu_conf.rot_roll; break;
 		case CFG_PARAM_IMU_rot_pitch: res = appconf->imu_conf.rot_pitch; break;
 		case CFG_PARAM_IMU_rot_yaw: res = appconf->imu_conf.rot_yaw; break;
-		case CFG_PARAM_IMU_accel_offset_x: res = appconf->imu_conf.accel_offsets[0]; break;
-		case CFG_PARAM_IMU_accel_offset_y: res = appconf->imu_conf.accel_offsets[1]; break;
-		case CFG_PARAM_IMU_accel_offset_z: res = appconf->imu_conf.accel_offsets[2]; break;
-		case CFG_PARAM_IMU_gyro_offset_x: res = appconf->imu_conf.gyro_offsets[0]; break;
-		case CFG_PARAM_IMU_gyro_offset_y: res = appconf->imu_conf.gyro_offsets[1]; break;
-		case CFG_PARAM_IMU_gyro_offset_z: res = appconf->imu_conf.gyro_offsets[2]; break;
+		case CFG_PARAM_IMU_accel_offset_x: res = appconf->imu_conf.accel_offsets_0; break;
+		case CFG_PARAM_IMU_accel_offset_y: res = appconf->imu_conf.accel_offsets_1; break;
+		case CFG_PARAM_IMU_accel_offset_z: res = appconf->imu_conf.accel_offsets_2; break;
+		case CFG_PARAM_IMU_gyro_offset_x: res = appconf->imu_conf.gyro_offsets_0; break;
+		case CFG_PARAM_IMU_gyro_offset_y: res = appconf->imu_conf.gyro_offsets_1; break;
+		case CFG_PARAM_IMU_gyro_offset_z: res = appconf->imu_conf.gyro_offsets_2; break;
 
 		case CFG_PARAM_si_gear_ratio: res = mcconf->si_gear_ratio; break;
 		case CFG_PARAM_si_wheel_diameter: res = mcconf->si_wheel_diameter; break;
@@ -540,12 +540,12 @@ static bool lib_set_cfg_float(CFG_PARAM p, float value) {
 		case CFG_PARAM_IMU_rot_roll: appconf->imu_conf.rot_roll = value; changed_app = 1; res = true; break;
 		case CFG_PARAM_IMU_rot_pitch: appconf->imu_conf.rot_pitch = value; changed_app = 1; res = true; break;
 		case CFG_PARAM_IMU_rot_yaw: appconf->imu_conf.rot_yaw = value; changed_app = 1; res = true; break;
-		case CFG_PARAM_IMU_accel_offset_x: appconf->imu_conf.accel_offsets[0] = value; changed_app = 1; res = true; break;
-		case CFG_PARAM_IMU_accel_offset_y: appconf->imu_conf.accel_offsets[1] = value; changed_app = 1; res = true; break;
-		case CFG_PARAM_IMU_accel_offset_z: appconf->imu_conf.accel_offsets[2] = value; changed_app = 1; res = true; break;
-		case CFG_PARAM_IMU_gyro_offset_x: appconf->imu_conf.gyro_offsets[0] = value; changed_app = 1; res = true; break;
-		case CFG_PARAM_IMU_gyro_offset_y: appconf->imu_conf.gyro_offsets[1] = value; changed_app = 1; res = true; break;
-		case CFG_PARAM_IMU_gyro_offset_z: appconf->imu_conf.gyro_offsets[2] = value; changed_app = 1; res = true; break;
+		case CFG_PARAM_IMU_accel_offset_x: appconf->imu_conf.accel_offsets_0 = value; changed_app = 1; res = true; break;
+		case CFG_PARAM_IMU_accel_offset_y: appconf->imu_conf.accel_offsets_1 = value; changed_app = 1; res = true; break;
+		case CFG_PARAM_IMU_accel_offset_z: appconf->imu_conf.accel_offsets_2 = value; changed_app = 1; res = true; break;
+		case CFG_PARAM_IMU_gyro_offset_x: appconf->imu_conf.gyro_offsets_0 = value; changed_app = 1; res = true; break;
+		case CFG_PARAM_IMU_gyro_offset_y: appconf->imu_conf.gyro_offsets_1 = value; changed_app = 1; res = true; break;
+		case CFG_PARAM_IMU_gyro_offset_z: appconf->imu_conf.gyro_offsets_2 = value; changed_app = 1; res = true; break;
 
 		case CFG_PARAM_si_gear_ratio: mcconf->si_gear_ratio = value; changed_mc = 1; res = true; break;
 		case CFG_PARAM_si_wheel_diameter: mcconf->si_wheel_diameter = value; changed_mc = 1; res = true; break;

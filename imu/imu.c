@@ -362,12 +362,12 @@ void imu_get_calibration(float yaw, float *imu_cal) {
 	float backup_roll = m_settings.rot_roll;
 	float backup_pitch = m_settings.rot_pitch;
 	float backup_yaw = m_settings.rot_yaw;
-	float backup_accel_offset_x = m_settings.accel_offsets[0];
-	float backup_accel_offset_y = m_settings.accel_offsets[1];
-	float backup_accel_offset_z = m_settings.accel_offsets[2];
-	float backup_gyro_offset_x = m_settings.gyro_offsets[0];
-	float backup_gyro_offset_y = m_settings.gyro_offsets[1];
-	float backup_gyro_offset_z = m_settings.gyro_offsets[2];
+	float backup_accel_offset_x = m_settings.accel_offsets_0;
+	float backup_accel_offset_y = m_settings.accel_offsets_1;
+	float backup_accel_offset_z = m_settings.accel_offsets_2;
+	float backup_gyro_offset_x = m_settings.gyro_offsets_0;
+	float backup_gyro_offset_y = m_settings.gyro_offsets_1;
+	float backup_gyro_offset_z = m_settings.gyro_offsets_2;
 
 	// Override settings
 	m_settings.sample_rate_hz = 1000;
@@ -376,12 +376,12 @@ void imu_get_calibration(float yaw, float *imu_cal) {
 	m_settings.rot_roll = 0;
 	m_settings.rot_pitch = 0;
 	m_settings.rot_yaw = 0;
-	m_settings.accel_offsets[0] = 0;
-	m_settings.accel_offsets[1] = 0;
-	m_settings.accel_offsets[2] = 0;
-	m_settings.gyro_offsets[0] = 0;
-	m_settings.gyro_offsets[1] = 0;
-	m_settings.gyro_offsets[2] = 0;
+	m_settings.accel_offsets_0 = 0;
+	m_settings.accel_offsets_1 = 0;
+	m_settings.accel_offsets_2 = 0;
+	m_settings.gyro_offsets_0 = 0;
+	m_settings.gyro_offsets_1 = 0;
+	m_settings.gyro_offsets_2 = 0;
 
 	// Sample gyro for offsets
 	float original_gyro_offsets[3] = {0, 0, 0};
@@ -396,9 +396,9 @@ void imu_get_calibration(float yaw, float *imu_cal) {
 	original_gyro_offsets[2] /= 1000;
 
 	// Set gyro offsets
-	m_settings.gyro_offsets[0] = original_gyro_offsets[0];
-	m_settings.gyro_offsets[1] = original_gyro_offsets[1];
-	m_settings.gyro_offsets[2] = original_gyro_offsets[2];
+	m_settings.gyro_offsets_0 = original_gyro_offsets[0];
+	m_settings.gyro_offsets_1 = original_gyro_offsets[1];
+	m_settings.gyro_offsets_2 = original_gyro_offsets[2];
 
 	// Reset AHRS and wait 1.5 seconds (for AHRS to settle now that gyro is calibrated)
 	ahrs_init_attitude_info(&m_att);
@@ -417,7 +417,11 @@ void imu_get_calibration(float yaw, float *imu_cal) {
 
 	// Rotate gyro offsets to match new IMU orientation
 	float rotation1[3] = {DEG2RAD_f(m_settings.rot_roll), DEG2RAD_f(m_settings.rot_pitch), DEG2RAD_f(m_settings.rot_yaw)};
-	utils_rotate_vector3(original_gyro_offsets, rotation1, m_settings.gyro_offsets, false);
+	float temp_gyro_offsets[3];
+	utils_rotate_vector3(original_gyro_offsets, rotation1, temp_gyro_offsets, false);
+	m_settings.gyro_offsets_0 = temp_gyro_offsets[0];
+	m_settings.gyro_offsets_1 = temp_gyro_offsets[1];
+	m_settings.gyro_offsets_2 = temp_gyro_offsets[2];
 
 	// Reset AHRS and wait 1.5 seconds (for AHRS to settle now that pitch is calibrated)
 	ahrs_init_attitude_info(&m_att);
@@ -436,14 +440,20 @@ void imu_get_calibration(float yaw, float *imu_cal) {
 
 	// Rotate imu offsets to match
 	float rotation2[3] = {DEG2RAD_f(m_settings.rot_roll), DEG2RAD_f(m_settings.rot_pitch), DEG2RAD_f(m_settings.rot_yaw)};
-	utils_rotate_vector3(original_gyro_offsets, rotation2, m_settings.gyro_offsets, false);
+	utils_rotate_vector3(original_gyro_offsets, rotation2, temp_gyro_offsets, false);
+	m_settings.gyro_offsets_0 = temp_gyro_offsets[0];
+	m_settings.gyro_offsets_1 = temp_gyro_offsets[1];
+	m_settings.gyro_offsets_2 = temp_gyro_offsets[2];
 
 	// Set yaw rotations to match user input
 	m_settings.rot_yaw = yaw;
 
 	// Rotate gyro offsets to match new IMU orientation
 	float rotation3[3] = {DEG2RAD_f(m_settings.rot_roll), DEG2RAD_f(m_settings.rot_pitch), DEG2RAD_f(m_settings.rot_yaw)};
-	utils_rotate_vector3(original_gyro_offsets, rotation3, m_settings.gyro_offsets, false);
+	utils_rotate_vector3(original_gyro_offsets, rotation3, temp_gyro_offsets, false);
+	m_settings.gyro_offsets_0 = temp_gyro_offsets[0];
+	m_settings.gyro_offsets_1 = temp_gyro_offsets[1];
+	m_settings.gyro_offsets_2 = temp_gyro_offsets[2];
 
 	// Note to future person interested in calibration:
 	// This is where accel calibration should go, because at this point the values should be 0,0,1
@@ -454,12 +464,12 @@ void imu_get_calibration(float yaw, float *imu_cal) {
 	imu_cal[0] = m_settings.rot_roll;
 	imu_cal[1] = m_settings.rot_pitch;
 	imu_cal[2] = m_settings.rot_yaw;
-	imu_cal[3] = m_settings.accel_offsets[0];
-	imu_cal[4] = m_settings.accel_offsets[1];
-	imu_cal[5] = m_settings.accel_offsets[2];
-	imu_cal[6] = m_settings.gyro_offsets[0];
-	imu_cal[7] = m_settings.gyro_offsets[1];
-	imu_cal[8] = m_settings.gyro_offsets[2];
+	imu_cal[3] = m_settings.accel_offsets_0;
+	imu_cal[4] = m_settings.accel_offsets_1;
+	imu_cal[5] = m_settings.accel_offsets_2;
+	imu_cal[6] = m_settings.gyro_offsets_0;
+	imu_cal[7] = m_settings.gyro_offsets_1;
+	imu_cal[8] = m_settings.gyro_offsets_2;
 
 	// Restore settings
 	m_settings.sample_rate_hz = backup_sample_rate;
@@ -473,12 +483,12 @@ void imu_get_calibration(float yaw, float *imu_cal) {
 	m_settings.rot_roll = backup_roll;
 	m_settings.rot_pitch = backup_pitch;
 	m_settings.rot_yaw = backup_yaw;
-	m_settings.accel_offsets[0] = backup_accel_offset_x;
-	m_settings.accel_offsets[1] = backup_accel_offset_y;
-	m_settings.accel_offsets[2] = backup_accel_offset_z;
-	m_settings.gyro_offsets[0] = backup_gyro_offset_x;
-	m_settings.gyro_offsets[1] = backup_gyro_offset_y;
-	m_settings.gyro_offsets[2] = backup_gyro_offset_z;
+	m_settings.accel_offsets_0 = backup_accel_offset_x;
+	m_settings.accel_offsets_1 = backup_accel_offset_y;
+	m_settings.accel_offsets_2 = backup_accel_offset_z;
+	m_settings.gyro_offsets_0 = backup_gyro_offset_x;
+	m_settings.gyro_offsets_1 = backup_gyro_offset_y;
+	m_settings.gyro_offsets_2 = backup_gyro_offset_z;
 
 	ahrs_init_attitude_info(&m_att);
 	FusionAhrsReinitialise(&m_fusionAhrs);
@@ -589,10 +599,12 @@ static void imu_read_callback(float *accel, float *gyro, float *mag) {
 	m_mag[2] = mag[0] * m31 + mag[1] * m32 + mag[2] * m33;
 
 	// Accelerometer and Gyro offset compensation and estimation
-	for (int i = 0; i < 3; i++) {
-		m_accel[i] -= m_settings.accel_offsets[i];
-		m_gyro[i] -= m_settings.gyro_offsets[i];
-	}
+	m_accel[0] -= m_settings.accel_offsets_0;
+	m_accel[1] -= m_settings.accel_offsets_1;
+	m_accel[2] -= m_settings.accel_offsets_2;
+	m_gyro[0] -= m_settings.gyro_offsets_0;
+	m_gyro[1] -= m_settings.gyro_offsets_1;
+	m_gyro[2] -= m_settings.gyro_offsets_2;
 
 	// Apply filters
 	if(m_settings.accel_lowpass_filter_x > 0){

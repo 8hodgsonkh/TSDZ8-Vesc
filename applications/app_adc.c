@@ -306,73 +306,46 @@ static float haz_pas_duty_process(const adc_config *conf, float dt_s) {
 	const float effort_filter = 0.12f;
 	UTILS_LP_FAST(haz_pas_duty_ctx.effort_smooth, effort, effort_filter);
 
-	// ============ ERPM MATCHING WITH DUTY ============
-	// The base is ALWAYS matching pedal ERPM - no fixed "base duty"
-	// Effort juice modifies the TARGET erpm
-	//   effort=0 → target = pedal ERPM (cruise/match)
-	//   effort=1 → target = pedal ERPM * (1 + erpm_boost) (accelerate!)
+	// ============ CLOSED-LOOP ERPM MATCHING ============
+	// Compare pedal target ERPM to actual motor ERPM
+	// Incrementally adjust duty to make motor match pedals
+	// Effort juice = target goes FASTER than pedals (boost!)
 
-	float effort_multiplier = 1.0f + haz_pas_duty_ctx.effort_smooth * erpm_boost;
-	float target_erpm_with_juice = target_erpm * effort_multiplier;
+	float motor_erpm = mc_interface_get_rpm();
 
-	// Get current motor ERPM
-	float erpm_now = mc_interface_get_rpm();
+	// Effort boost: push hard = target faster than pedal speed
+	float effort_boost = haz_pas_duty_ctx.effort_smooth * erpm_boost;
+	float target_erpm_with_juice = target_erpm * (1.0f + effort_boost);
 
-	// P-controller for ERPM tracking → outputs DUTY
-	// This is the key: we're NOT setting a fixed base duty
-	// We're calculating what duty is needed to reach target ERPM
-	const float kp_duty_per_erpm = 0.00008f;  // ~0.08 duty per 1000 ERPM error
-	const float deadband_erpm = 150.0f;
+	// Offset to keep motor slightly ahead (not bogging down under load)
+	const float erpm_offset = 300.0f;  // Motor tries to stay this much ahead
 
-	float erpm_err = target_erpm_with_juice - erpm_now;
-	if (fabsf(erpm_err) < deadband_erpm) {
-		erpm_err = 0.0f;
+	// ============ TORQUE-SENSOR FEEL ============
+	// Ramp rate scales with effort: push hard = instant response, cruise = smooth
+	// Base rates from config, effort multiplies them
+	float effort_scale = 1.0f + haz_pas_duty_ctx.effort_smooth * 4.0f;  // 1x to 5x based on effort
+	float duty_add_rate = ramp_up_target * effort_scale;
+	float duty_sub_rate = ramp_down;  // Ramp down stays consistent
+
+	// Compare and adjust
+	if (target_erpm_with_juice > motor_erpm + erpm_offset) {
+		// Motor too slow - pedals ahead - ADD duty
+		// More effort = faster ramp = punchy torque-sensor feel!
+		haz_pas_duty_ctx.duty_cmd += duty_add_rate * dt_s;
+	} else if (target_erpm_with_juice < motor_erpm - erpm_offset) {
+		// Motor too fast - pedals behind - REDUCE duty
+		haz_pas_duty_ctx.duty_cmd -= duty_sub_rate * dt_s;
+	}
+	// else: in the sweet spot - hold steady!
+
+	// Startup kick when first engaging
+	if (target_erpm > 100.0f && haz_pas_duty_ctx.duty_cmd < 0.03f) {
+		haz_pas_duty_ctx.duty_cmd = 0.03f;  // Small kick to get moving
 	}
 
-	// Target duty = P-controller output
-	// Positive error (motor too slow) → positive duty
-	// Negative error (motor too fast) → reduce/coast
-	float duty_target = kp_duty_per_erpm * erpm_err;
-
-	// Add a small base to overcome static friction when starting
-	if (duty_target > 0.0f && haz_pas_duty_ctx.duty_cmd < 0.05f) {
-		duty_target += 0.03f;  // Small kick to get moving
-	}
-
-	// Clamp to valid range
-	if (duty_target < 0.0f) duty_target = 0.0f;
-	if (duty_target > max_duty) duty_target = max_duty;
-
-	// ============ RAMP WITH RISE TIME (the new ramp-of-ramp!) ============
-	// Ramp rate starts at 0 and linearly increases to ramp_up_target over ramp_rise_time
-	// This gives a soft start feel
-
-	if (duty_target > haz_pas_duty_ctx.duty_cmd) {
-		// Ramping UP - apply the ramp rise
-		haz_pas_duty_ctx.ramp_elapsed += dt_s;
-		if (haz_pas_duty_ctx.ramp_elapsed > ramp_rise_time) {
-			haz_pas_duty_ctx.ramp_elapsed = ramp_rise_time;
-		}
-
-		// Calculate current ramp rate (0 → ramp_up_target over ramp_rise_time)
-		float ramp_ratio = 1.0f;
-		if (ramp_rise_time > 0.01f) {
-			ramp_ratio = haz_pas_duty_ctx.ramp_elapsed / ramp_rise_time;
-		}
-		float current_ramp_rate = ramp_up_target * ramp_ratio;
-
-		haz_pas_duty_ctx.duty_cmd += current_ramp_rate * dt_s;
-		if (haz_pas_duty_ctx.duty_cmd > duty_target) {
-			haz_pas_duty_ctx.duty_cmd = duty_target;
-		}
-	} else {
-		// Ramping DOWN - use full ramp down rate (no rise time needed)
-		haz_pas_duty_ctx.ramp_elapsed = 0.0f;  // Reset for next ramp up
-		haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
-		if (haz_pas_duty_ctx.duty_cmd < duty_target) {
-			haz_pas_duty_ctx.duty_cmd = duty_target;
-		}
-	}
+	// Apply wheel speed limit (street mode)
+	float speed_scale = mc_get_wheel_speed_limit_scale();
+	haz_pas_duty_ctx.duty_cmd *= speed_scale;
 
 	// Final clamp
 	if (haz_pas_duty_ctx.duty_cmd < 0.0f) haz_pas_duty_ctx.duty_cmd = 0.0f;
@@ -1396,6 +1369,21 @@ static THD_FUNCTION(adc_thread, arg) {
 							// NORMAL THROTTLE MODE: pure duty ramping
 							// Apply street mode speed limit
 							float speed_scale = mc_get_wheel_speed_limit_scale();
+							
+							// STREET MODE ERPM LIMIT: Cut throttle above 2000 ERPM
+							const float street_erpm_limit = 2000.0f;
+							if (!mc_interface_is_offroad_mode()) {
+								float motor_erpm = fabsf(mc_interface_get_rpm());
+								if (motor_erpm > street_erpm_limit) {
+									// Above limit - cut throttle completely
+									speed_scale = 0.0f;
+								} else if (motor_erpm > street_erpm_limit * 0.85f) {
+									// Soft limit zone (85-100% of limit) - taper off
+									float erpm_scale = (street_erpm_limit - motor_erpm) / (street_erpm_limit * 0.15f);
+									speed_scale = fminf(speed_scale, erpm_scale);
+								}
+							}
+							
 							float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale;
 							float duty_gap = fabsf(duty_target - osf_duty_ramped);
 

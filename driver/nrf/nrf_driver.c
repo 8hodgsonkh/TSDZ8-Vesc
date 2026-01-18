@@ -149,9 +149,9 @@ void nrf_driver_start_pairing(int ms) {
 			pairing_active = true;
 
 			nrf_config conf = app_get_configuration()->app_nrf_conf;
-			conf.address[0] = 0xC6;
-			conf.address[1] = 0xC5;
-			conf.address[2] = 0x0;
+			conf.address_0 = 0xC6;
+			conf.address_1 = 0xC5;
+			conf.address_2 = 0x0;
 			conf.channel = 67;
 			conf.crc_type = NRF_CRC_1B;
 			conf.retries = 3;
@@ -239,9 +239,9 @@ static THD_FUNCTION(tx_thread, arg) {
 				unsigned char data[5];
 				data[0] = COMM_EXT_NRF_ESB_SET_CH_ADDR;
 				data[1] = appconf_ptr->app_nrf_conf.channel;
-				data[2] = appconf_ptr->app_nrf_conf.address[0];
-				data[3] = appconf_ptr->app_nrf_conf.address[1];
-				data[4] = appconf_ptr->app_nrf_conf.address[2];
+				data[2] = appconf_ptr->app_nrf_conf.address_0;
+				data[3] = appconf_ptr->app_nrf_conf.address_1;
+				data[4] = appconf_ptr->app_nrf_conf.address_2;
 				commands_send_packet_nrf(data, 5);
 			} else {
 				nrf_config conf = app_get_configuration()->app_nrf_conf;
@@ -475,9 +475,9 @@ void nrf_driver_process_packet(unsigned char *buf, unsigned char len) {
 		pairing_active = false;
 
 		app_configuration appconf = *app_get_configuration();
-		appconf.app_nrf_conf.address[0] = buf[ind++];
-		appconf.app_nrf_conf.address[1] = buf[ind++];
-		appconf.app_nrf_conf.address[2] = buf[ind++];
+		appconf.app_nrf_conf.address_0 = buf[ind++];
+		appconf.app_nrf_conf.address_1 = buf[ind++];
+		appconf.app_nrf_conf.address_2 = buf[ind++];
 		appconf.app_nrf_conf.channel = buf[ind++];
 		appconf.app_nrf_conf.crc_type = NRF_CRC_1B;
 		appconf.app_nrf_conf.retries = 3;
@@ -490,9 +490,9 @@ void nrf_driver_process_packet(unsigned char *buf, unsigned char len) {
 			unsigned char data[5];
 			data[0] = COMM_EXT_NRF_ESB_SET_CH_ADDR;
 			data[1] = appconf.app_nrf_conf.channel;
-			data[2] = appconf.app_nrf_conf.address[0];
-			data[3] = appconf.app_nrf_conf.address[1];
-			data[4] = appconf.app_nrf_conf.address[2];
+			data[2] = appconf.app_nrf_conf.address_0;
+			data[3] = appconf.app_nrf_conf.address_1;
+			data[4] = appconf.app_nrf_conf.address_2;
 			commands_send_packet_nrf(data, 5);
 		}
 

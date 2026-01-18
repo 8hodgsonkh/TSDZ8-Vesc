@@ -1032,9 +1032,9 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 				uint8_t send_buffer[50];
 				send_buffer[0] = COMM_EXT_NRF_ESB_SET_CH_ADDR;
 				send_buffer[1] = appconf->app_nrf_conf.channel;
-				send_buffer[2] = appconf->app_nrf_conf.address[0];
-				send_buffer[3] = appconf->app_nrf_conf.address[1];
-				send_buffer[4] = appconf->app_nrf_conf.address[2];
+				send_buffer[2] = appconf->app_nrf_conf.address_0;
+				send_buffer[3] = appconf->app_nrf_conf.address_1;
+				send_buffer[4] = appconf->app_nrf_conf.address_2;
 				commands_send_packet_nrf(send_buffer, 5);
 			}
 		}

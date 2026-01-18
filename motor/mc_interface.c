@@ -65,7 +65,7 @@
 // Street mode wheel speed limit (m/s) - 1.34 m/s = 4.8 km/h = 3 mph (for testing)
 // Set to 0 to disable wheel speed limiting and only use ERPM
 #ifndef STREET_MODE_WHEEL_SPEED_LIMIT
-#define STREET_MODE_WHEEL_SPEED_LIMIT   1.34f
+#define STREET_MODE_WHEEL_SPEED_LIMIT   6.7f    // 15 mph in m/s
 #endif
 
 // Safety: If motor runs for this long (ms) in street mode without a wheel pulse, cut motor
