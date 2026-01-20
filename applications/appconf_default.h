@@ -210,27 +210,28 @@
 #ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER
 #define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER		1.0f	// Global feel modifier (higher = earlier catch)
 #endif
-// Hazza PAS Duty - sexy duty-based PAS control
+// Hazza PAS Duty - simple cadence-based duty control
+// Smooth alternative to current-based PAS - just ramps duty based on pedal speed
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_ENABLED
 #define APPCONF_ADC_HAZ_PAS_DUTY_ENABLED			false
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_VARIATION_THRESHOLD
-#define APPCONF_ADC_HAZ_PAS_DUTY_VARIATION_THRESHOLD	0.15f	// Cadence variation threshold
+#define APPCONF_ADC_HAZ_PAS_DUTY_VARIATION_THRESHOLD	0.15f	// UNUSED in new version
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_ERPM_BOOST
-#define APPCONF_ADC_HAZ_PAS_DUTY_ERPM_BOOST			1.1f	// Target ERPM multiplier
+#define APPCONF_ADC_HAZ_PAS_DUTY_ERPM_BOOST			1.0f	// Max Cadence scale (1.0 = 100 RPM for max duty)
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_EFFORT_GAIN
-#define APPCONF_ADC_HAZ_PAS_DUTY_EFFORT_GAIN			1.0f	// Effort gain
+#define APPCONF_ADC_HAZ_PAS_DUTY_EFFORT_GAIN			0.7f	// Power Scale (0.5 = 50%, 1.0 = 100%)
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP
-#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP			0.5f	// Duty/s ramp up
+#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP			0.3f	// Duty/s ramp up (lower = smoother)
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN
-#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN			1.0f	// Duty/s ramp down
+#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN			0.5f	// Duty/s ramp down
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_RISE_TIME
-#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_RISE_TIME		0.3f	// Time to blend slow->fast ramp
+#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_RISE_TIME		0.3f	// UNUSED in new version
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_IDLE_TIMEOUT
 #define APPCONF_ADC_HAZ_PAS_DUTY_IDLE_TIMEOUT			0.5f	// Idle timeout (s)
