@@ -769,6 +769,14 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 	} break;
 
 	case COMM_CUSTOM_APP_DATA:
+		// Check for Hazza display assist level command
+		// Format: [0x48] [0x41] [level 1-5] = "HA" + level
+		if (len >= 3 && data[0] == 0x48 && data[1] == 0x41) {
+			uint8_t level = data[2];
+			if (level >= 1 && level <= 5) {
+				app_adc_set_assist_level(level);
+			}
+		}
 		if (appdata_func) {
 			appdata_func(data, len);
 		}

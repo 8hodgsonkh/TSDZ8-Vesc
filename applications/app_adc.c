@@ -113,6 +113,32 @@ static volatile bool rev_override = false;
 static volatile bool cc_override = false;
 static volatile bool range_ok = true;
 
+// =============================================================================
+// ASSIST LEVEL SYSTEM
+// Level 1-5: Power multiplier (20%, 40%, 60%, 80%, 100%)
+// In street mode: Also apply 250W motor power limit
+// In offroad mode: Level 5 = full power (VESC limits), 1-4 = multiplied
+// =============================================================================
+static volatile uint8_t assist_level = 5;  // Default to full power
+
+// Get current assist level (1-5)
+uint8_t app_adc_get_assist_level(void) {
+	return assist_level;
+}
+
+// Set assist level from display (1-5)
+void app_adc_set_assist_level(uint8_t level) {
+	if (level >= 1 && level <= 5) {
+		assist_level = level;
+	}
+}
+
+// Get power multiplier for current assist level (0.2 to 1.0)
+static float get_assist_power_multiplier(void) {
+	// Level 1=20%, 2=40%, 3=60%, 4=80%, 5=100%
+	return (float)assist_level * 0.2f;
+}
+
 // Hazza throttle state (current control)
 typedef struct {
 	float current_rel_cmd;
@@ -202,27 +228,31 @@ static float haz_pas_duty_process(const adc_config *conf, float dt_s) {
 	const float max_cadence = fmaxf(conf->haz_pas_duty_erpm_boost * 100.0f, 60.0f);
 	const float idle_timeout = fmaxf(conf->haz_pas_duty_idle_timeout, 0.1f);
 
-	// ========== SPEED LIMIT CHECK ==========
-	// PAS cuts off at 15.5 mph (6.93 m/s) - hard cutoff, no power above this
-	const float pas_speed_limit_ms = 15.5f * 0.44704f;  // mph to m/s
-	const float pas_speed_taper_start = pas_speed_limit_ms * 0.90f;  // Start tapering at 90%
+	// ========== SPEED LIMIT CHECK (STREET MODE ONLY) ==========
+	// PAS cuts off at 15.5 mph in STREET MODE only
+	// Offroad mode has no PAS speed limit
 	float wheel_speed = fabsf(mc_interface_get_speed());
-	
-	// Calculate speed-based power scale (1.0 below taper, 0.0 at limit)
 	float speed_power_scale = 1.0f;
-	if (wheel_speed >= pas_speed_limit_ms) {
-		// At or above limit - zero power
-		speed_power_scale = 0.0f;
-	} else if (wheel_speed > pas_speed_taper_start) {
-		// In taper zone - smooth reduction
-		speed_power_scale = (pas_speed_limit_ms - wheel_speed) / (pas_speed_limit_ms - pas_speed_taper_start);
-	}
 	
-	// If over speed limit, force ramp down to zero
-	if (speed_power_scale <= 0.0f) {
-		haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
-		if (haz_pas_duty_ctx.duty_cmd < 0.0f) haz_pas_duty_ctx.duty_cmd = 0.0f;
-		return 0.0f;
+	if (!mc_interface_is_offroad_mode()) {
+		// Street mode - apply 15.5 mph limit
+		const float pas_speed_limit_ms = 15.5f * 0.44704f;  // mph to m/s
+		const float pas_speed_taper_start = pas_speed_limit_ms * 0.90f;  // Start tapering at 90%
+		
+		if (wheel_speed >= pas_speed_limit_ms) {
+			// At or above limit - zero power
+			speed_power_scale = 0.0f;
+		} else if (wheel_speed > pas_speed_taper_start) {
+			// In taper zone - smooth reduction
+			speed_power_scale = (pas_speed_limit_ms - wheel_speed) / (pas_speed_limit_ms - pas_speed_taper_start);
+		}
+		
+		// If over speed limit, force ramp down to zero
+		if (speed_power_scale <= 0.0f) {
+			haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
+			if (haz_pas_duty_ctx.duty_cmd < 0.0f) haz_pas_duty_ctx.duty_cmd = 0.0f;
+			return 0.0f;
+		}
 	}
 
 	// Track step count and calculate step rate (more robust than single-step detection)
@@ -255,12 +285,20 @@ static float haz_pas_duty_process(const adc_config *conf, float dt_s) {
 	float pedal_rpm = app_pas_get_pedal_rpm();
 	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, pedal_rpm, 0.1f);
 
+	// Apply assist level multiplier (1-5 = 20-100%)
+	// In offroad mode: Level 5 = normal VESC limits, 1-4 = reduced power
+	// In street mode: Level is ignored (already limited by speed)
+	float assist_mult = 1.0f;
+	if (mc_interface_is_offroad_mode()) {
+		assist_mult = get_assist_power_multiplier();
+	}
+
 	// Calculate target - zero if idle, otherwise from cadence
 	float target_duty = 0.0f;
 	if (!is_idle && haz_pas_duty_ctx.cadence_smooth > 3.0f) {
 		float cadence_ratio = haz_pas_duty_ctx.cadence_smooth / max_cadence;
 		if (cadence_ratio > 1.0f) cadence_ratio = 1.0f;
-		target_duty = cadence_ratio * max_duty * power_scale * speed_power_scale;
+		target_duty = cadence_ratio * max_duty * power_scale * speed_power_scale * assist_mult;
 	}
 
 	// Ramp to target
@@ -1318,8 +1356,18 @@ static THD_FUNCTION(adc_thread, arg) {
 								}
 							}
 							
-							float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale;
+							// Apply assist level multiplier (1-5 = 20-100%)
+							// In offroad mode: Level 5 = normal VESC limits, 1-4 = reduced power
+							// In street mode: Level is ignored (already limited by speed)
+							float assist_mult = 1.0f;
+							if (mc_interface_is_offroad_mode()) {
+								assist_mult = get_assist_power_multiplier();
+							}
+							// Street mode: already speed-limited, no assist scaling needed
+							
+							float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale * assist_mult;
 							float duty_gap = fabsf(duty_target - osf_duty_ramped);
+
 
 							// Configurable ramp rates (duty/s)
 							const float ramp_up_slow = config.haz_hybrid_ramp_up_slow;

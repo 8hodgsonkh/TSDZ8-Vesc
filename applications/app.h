@@ -53,6 +53,8 @@ void app_adc_detach_buttons(bool state);
 void app_adc_rev_override(bool state);
 void app_adc_cc_override(bool state);
 bool app_adc_range_ok(void);
+uint8_t app_adc_get_assist_level(void);
+void app_adc_set_assist_level(uint8_t level);
 
 typedef enum {
 	UART_PORT_COMM_HEADER = 0,
