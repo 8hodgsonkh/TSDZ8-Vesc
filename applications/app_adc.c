@@ -651,6 +651,21 @@ static float haz_pas_follow_process(float dt_s) {
 		return 0.0f;
 	}
 
+	// ========== SPEED LIMIT CHECK (STREET MODE ONLY) ==========
+	// PAS current mode also respects 15.5 mph limit in street mode
+	if (!mc_interface_is_offroad_mode()) {
+		const float pas_speed_limit_ms = 15.5f * 0.44704f;  // mph to m/s
+		float wheel_speed = fabsf(mc_interface_get_speed());
+		if (wheel_speed >= pas_speed_limit_ms) {
+			// At or above limit - return zero, force ramp down
+			haz_pas_follow_ctx.current_rel_cmd *= 0.9f; // Quick decay
+			if (haz_pas_follow_ctx.current_rel_cmd < 0.01f) {
+				haz_pas_follow_ctx.current_rel_cmd = 0.0f;
+			}
+			return 0.0f;
+		}
+	}
+
 	const float start_rotations = haz_pas_conf_clamp(
 		pas_conf->pas_follow_start_rotations,
 		PAS_FOLLOW_START_ROTATIONS_DEFAULT,
@@ -1395,9 +1410,24 @@ static THD_FUNCTION(adc_thread, arg) {
 							if (osf_duty_ramped < 0.0f) osf_duty_ramped = 0.0f;
 							if (osf_duty_ramped > mcconf->l_max_duty) osf_duty_ramped = mcconf->l_max_duty;
 
-							if (osf_duty_ramped > 0.001f) {
+							// ========== CRITICAL: HARD SPEED LIMIT ENFORCEMENT ==========
+							// Even if ramped duty is high, NEVER allow motor assist above speed limit
+							// This is a safety clamp - applies the speed_scale to the actual output
+							float duty_to_send = osf_duty_ramped;
+							if (!mc_interface_is_offroad_mode()) {
+								// In street mode, hard-limit the duty based on current speed
+								// This ensures motor can NEVER push past the speed limit
+								duty_to_send *= speed_scale;
+								
+								// If we're at or above speed limit, force release motor
+								if (speed_scale <= 0.0f) {
+									duty_to_send = 0.0f;
+								}
+							}
+
+							if (duty_to_send > 0.001f) {
 								mc_interface_set_throttle_limit_active(true);
-								mc_interface_set_duty(pwr >= 0.0f ? osf_duty_ramped : -osf_duty_ramped);
+								mc_interface_set_duty(pwr >= 0.0f ? duty_to_send : -duty_to_send);
 								send_duty = true;
 							} else {
 								mc_interface_release_motor();

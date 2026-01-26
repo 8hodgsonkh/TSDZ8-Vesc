@@ -138,6 +138,12 @@ void mcpwm_foc_get_currents_adc(
 float mcpwm_foc_get_ts(void);
 bool mcpwm_foc_is_using_encoder(void);
 void mcpwm_foc_get_observer_state(float *x1, float *x2);
+// HAZZA MID-DRIVE: Observer confidence monitoring
+void mcpwm_foc_get_tracking_status(float *tracking_quality, float *safe_power_limit, float *power_scale);
+float mcpwm_foc_get_tracking_quality_now(void);
+// HAZZA: Manual MTPA boost button control (for ESP32 display)
+void mcpwm_foc_set_mtpa_boost(bool active);
+bool mcpwm_foc_get_mtpa_boost(void);
 void mcpwm_foc_set_current_off_delay(float delay_sec);
 
 // Functions where the motor can be selected

@@ -777,6 +777,12 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 				app_adc_set_assist_level(level);
 			}
 		}
+		// Check for Hazza display MTPA boost toggle command
+		// Format: [0x48] [0x42] [0/1] = "HB" + enable/disable
+		if (len >= 3 && data[0] == 0x48 && data[1] == 0x42) {
+			bool boost_active = (data[2] != 0);
+			mcpwm_foc_set_mtpa_boost(boost_active);
+		}
 		if (appdata_func) {
 			appdata_func(data, len);
 		}

@@ -371,6 +371,11 @@ void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2) {
 	m_motor_1.m_hall_dt_diff_last = 1.0;
 	m_motor_1.m_hall_dt_diff_now = 1.0;
 	m_motor_1.m_ang_hall_int_prev = -1;
+	// HAZZA MID-DRIVE: Initialize anti-lockup system
+	m_motor_1.m_tracking_quality = 1.0f;  // Start assuming perfect tracking
+	m_motor_1.m_power_scale = 1.0f;       // Start at full power
+	m_motor_1.m_safe_power_limit = conf_m1->l_max_duty;
+	m_motor_1.m_mtpa_boost_active = true; // HAZZA: Boost ON by default
 	foc_precalc_values((motor_all_state_t*)&m_motor_1);
 	update_hfi_samples(m_motor_1.m_conf->foc_hfi_samples, &m_motor_1);
 	init_audio_state(&m_motor_1.m_audio);
@@ -383,6 +388,10 @@ void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2) {
 	m_motor_2.m_hall_dt_diff_last = 1.0;
 	m_motor_2.m_hall_dt_diff_now = 1.0;
 	m_motor_2.m_ang_hall_int_prev = -1;
+	// HAZZA MID-DRIVE: Initialize anti-lockup system
+	m_motor_2.m_tracking_quality = 1.0f;  // Start assuming perfect tracking
+	m_motor_2.m_power_scale = 1.0f;       // Start at full power
+	m_motor_2.m_safe_power_limit = conf_m2->l_max_duty;
 	foc_precalc_values((motor_all_state_t*)&m_motor_2);
 	update_hfi_samples(m_motor_2.m_conf->foc_hfi_samples, &m_motor_2);
 	init_audio_state(&m_motor_2.m_audio);
@@ -1099,6 +1108,37 @@ void mcpwm_foc_get_observer_state(float *x1, float *x2) {
 	volatile motor_all_state_t *motor = get_motor_now();
 	*x1 = motor->m_observer_state.x1;
 	*x2 = motor->m_observer_state.x2;
+}
+
+// HAZZA MID-DRIVE: Get tracking status for debugging/monitoring
+// tracking_quality: 0.0 = lost, 1.0 = perfect tracking
+// safe_power_limit: Current max duty we're allowing
+// power_scale: How much we've reduced power (1.0 = full, 0.3 = minimum)
+void mcpwm_foc_get_tracking_status(float *tracking_quality, float *safe_power_limit, float *power_scale) {
+	volatile motor_all_state_t *motor = get_motor_now();
+	*tracking_quality = motor->m_tracking_quality;
+	*safe_power_limit = motor->m_safe_power_limit;
+	*power_scale = motor->m_power_scale;
+}
+
+float mcpwm_foc_get_tracking_quality_now(void) {
+	return get_motor_now()->m_tracking_quality;
+}
+
+// HAZZA: Manual MTPA boost button control (for ESP32 display)
+// When active, enables duty-based field weakening boost
+void mcpwm_foc_set_mtpa_boost(bool active) {
+	// Set on BOTH motors to be safe (single motor setup still works)
+	m_motor_1.m_mtpa_boost_active = active;
+	m_motor_1.m_mtpa_boost_iq = 0.0f;  // Reset ramp on toggle
+#ifdef HW_HAS_DUAL_MOTORS
+	m_motor_2.m_mtpa_boost_active = active;
+	m_motor_2.m_mtpa_boost_iq = 0.0f;
+#endif
+}
+
+bool mcpwm_foc_get_mtpa_boost(void) {
+	return m_motor_1.m_mtpa_boost_active;
 }
 
 /**
@@ -3410,9 +3450,27 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			} else {
 				// If the duty cycle is less than or equal to the set duty cycle just limit
 				// the modulation and use the maximum allowed current.
+				// 
+				// HAZZA FIX: At very low duty, scale current proportionally instead of using max.
+				// This prevents violent vibration/arcing when duty is tiny but current is maxed.
+				// Also respect l_min_duty - below this threshold, don't drive the motor at all.
+				const float min_duty = conf_now->l_min_duty;
+				const float duty_abs_set = fabsf(duty_set);
+				
 				motor_now->m_duty_i_term = state_now->iq / current_max_for_duty;
 				state_now->max_duty = duty_set;
-				if (duty_set > 0.0) {
+				
+				if (duty_abs_set < min_duty) {
+					// Below minimum duty - don't drive motor
+					iq_set_tmp = 0.0;
+				} else if (duty_abs_set < 0.05) {
+					// Low duty (< 5%) - scale current proportionally to prevent stall vibration
+					// This ramps from 0 current at min_duty to full current at 5% duty
+					float current_scale = (duty_abs_set - min_duty) / (0.05 - min_duty);
+					if (current_scale < 0.0) current_scale = 0.0;
+					if (current_scale > 1.0) current_scale = 1.0;
+					iq_set_tmp = SIGN(duty_set) * current_scale * current_max_for_duty;
+				} else if (duty_set > 0.0) {
 					iq_set_tmp = current_max_for_duty;
 				} else {
 					iq_set_tmp = -current_max_for_duty;
@@ -3437,6 +3495,101 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 				// that run on high ERPM compared to the switching frequency.
 				motor_now->m_phase_now_observer += motor_now->m_pll_speed * dt * (0.5 + conf_now->foc_observer_offset);
 				utils_norm_angle_rad((float*)&motor_now->m_phase_now_observer);
+				
+				// =============================================================================
+				// HAZZA MID-DRIVE: Anti-Lockup System
+				// 
+				// Problem: On mid-drives, the chain can snap tight suddenly, causing:
+				//   1. Motor speed changes instantly
+				//   2. Position tracking gets confused
+				//   3. Current control cranks up voltage trying to hit target
+				//   4. More confusion → runaway → GRINDING LOCKUP!
+				//
+				// Solution: Monitor how well we're tracking the motor position.
+				// When tracking quality drops, automatically reduce power to prevent lockup.
+				// =============================================================================
+				{
+					// --- Step 1: Check how well we're tracking motor position ---
+					// We estimate a magnetic "flux circle". Its size should match the motor's spec.
+					// If the size is wrong, we're probably confused about motor position.
+					const float expected_flux = conf_now->foc_motor_flux_linkage;
+					const float x1 = motor_now->m_observer_state.x1;
+					const float x2 = motor_now->m_observer_state.x2;
+					const float actual_flux = sqrtf(x1*x1 + x2*x2);
+					
+					// How far off are we? (0 = perfect, 1 = totally wrong)
+					const float tracking_error = fabsf(actual_flux - expected_flux) / expected_flux;
+					
+					// --- Step 2: Detect sudden speed changes (chain snap!) ---
+					const float speed_rpm = RADPS2RPM_f(motor_now->m_pll_speed);
+					const float speed_change = (speed_rpm - motor_now->m_speed_prev) / dt;
+					motor_now->m_speed_prev = speed_rpm;
+					UTILS_LP_FAST(motor_now->m_speed_change_rate, speed_change, 0.1f);
+					
+					// If speed changes more than 50,000 RPM/sec, something violent happened
+					const bool chain_snap_detected = fabsf(motor_now->m_speed_change_rate) > 50000.0f;
+					
+					// --- Step 3: Build up error history (sustained problems are worse) ---
+					motor_now->m_tracking_error_buildup += tracking_error * dt;
+					motor_now->m_tracking_error_buildup *= 0.99f;  // Slowly forget old errors
+					utils_truncate_number(&motor_now->m_tracking_error_buildup, 0.0f, 1.0f);
+					
+					// --- Step 4: Calculate overall tracking quality (0=lost, 1=perfect) ---
+					float quality = 1.0f - tracking_error * 2.0f;
+					quality -= motor_now->m_tracking_error_buildup;
+					if (chain_snap_detected) {
+						quality *= 0.5f;  // Big penalty during violent transients
+					}
+					utils_truncate_number(&quality, 0.0f, 1.0f);
+					
+					// Smooth it out (don't overreact to noise)
+					UTILS_LP_FAST(motor_now->m_tracking_quality, quality, 0.05f);
+					
+					// --- Step 5: Detect if we've completely lost track (LOCKUP IMMINENT!) ---
+					const bool is_current_mode = (motor_now->m_control_mode == CONTROL_MODE_CURRENT);
+					const float current_error = fabsf(state_now->iq_target - state_now->iq_filter);
+					const bool lost_it = is_current_mode && 
+					                     motor_now->m_tracking_quality < 0.5f &&  // Tracking is bad
+					                     current_error > 20.0f &&                  // Can't hit current target
+					                     state_now->i_abs_filter > 10.0f;          // But we're trying hard
+					
+					if (lost_it && !motor_now->m_lost_sync) {
+						// OH SHIT! Back off immediately!
+						motor_now->m_lost_sync = true;
+						motor_now->m_recovery_cycles = 0;
+						motor_now->m_power_scale = 0.3f;  // Drop to 30% power NOW
+					}
+					
+					// --- Step 6: Recovery (slowly bring power back up) ---
+					if (motor_now->m_lost_sync) {
+						motor_now->m_recovery_cycles++;
+						// Wait a bit, then slowly recover
+						if (motor_now->m_recovery_cycles > 100) {
+							motor_now->m_power_scale += 0.001f;  // Creep back up
+							if (motor_now->m_power_scale >= 1.0f) {
+								motor_now->m_power_scale = 1.0f;
+								motor_now->m_lost_sync = false;  // We're back baby!
+							}
+						}
+					} else {
+						// Normal operation: scale power with tracking quality
+						float target_power = 0.3f + 0.7f * motor_now->m_tracking_quality;
+						if (target_power > motor_now->m_power_scale) {
+							motor_now->m_power_scale += 0.01f;  // Ramp UP slowly (cautious)
+						} else {
+							motor_now->m_power_scale = target_power;  // Ramp DOWN fast (safety)
+						}
+						utils_truncate_number(&motor_now->m_power_scale, 0.3f, 1.0f);
+					}
+					
+					// --- Step 7: Calculate safe power limit ---
+					// Trust tracking quality only - no blanket low-speed penalty
+					float safe_limit = conf_now->l_max_duty;
+					safe_limit *= motor_now->m_power_scale;    // Scale by tracking quality
+					safe_limit = fmaxf(safe_limit, 0.2f);      // Never below 20%
+					
+					motor_now->m_safe_power_limit = safe_limit;
+				}
 			}
 
 			FOC_PROFILE_LINE_FINE();
@@ -3559,18 +3712,96 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		FOC_PROFILE_LINE_FINE();
 
 		// Apply MTPA. See: https://github.com/vedderb/bldc/pull/179
+		// Only enable above 250 ERPM to prevent stall vibration at startup
 		const float ld_lq_diff = conf_now->foc_motor_ld_lq_diff;
+		const float erpm_now = fabsf(RADPS2RPM_f(motor_now->m_pll_speed));
 		if (conf_now->foc_mtpa_mode != MTPA_MODE_OFF && ld_lq_diff != 0.0 &&
-				motor_now->m_control_mode != CONTROL_MODE_OPENLOOP_PHASE) {
+				motor_now->m_control_mode != CONTROL_MODE_OPENLOOP_PHASE &&
+				erpm_now > 250.0f) {
 			const float lambda = conf_now->foc_motor_flux_linkage;
 
 			float iq_ref = iq_set_tmp;
 			if (conf_now->foc_mtpa_mode == MTPA_MODE_IQ_MEASURED) {
 				iq_ref = utils_min_abs(iq_set_tmp, state_now->iq_filter);
 			}
+			// IQ_TARGET mode: Use commanded iq directly (default behavior)
 
-			id_set_tmp = (lambda - sqrtf(SQ(lambda) + 8.0 * SQ(ld_lq_diff * iq_ref))) / (4.0 * ld_lq_diff);
-			iq_set_tmp = SIGN(iq_set_tmp) * sqrtf(SQ(iq_set_tmp) - SQ(id_set_tmp));
+			// Calculate optimal MTPA id for this iq
+			float id_mtpa = (lambda - sqrtf(SQ(lambda) + 8.0 * SQ(ld_lq_diff * iq_ref))) / (4.0 * ld_lq_diff);
+			float iq_mtpa = SIGN(iq_set_tmp) * sqrtf(SQ(iq_set_tmp) - SQ(id_mtpa));
+
+			// =============================================================================
+			// HAZZA: Direct Field Weakening Boost (clean approach)
+			// When at max duty (94%+) and boost enabled, ramp in extra negative Id.
+			// This is simpler and more predictable than the virtual Iq approach.
+			// At high speed, mod_d is small (~0.1-0.3), so -15A Id only costs ~2-5A battery.
+			// =============================================================================
+			if (motor_now->m_mtpa_boost_active) {
+				const float duty_now = fabsf(state_now->duty_now);
+				const float duty_threshold = 0.94f;  // Close to your 95% max
+				const float max_id_offset = -15.0f;  // Max field weakening current
+				const float ramp_rate = 0.0005f;     // ~15A/s at 30kHz = 1 sec ramp
+				
+				// Target: full offset when at duty ceiling, zero otherwise
+				float target_offset = (duty_now >= duty_threshold) ? max_id_offset : 0.0f;
+				
+				// Ramp towards target
+				if (motor_now->m_mtpa_boost_iq > target_offset) {
+					motor_now->m_mtpa_boost_iq -= ramp_rate;
+					if (motor_now->m_mtpa_boost_iq < target_offset) {
+						motor_now->m_mtpa_boost_iq = target_offset;
+					}
+				} else if (motor_now->m_mtpa_boost_iq < target_offset) {
+					motor_now->m_mtpa_boost_iq += ramp_rate;
+					if (motor_now->m_mtpa_boost_iq > target_offset) {
+						motor_now->m_mtpa_boost_iq = target_offset;
+					}
+				}
+				
+				// Apply offset to Id (m_mtpa_boost_iq is now used as Id offset, negative value)
+				id_mtpa += motor_now->m_mtpa_boost_iq;
+			} else {
+				// Boost disabled - ramp back to zero
+				if (motor_now->m_mtpa_boost_iq < 0.0f) {
+					motor_now->m_mtpa_boost_iq += 0.0005f;
+					if (motor_now->m_mtpa_boost_iq > 0.0f) {
+						motor_now->m_mtpa_boost_iq = 0.0f;
+					}
+				}
+			}
+
+			// =============================================================================
+			// HAZZA: Power-Capped MTPA
+			// Standard MTPA keeps motor current magnitude constant but ignores battery power.
+			// For high-saliency IPM motors, the id component adds significant battery draw.
+			// This mode scales the entire MTPA vector down to respect battery current limits.
+			// =============================================================================
+			if (conf_now->foc_mtpa_power_cap) {
+				// Estimate battery current for this MTPA current vector
+				// I_batt = mod_d * id + mod_q * iq
+				// We use the measured/filtered modulation values as our best estimate
+				const float mod_d = state_now->mod_d;
+				const float mod_q = state_now->mod_q_filter;
+				
+				// Predicted battery current with MTPA currents
+				float i_batt_mtpa = mod_d * id_mtpa + mod_q * iq_mtpa;
+				
+				// Check against battery current limit
+				float i_batt_limit = (iq_mtpa > 0) ? conf_now->lo_in_current_max : -conf_now->lo_in_current_min;
+				
+				if (fabsf(i_batt_mtpa) > fabsf(i_batt_limit) && fabsf(i_batt_mtpa) > 0.1f) {
+					// We'd exceed battery limit! Scale down both id and iq together
+					// This maintains the MTPA angle while reducing total power
+					float scale = fabsf(i_batt_limit / i_batt_mtpa);
+					if (scale < 1.0f) {
+						id_mtpa *= scale;
+						iq_mtpa *= scale;
+					}
+				}
+			}
+
+			id_set_tmp = id_mtpa;
+			iq_set_tmp = iq_mtpa;
 		}
 
 		const float mod_q = state_now->mod_q_filter;
@@ -4554,6 +4785,15 @@ static void control_current(motor_all_state_t *motor, float dt) {
 
 	float max_duty = fabsf(state_m->max_duty);
 	utils_truncate_number(&max_duty, 0.0, conf_now->l_max_duty);
+	
+	// =============================================================================
+	// HAZZA MID-DRIVE: Apply safe power limit in CURRENT control mode
+	// When tracking is bad, we limit how much voltage can be applied.
+	// This prevents the runaway feedback loop that causes grinding/lockup.
+	// =============================================================================
+	if (motor->m_control_mode == CONTROL_MODE_CURRENT && motor->m_safe_power_limit > 0.01f) {
+		max_duty = fminf(max_duty, motor->m_safe_power_limit);
+	}
 
 	// Park transform: transforms the currents from stator to the rotor reference frame
 	state_m->id = c * state_m->i_alpha + s * state_m->i_beta;
@@ -4613,6 +4853,29 @@ static void control_current(motor_all_state_t *motor, float dt) {
 
 	state_m->vd -= dec_vd; //Negative sign as in the PMSM equations
 	state_m->vq += dec_vq + dec_bemf;
+	
+	// =============================================================================
+	// HAZZA MID-DRIVE: Smooth voltage changes when tracking is poor
+	// Sudden voltage jumps confuse position tracking even more.
+	// When tracking quality is low, we smooth out voltage changes.
+	// =============================================================================
+	if (motor->m_control_mode == CONTROL_MODE_CURRENT && motor->m_tracking_quality < 0.8f) {
+		// How much can voltage change per cycle? Less when tracking is bad.
+		const float smoothing_strength = 0.5f + 0.5f * motor->m_tracking_quality;  // 0.5 to 1.0
+		const float max_voltage_change = state_m->v_bus * 0.1f * smoothing_strength;
+		
+		// Limit how fast voltage can change
+		float voltage_delta = state_m->vq - motor->m_voltage_smoothed;
+		utils_truncate_number(&voltage_delta, -max_voltage_change, max_voltage_change);
+		motor->m_voltage_smoothed += voltage_delta;
+		
+		// Blend smoothed and raw voltage based on tracking quality
+		// Bad tracking = more smoothing, Good tracking = more raw
+		state_m->vq = motor->m_voltage_smoothed * (1.0f - motor->m_tracking_quality) + 
+		              state_m->vq * motor->m_tracking_quality;
+	} else {
+		motor->m_voltage_smoothed = state_m->vq;  // Keep tracking when not smoothing
+	}
 
 	// Calculate the max length of the voltage space vector without overmodulation.
 	// Is simply 1/sqrt(3) * v_bus. See https://microchipdeveloper.com/mct5001:start. Adds margin with max_duty.

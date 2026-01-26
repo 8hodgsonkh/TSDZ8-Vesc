@@ -484,6 +484,9 @@
 #ifndef MCCONF_FOC_MTPA_MODE
 #define MCCONF_FOC_MTPA_MODE				MTPA_MODE_OFF // Maximum torque per amp (MTPA) algorithm mode
 #endif
+#ifndef MCCONF_FOC_MTPA_POWER_CAP
+#define MCCONF_FOC_MTPA_POWER_CAP			false // Scale MTPA currents to respect battery current limit
+#endif
 #ifndef MCCONF_FOC_FW_CURRENT_MAX
 #define MCCONF_FOC_FW_CURRENT_MAX		0.0 // Maximum field weakening current
 #endif
