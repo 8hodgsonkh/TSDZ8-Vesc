@@ -200,17 +200,8 @@ static haz_pas_duty_ctx_t haz_pas_duty_ctx = {
 	.last_step_count = 0
 };
 
-static void haz_pas_duty_reset(void) {
-	haz_pas_duty_ctx.duty_cmd = 0.0f;
-	haz_pas_duty_ctx.target_duty = 0.0f;
-	haz_pas_duty_ctx.cadence_smooth = 0.0f;
-	haz_pas_duty_ctx.idle_time = 0.0f;
-	haz_pas_duty_ctx.startup_progress = 0.0f;
-	haz_pas_duty_ctx.engaged = false;
-}
-
 // Simple PAS duty - cadence-based duty output with smooth ramping
-static float haz_pas_duty_process(const adc_config *conf, float dt_s) {
+static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	if (!conf->haz_pas_duty_enabled) {
 		haz_pas_duty_ctx.duty_cmd = 0.0f;
 		return 0.0f;
@@ -281,9 +272,60 @@ static float haz_pas_duty_process(const adc_config *conf, float dt_s) {
 
 	bool is_idle = (haz_pas_duty_ctx.idle_time > idle_timeout);
 
-	// Get pedal RPM and smooth it
-	float pedal_rpm = app_pas_get_pedal_rpm();
-	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, pedal_rpm, 0.1f);
+	// Get pedal RPM with MEDIAN FILTER (outlier rejection)
+	// Tunable via VESC Tool settings:
+	// - PAS Duty: LP Smoothing (variation_threshold): 1-10 (1=responsive, 10=smooth)
+	// - PAS Duty: Median Buffer (ramp_rise_time): 3-11 samples
+	
+	// Buffer size: direct integer from setting (3-11 samples)
+	int buf_size = (int)conf->haz_pas_duty_ramp_rise_time;
+	if (buf_size < 3) buf_size = 3;
+	if (buf_size > 11) buf_size = 11;
+	
+	// LP filter: setting 1-10 maps to factor 0.5-0.01 (inverted: 1=responsive, 10=smooth)
+	int lp_setting = (int)conf->haz_pas_duty_variation_threshold;
+	if (lp_setting < 1) lp_setting = 1;
+	if (lp_setting > 10) lp_setting = 10;
+	float lp_factor = 0.5f - (lp_setting - 1) * (0.49f / 9.0f);  // 1→0.5, 10→0.01
+	
+	// Fixed 11-element buffer, always use full buffer for consistency
+	// (changing buf_size only affects how many samples we consider for median)
+	static float rpm_buffer[11] = {0};
+	static int rpm_idx = 0;
+	static int buf_filled = 0;  // Track how many valid samples we have
+	
+	float pedal_rpm_raw = app_pas_get_pedal_rpm();
+	rpm_buffer[rpm_idx] = pedal_rpm_raw;
+	rpm_idx = (rpm_idx + 1) % 11;  // Always wrap at 11
+	if (buf_filled < 11) buf_filled++;
+	
+	// Use minimum of buf_size and buf_filled for median calculation
+	int samples_to_use = (buf_filled < buf_size) ? buf_filled : buf_size;
+	if (samples_to_use < 3) samples_to_use = 3;
+	
+	// Copy most recent samples for sorting
+	float sorted[11];
+	for (int i = 0; i < samples_to_use; i++) {
+		int idx = (rpm_idx - 1 - i + 11) % 11;  // Work backwards from most recent
+		sorted[i] = rpm_buffer[idx];
+	}
+	
+	// Sort (simple insertion sort)
+	for (int i = 1; i < samples_to_use; i++) {
+		float key = sorted[i];
+		int j = i - 1;
+		while (j >= 0 && sorted[j] > key) {
+			sorted[j + 1] = sorted[j];
+			j--;
+		}
+		sorted[j + 1] = key;
+	}
+	
+	// Take median (middle value)
+	float pedal_rpm = sorted[samples_to_use / 2];
+	
+	// LP filter on top (tunable)
+	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, pedal_rpm, lp_factor);
 
 	// Apply assist level multiplier (1-5 = 20-100%)
 	// In offroad mode: Level 5 = normal VESC limits, 1-4 = reduced power
@@ -1385,8 +1427,11 @@ static THD_FUNCTION(adc_thread, arg) {
 
 
 							// Configurable ramp rates (duty/s)
-							const float ramp_up_slow = config.haz_hybrid_ramp_up_slow;
-							const float ramp_up_fast = config.haz_hybrid_ramp_up_fast;
+							// Street mode: VERY slow ramp (0.05/s) to avoid slingshot past speed limit
+							// with low-resolution 1 pulse/rotation speed sensor
+							const bool street_mode = !mc_interface_is_offroad_mode();
+							const float ramp_up_slow = street_mode ? 0.05f : config.haz_hybrid_ramp_up_slow;
+							const float ramp_up_fast = street_mode ? 0.05f : config.haz_hybrid_ramp_up_fast;
 							const float ramp_down_slow = config.haz_hybrid_ramp_down_slow;
 							const float ramp_down_fast = config.haz_hybrid_ramp_down_fast;
 

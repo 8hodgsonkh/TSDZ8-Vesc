@@ -74,6 +74,11 @@
 #define STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS     3000
 #endif
 
+// Street mode power limit (250W for EU legal compliance)
+#ifndef STREET_MODE_WATT_LIMIT
+#define STREET_MODE_WATT_LIMIT          250.0f
+#endif
+
 // Safety fallbacks if the overrides above are disabled or zeroed by mistake.
 #define STREET_MODE_ERPM_FALLBACK       7500.0f
 #define STREET_MODE_THROTTLE_ERPM_FALLBACK      2000.0f
@@ -2638,7 +2643,14 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 	}
 
 	// Wattage limits
-	const float lo_in_max_watt = conf->l_watt_max / v_in;
+	float watt_max = conf->l_watt_max;
+	
+	// Street mode: 250W limit when not in offroad mode
+	if (!m_offroad_mode && watt_max > STREET_MODE_WATT_LIMIT) {
+		watt_max = STREET_MODE_WATT_LIMIT;
+	}
+	
+	const float lo_in_max_watt = watt_max / v_in;
 	const float lo_in_min_watt = conf->l_watt_min / v_in;
 
 	float lo_in_max = utils_min_abs(lo_in_max_watt, lo_in_max_batt);

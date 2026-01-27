@@ -253,6 +253,7 @@ typedef struct {
 	
 	// HAZZA: Manual MTPA boost button (ESP32 display)
 	bool m_mtpa_boost_active;         // TRUE = boost mode enabled
+	int m_mtpa_boost_level;           // Boost level 1-5 (determines Id offset)
 	float m_mtpa_boost_iq;            // Smoothed boost Iq value (ramps up/down)
 
 	// Pre-calculated values

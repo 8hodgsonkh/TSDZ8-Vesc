@@ -1127,18 +1127,24 @@ float mcpwm_foc_get_tracking_quality_now(void) {
 
 // HAZZA: Manual MTPA boost button control (for ESP32 display)
 // When active, enables duty-based field weakening boost
-void mcpwm_foc_set_mtpa_boost(bool active) {
+// Level 0 = off, Level 1-5 = increasing field weakening
+void mcpwm_foc_set_mtpa_boost(int level) {
+	bool active = (level > 0 && level <= 5);
+	int clamped_level = active ? level : 0;
+	
 	// Set on BOTH motors to be safe (single motor setup still works)
 	m_motor_1.m_mtpa_boost_active = active;
-	m_motor_1.m_mtpa_boost_iq = 0.0f;  // Reset ramp on toggle
+	m_motor_1.m_mtpa_boost_level = clamped_level;
+	if (!active) m_motor_1.m_mtpa_boost_iq = 0.0f;  // Reset ramp when disabled
 #ifdef HW_HAS_DUAL_MOTORS
 	m_motor_2.m_mtpa_boost_active = active;
-	m_motor_2.m_mtpa_boost_iq = 0.0f;
+	m_motor_2.m_mtpa_boost_level = clamped_level;
+	if (!active) m_motor_2.m_mtpa_boost_iq = 0.0f;
 #endif
 }
 
-bool mcpwm_foc_get_mtpa_boost(void) {
-	return m_motor_1.m_mtpa_boost_active;
+int mcpwm_foc_get_mtpa_boost(void) {
+	return m_motor_1.m_mtpa_boost_active ? m_motor_1.m_mtpa_boost_level : 0;
 }
 
 /**
@@ -3734,16 +3740,20 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			// HAZZA: Direct Field Weakening Boost (clean approach)
 			// When at max duty (94%+) and boost enabled, ramp in extra negative Id.
 			// This is simpler and more predictable than the virtual Iq approach.
-			// At high speed, mod_d is small (~0.1-0.3), so -15A Id only costs ~2-5A battery.
+			// Boost levels: 1=-3A, 2=-6A, 3=-9A, 4=-12A, 5=-15A
 			// =============================================================================
 			if (motor_now->m_mtpa_boost_active) {
-				const float duty_now = fabsf(state_now->duty_now);
+				const float boost_duty = fabsf(state_now->duty_now);
 				const float duty_threshold = 0.94f;  // Close to your 95% max
-				const float max_id_offset = -15.0f;  // Max field weakening current
+				
+				// Calculate max Id offset based on boost level (1-5)
+				// Level 1=-3A, Level 2=-6A, Level 3=-9A, Level 4=-12A, Level 5=-15A
+				float max_id_offset = -3.0f * motor_now->m_mtpa_boost_level;
+				
 				const float ramp_rate = 0.0005f;     // ~15A/s at 30kHz = 1 sec ramp
 				
 				// Target: full offset when at duty ceiling, zero otherwise
-				float target_offset = (duty_now >= duty_threshold) ? max_id_offset : 0.0f;
+				float target_offset = (boost_duty >= duty_threshold) ? max_id_offset : 0.0f;
 				
 				// Ramp towards target
 				if (motor_now->m_mtpa_boost_iq > target_offset) {
