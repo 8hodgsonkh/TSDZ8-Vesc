@@ -53,6 +53,8 @@ void app_adc_detach_buttons(bool state);
 void app_adc_rev_override(bool state);
 void app_adc_cc_override(bool state);
 bool app_adc_range_ok(void);
+uint8_t app_adc_get_assist_level(void);
+void app_adc_set_assist_level(uint8_t level);
 
 typedef enum {
 	UART_PORT_COMM_HEADER = 0,
@@ -90,6 +92,7 @@ int app_pas_get_pas1_level(void);
 int app_pas_get_pas2_level(void);
 uint32_t app_pas_get_step_count(void);
 float app_pas_get_time_since_real_step(void);
+float app_pas_get_event_period(void);
 bool app_pas_is_forced_idle(void);
 void app_pas_set_current_sub_scaling(float current_sub_scaling);
 void app_pas_pas_irq_handler(void);

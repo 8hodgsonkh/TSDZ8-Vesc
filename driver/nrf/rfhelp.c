@@ -126,8 +126,12 @@ void rfhelp_restart(void) {
 	rf_enable_pipe_address(NRF_MASK_PIPE0);
 	rf_enable_pipe_dlp(NRF_MASK_PIPE0);
 
-	memcpy(tx_addr, nrf_conf.address, 3);
-	memcpy(rx_addr[0], nrf_conf.address, 3);
+	tx_addr[0] = nrf_conf.address_0;
+	tx_addr[1] = nrf_conf.address_1;
+	tx_addr[2] = nrf_conf.address_2;
+	rx_addr[0][0] = nrf_conf.address_0;
+	rx_addr[0][1] = nrf_conf.address_1;
+	rx_addr[0][2] = nrf_conf.address_2;
 	tx_pipe0_addr_eq = true;
 
 	rf_set_tx_addr(tx_addr, address_length);

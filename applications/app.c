@@ -76,7 +76,7 @@ void app_set_configuration(app_configuration *conf) {
 		break;
 	}
 	bool start_pas_sidecar =
-		(appconf.app_pas_conf.ctrl_type != PAS_CTRL_TYPE_NONE) &&
+		((appconf.app_pas_conf.ctrl_type != PAS_CTRL_TYPE_NONE) || appconf.app_adc_conf.haz_pas_duty_enabled) &&
 		pas_hw_ready &&
 		(appconf.app_to_use == APP_ADC || appconf.app_to_use == APP_ADC_UART);
 #else

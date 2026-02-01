@@ -210,9 +210,9 @@ static float pas_get_assist_ceiling(void) {
 }
 
 static float pas_get_drive_reduction(void) {
-	// Use gear_reduction from hazza_mid_conf (motor:chainring ratio, e.g. 38 for TSDZ8)
+	// Use internal_ratio from gear_detect_conf (motor:chainring ratio, e.g. 38 for TSDZ8)
 	const app_configuration *appconf = app_get_configuration();
-	float ratio = appconf->hazza_mid_conf.gear_reduction;
+	float ratio = appconf->gear_detect_conf.internal_ratio;
 	if (!isfinite(ratio) || ratio <= 0.0f) {
 		ratio = 1.0f;
 	}
@@ -608,6 +608,10 @@ uint32_t app_pas_get_step_count(void) {
 
 float app_pas_get_time_since_real_step(void) {
 	return pas_time_since_last_real_step;
+}
+
+float app_pas_get_event_period(void) {
+	return pas_quad_state.event_period;
 }
 
 bool app_pas_is_forced_idle(void) {

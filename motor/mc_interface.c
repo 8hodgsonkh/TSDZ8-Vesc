@@ -65,13 +65,18 @@
 // Street mode wheel speed limit (m/s) - 1.34 m/s = 4.8 km/h = 3 mph (for testing)
 // Set to 0 to disable wheel speed limiting and only use ERPM
 #ifndef STREET_MODE_WHEEL_SPEED_LIMIT
-#define STREET_MODE_WHEEL_SPEED_LIMIT   1.34f
+#define STREET_MODE_WHEEL_SPEED_LIMIT   6.7f    // 15 mph in m/s
 #endif
 
 // Safety: If motor runs for this long (ms) in street mode without a wheel pulse, cut motor
 // Prevents bypassing speed limit by removing the speed sensor
 #ifndef STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS
 #define STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS     3000
+#endif
+
+// Street mode power limit (250W for EU legal compliance)
+#ifndef STREET_MODE_WATT_LIMIT
+#define STREET_MODE_WATT_LIMIT          250.0f
 #endif
 
 // Safety fallbacks if the overrides above are disabled or zeroed by mistake.
@@ -2638,7 +2643,14 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 	}
 
 	// Wattage limits
-	const float lo_in_max_watt = conf->l_watt_max / v_in;
+	float watt_max = conf->l_watt_max;
+	
+	// Street mode: 250W limit when not in offroad mode
+	if (!m_offroad_mode && watt_max > STREET_MODE_WATT_LIMIT) {
+		watt_max = STREET_MODE_WATT_LIMIT;
+	}
+	
+	const float lo_in_max_watt = watt_max / v_in;
 	const float lo_in_min_watt = conf->l_watt_min / v_in;
 
 	float lo_in_max = utils_min_abs(lo_in_max_watt, lo_in_max_batt);
