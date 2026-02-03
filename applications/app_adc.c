@@ -1293,6 +1293,8 @@ static THD_FUNCTION(adc_thread, arg) {
 				static int freewheel_catch_state = 0;  // 0=normal, 1=spinning up, 2=engaged
 				static float freewheel_catch_duty = 0.0f;
 				static int freewheel_catch_gear = 0;
+				static float throttle_slam_initial_gap = 0.0f;  // Track initial gap for slam detection
+				static float last_duty_target = 0.0f;           // Track target changes
 				const float dt_s = (float)sleep_time / (float)CH_CFG_ST_FREQUENCY;
 
 				float throttle_mag = fabsf(pwr);
@@ -1438,6 +1440,28 @@ static THD_FUNCTION(adc_thread, arg) {
 							// Scale ramp by how far we are from target
 							float gap_ratio = duty_gap / mcconf->l_max_duty;
 							if (gap_ratio > 1.0f) gap_ratio = 1.0f;
+							
+							// Slam detection: if throttle target jumped significantly, remember it
+							const float slam_threshold = 0.25f;  // 25% duty change = slam
+							float target_change = fabsf(duty_target - last_duty_target);
+							if (target_change > slam_threshold * mcconf->l_max_duty) {
+								// New slam detected - remember the initial gap
+								throttle_slam_initial_gap = duty_gap;
+							}
+							last_duty_target = duty_target;
+							
+							// If this was a big slam (initial gap > 30%), stay fast all the way
+							// Otherwise use squared blend for fine control
+							const float slam_fast_threshold = 0.30f;  // 30% initial gap = full fast mode
+							if (throttle_slam_initial_gap > slam_fast_threshold * mcconf->l_max_duty) {
+								gap_ratio = 1.0f;  // Full fast ramp until target reached
+								// Reset slam tracking once we reach target
+								if (duty_gap < 0.02f) {
+									throttle_slam_initial_gap = 0.0f;
+								}
+							} else {
+								gap_ratio = gap_ratio * gap_ratio;  // Square it - smooth transition to slow
+							}
 
 							if (duty_target > osf_duty_ramped) {
 								// Ramping UP
