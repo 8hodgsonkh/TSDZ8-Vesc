@@ -244,6 +244,37 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 			commands_printf("\nUse 'wheel_speed watch' for live updates.\n");
 		}
 #endif
+	} else if (strcmp(argv[0], "mtpv") == 0) {
+		// HAZZA: MTPV debug info
+		bool watch_mode = (argc >= 2 && strcmp(argv[1], "watch") == 0);
+		
+		if (watch_mode) {
+			commands_printf("MTPV watch mode (Ctrl+C to stop)...\n");
+			commands_printf("Boost|Throt|Mod  |Ceil|Bst|Id    |ERPM\n");
+			for (int i = 0; i < 200; i++) {  // 20 seconds max
+				commands_printf("  %d  |%.2f |%.3f| %c  | %c |%+.2f |%.0f",
+					mcpwm_foc_get_mtpa_boost(),
+					(double)mcpwm_foc_get_throttle_pos(),
+					(double)mcpwm_foc_get_fw_mod(),
+					mcpwm_foc_get_fw_at_ceiling() ? 'Y' : 'N',
+					mcpwm_foc_get_fw_in_boost() ? 'Y' : 'N',
+					(double)mcpwm_foc_get_mtpv_id(),
+					(double)mc_interface_get_rpm());
+				chThdSleepMilliseconds(100);
+			}
+			commands_printf("\nWatch mode ended.\n");
+		} else {
+			commands_printf("MTPV Status:");
+			commands_printf("  Boost level:     %d (0=off, 1-5=on)", mcpwm_foc_get_mtpa_boost());
+			commands_printf("  Throttle pos:    %.3f (0-1, FW scales 0.9-1.0)", (double)mcpwm_foc_get_throttle_pos());
+			commands_printf("  Modulation:      %.3f", (double)mcpwm_foc_get_fw_mod());
+			commands_printf("  At ceiling:      %s (mod > 90%% of max duty)", mcpwm_foc_get_fw_at_ceiling() ? "YES" : "NO");
+			commands_printf("  In boost zone:   %s (throttle > 90%%)", mcpwm_foc_get_fw_in_boost() ? "YES" : "NO");
+			commands_printf("  FW Id offset:    %.3f A (negative = field weakening)", (double)mcpwm_foc_get_mtpv_id());
+			commands_printf("  Current duty:    %.3f", (double)mc_interface_get_duty_cycle_now());
+			commands_printf("  Current ERPM:    %.0f", (double)mc_interface_get_rpm());
+			commands_printf("\nUse 'mtpv watch' for live updates.\n");
+		}
 	} else if (strcmp(argv[0], "volt") == 0) {
 		commands_printf("Input voltage: %.2f\n", (double)mc_interface_get_input_voltage_filtered());
 #ifdef HW_HAS_GATE_DRIVER_SUPPLY_MONITOR

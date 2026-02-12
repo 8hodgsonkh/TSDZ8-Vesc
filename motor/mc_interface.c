@@ -166,6 +166,7 @@ static volatile bool m_wheel_speed_override = false;
 static volatile float m_wheel_speed_override_value = 0.0;
 static volatile bool m_offroad_mode = false;
 static volatile bool m_throttle_limit_active = false;
+static volatile float m_assist_current_scale = 1.0f;  // HAZZA: Assist level current scaling (0.2-1.0)
 
 typedef struct {
 	bool is_second_motor;
@@ -1833,6 +1834,18 @@ void mc_interface_set_throttle_limit_active(bool active) {
 	m_throttle_limit_active = active;
 }
 
+// HAZZA: Set assist level current scaling (0.2-1.0)
+// Level 1=20%, 2=40%, 3=60%, 4=80%, 5=100%
+void mc_interface_set_assist_current_scale(float scale) {
+	if (scale < 0.1f) scale = 0.1f;
+	if (scale > 1.0f) scale = 1.0f;
+	m_assist_current_scale = scale;
+}
+
+float mc_interface_get_assist_current_scale(void) {
+	return m_assist_current_scale;
+}
+
 setup_values mc_interface_get_setup_values(void) {
 	setup_values val = {0, 0, 0, 0, 0, 0, 0};
 	val.num_vescs = 1;
@@ -2497,7 +2510,7 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 #endif
 
 	const float l_current_min_tmp = conf->l_current_min * conf->l_current_min_scale;
-	const float l_current_max_tmp = conf->l_current_max * conf->l_current_max_scale;
+	const float l_current_max_tmp = conf->l_current_max * conf->l_current_max_scale * m_assist_current_scale;
 
 	// Temperature MOSFET
 	float lo_min_mos = l_current_min_tmp;

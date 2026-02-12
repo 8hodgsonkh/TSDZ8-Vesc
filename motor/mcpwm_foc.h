@@ -144,6 +144,12 @@ float mcpwm_foc_get_tracking_quality_now(void);
 // HAZZA: Manual MTPA boost button control (for ESP32 display)
 void mcpwm_foc_set_mtpa_boost(int level);  // 0=off, 1-5=boost levels
 int mcpwm_foc_get_mtpa_boost(void);
+float mcpwm_foc_get_mtpv_id(void);         // Get current MTPV -Id offset
+float mcpwm_foc_get_throttle_pos(void);    // Get throttle position sent to FOC
+void mcpwm_foc_set_throttle_pos(float throttle);  // 0-1 for FW scaling
+float mcpwm_foc_get_fw_mod(void);          // Debug: current modulation
+bool mcpwm_foc_get_fw_at_ceiling(void);    // Debug: at duty ceiling?
+bool mcpwm_foc_get_fw_in_boost(void);      // Debug: in boost zone?
 void mcpwm_foc_set_current_off_delay(float delay_sec);
 
 // Functions where the motor can be selected

@@ -1147,6 +1147,38 @@ int mcpwm_foc_get_mtpa_boost(void) {
 	return m_motor_1.m_mtpa_boost_active ? m_motor_1.m_mtpa_boost_level : 0;
 }
 
+// HAZZA: Get MTPV debug info
+float mcpwm_foc_get_mtpv_id(void) {
+	return m_motor_1.m_mtpa_boost_iq;  // Current -Id offset being applied
+}
+
+float mcpwm_foc_get_throttle_pos(void) {
+	return m_motor_1.m_throttle_pos;
+}
+
+float mcpwm_foc_get_fw_mod(void) {
+	return m_motor_1.m_fw_mod_now;
+}
+
+bool mcpwm_foc_get_fw_at_ceiling(void) {
+	return m_motor_1.m_fw_at_ceiling;
+}
+
+bool mcpwm_foc_get_fw_in_boost(void) {
+	return m_motor_1.m_fw_in_boost;
+}
+
+// HAZZA: Set throttle position for FW scaling (0-1)
+// Called from app_adc so FOC knows where throttle is
+void mcpwm_foc_set_throttle_pos(float throttle) {
+	if (throttle < 0.0f) throttle = 0.0f;
+	if (throttle > 1.0f) throttle = 1.0f;
+	m_motor_1.m_throttle_pos = throttle;
+#ifdef HW_HAS_DUAL_MOTORS
+	m_motor_2.m_throttle_pos = throttle;
+#endif
+}
+
 /**
  * Set current off delay. Prevent the current controller from switching off modulation
  * for target currents < cc_min_current for this amount of time.
@@ -3737,43 +3769,59 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			float iq_mtpa = SIGN(iq_set_tmp) * sqrtf(SQ(iq_set_tmp) - SQ(id_mtpa));
 
 			// =============================================================================
-			// HAZZA: Direct Field Weakening Boost (clean approach)
-			// When at max duty (94%+) and boost enabled, ramp in extra negative Id.
-			// This is simpler and more predictable than the virtual Iq approach.
-			// Boost levels: 1=-3A, 2=-6A, 3=-9A, 4=-12A, 5=-15A
+			// HAZZA: Simple Field Weakening with Boost Level
+			// When at duty ceiling AND throttle > 90%, inject negative Id
+			// Boost level controls max FW: Level N = max -2N amps
+			//   Level 0 = disabled, Level 5 = max -10A
 			// =============================================================================
 			if (motor_now->m_mtpa_boost_active) {
-				const float boost_duty = fabsf(state_now->duty_now);
-				const float duty_threshold = 0.94f;  // Close to your 95% max
+				const float omega_e = erpm_now * (2.0f * M_PI / 60.0f);  // Electrical rad/s
 				
-				// Calculate max Id offset based on boost level (1-5)
-				// Level 1=-3A, Level 2=-6A, Level 3=-9A, Level 4=-12A, Level 5=-15A
-				float max_id_offset = -3.0f * motor_now->m_mtpa_boost_level;
+				// Check if at duty ceiling
+				float mod_now = sqrtf(SQ(state_now->mod_d) + SQ(state_now->mod_q_filter));
+				bool at_duty_ceiling = (mod_now > conf_now->l_max_duty * 0.90f);  // 90% of max
+				bool in_boost_zone = (motor_now->m_throttle_pos > 0.90f);
 				
-				const float ramp_rate = 0.0005f;     // ~15A/s at 30kHz = 1 sec ramp
+				// Store for debug
+				motor_now->m_fw_mod_now = mod_now;
+				motor_now->m_fw_at_ceiling = at_duty_ceiling;
+				motor_now->m_fw_in_boost = in_boost_zone;
 				
-				// Target: full offset when at duty ceiling, zero otherwise
-				float target_offset = (boost_duty >= duty_threshold) ? max_id_offset : 0.0f;
+				float id_fw_target = 0.0f;
+				if (at_duty_ceiling && in_boost_zone && omega_e > 100.0f) {
+					// How far into the boost zone? 0.0 at 90%, 1.0 at 100%
+					float throttle_scale = (motor_now->m_throttle_pos - 0.90f) / 0.10f;
+					throttle_scale = fmaxf(0.0f, fminf(1.0f, throttle_scale));
+					
+					// Max FW current based on boost level: Level N = -3.6N amps
+					// Level 5 = -18A max
+					float id_fw_max = -3.6f * motor_now->m_mtpa_boost_level;
+					
+					// Target = max * throttle position in boost zone
+					id_fw_target = id_fw_max * throttle_scale;
+				}
 				
-				// Ramp towards target
-				if (motor_now->m_mtpa_boost_iq > target_offset) {
+				// Ramp towards target for smooth transitions
+				const float ramp_rate = 0.001f;  // ~30A/s at 30kHz (0.33s to 10A)
+				
+				if (motor_now->m_mtpa_boost_iq > id_fw_target) {
 					motor_now->m_mtpa_boost_iq -= ramp_rate;
-					if (motor_now->m_mtpa_boost_iq < target_offset) {
-						motor_now->m_mtpa_boost_iq = target_offset;
+					if (motor_now->m_mtpa_boost_iq < id_fw_target) {
+						motor_now->m_mtpa_boost_iq = id_fw_target;
 					}
-				} else if (motor_now->m_mtpa_boost_iq < target_offset) {
+				} else if (motor_now->m_mtpa_boost_iq < id_fw_target) {
 					motor_now->m_mtpa_boost_iq += ramp_rate;
-					if (motor_now->m_mtpa_boost_iq > target_offset) {
-						motor_now->m_mtpa_boost_iq = target_offset;
+					if (motor_now->m_mtpa_boost_iq > id_fw_target) {
+						motor_now->m_mtpa_boost_iq = id_fw_target;
 					}
 				}
 				
-				// Apply offset to Id (m_mtpa_boost_iq is now used as Id offset, negative value)
+				// Apply the field weakening offset to Id
 				id_mtpa += motor_now->m_mtpa_boost_iq;
 			} else {
 				// Boost disabled - ramp back to zero
 				if (motor_now->m_mtpa_boost_iq < 0.0f) {
-					motor_now->m_mtpa_boost_iq += 0.0005f;
+					motor_now->m_mtpa_boost_iq += 0.001f;
 					if (motor_now->m_mtpa_boost_iq > 0.0f) {
 						motor_now->m_mtpa_boost_iq = 0.0f;
 					}

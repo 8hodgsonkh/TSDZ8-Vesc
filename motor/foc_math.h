@@ -255,6 +255,10 @@ typedef struct {
 	bool m_mtpa_boost_active;         // TRUE = boost mode enabled
 	int m_mtpa_boost_level;           // Boost level 1-5 (determines Id offset)
 	float m_mtpa_boost_iq;            // Smoothed boost Iq value (ramps up/down)
+	float m_throttle_pos;             // Throttle position 0-1 for FW scaling
+	float m_fw_mod_now;               // Debug: current modulation
+	bool m_fw_at_ceiling;             // Debug: at duty ceiling?
+	bool m_fw_in_boost;               // Debug: in boost zone?
 
 	// Pre-calculated values
 	float p_lq;
