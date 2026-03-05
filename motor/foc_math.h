@@ -237,6 +237,38 @@ typedef struct {
 	float m_res_temp_comp;
 	float m_current_ki_temp_comp;
 
+	// =============================================================================
+	// HAZZA MID-DRIVE: Anti-Lockup System for Current Control
+	// Detects when motor control is struggling and backs off to prevent grinding
+	// =============================================================================
+	float m_tracking_quality;         // 0.0 = completely lost, 1.0 = perfect (how well we know motor position)
+	float m_tracking_error_buildup;   // Accumulated position tracking errors over time
+	float m_voltage_smoothed;         // Smoothed voltage to prevent sudden jumps
+	float m_safe_power_limit;         // How much power we're allowing (reduces when struggling)
+	float m_speed_change_rate;        // How fast motor speed is changing (detects chain snap)
+	float m_speed_prev;               // Previous speed for calculating change rate
+	float m_power_scale;              // Current power multiplier 0.3-1.0 (backs off when confused)
+	bool m_lost_sync;                 // TRUE = we lost track of motor position, backing off!
+	uint32_t m_recovery_cycles;       // How many cycles since we started recovering
+	
+	// HAZZA: Manual MTPA boost button (ESP32 display)
+	bool m_mtpa_boost_active;         // TRUE = boost mode enabled
+	int m_mtpa_boost_level;           // Boost level 1-5 (determines Id offset)
+	float m_mtpa_boost_iq;            // Smoothed boost Iq value (ramps up/down)
+	float m_throttle_pos;             // Throttle position 0-1 for FW scaling
+	float m_fw_mod_now;               // Debug: current modulation
+	bool m_fw_at_ceiling;             // Debug: at duty ceiling?
+	bool m_fw_in_boost;               // Debug: in boost zone?
+
+	// HAZZA: Stall detection for mid-drive safety
+	bool m_stall_active;              // TRUE = stall detected, motor disabled
+	uint8_t m_stall_reason;           // Reason code (see STALL_REASON_*)
+	float m_stall_timer;              // Seconds in potential stall condition
+	float m_stall_current_var;        // Current draw variance (machine-gun detection)
+	float m_stall_current_prev;       // Previous current for variance calc
+	float m_stall_tracking_osc;       // Tracking quality oscillation detector
+	float m_stall_tracking_prev;      // Previous tracking quality for oscillation
+
 	// Pre-calculated values
 	float p_lq;
 	float p_ld;

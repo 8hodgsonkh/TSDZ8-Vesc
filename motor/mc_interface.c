@@ -74,6 +74,11 @@
 #define STREET_MODE_WHEEL_SENSOR_TIMEOUT_MS     3000
 #endif
 
+// Street mode power limit (250W for EU legal compliance)
+#ifndef STREET_MODE_WATT_LIMIT
+#define STREET_MODE_WATT_LIMIT          250.0f
+#endif
+
 // Safety fallbacks if the overrides above are disabled or zeroed by mistake.
 #define STREET_MODE_ERPM_FALLBACK       7500.0f
 #define STREET_MODE_THROTTLE_ERPM_FALLBACK      2000.0f
@@ -161,6 +166,8 @@ static volatile bool m_wheel_speed_override = false;
 static volatile float m_wheel_speed_override_value = 0.0;
 static volatile bool m_offroad_mode = false;
 static volatile bool m_throttle_limit_active = false;
+static volatile float m_assist_current_scale = 1.0f;  // HAZZA: Assist level current scaling (0.2-1.0)
+static volatile bool m_motor_locked = false;  // HAZZA: Hard motor lock (blocks ALL output including duty)
 
 typedef struct {
 	bool is_second_motor;
@@ -572,6 +579,11 @@ mc_control_mode mc_interface_get_control_mode(void) {
 }
 
 void mc_interface_set_duty(float dutyCycle) {
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(dutyCycle) > 0.001) {
 		SHUTDOWN_RESET();
 	}
@@ -624,6 +636,11 @@ void mc_interface_set_duty_noramp(float dutyCycle) {
 }
 
 void mc_interface_set_pid_speed(float rpm) {
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(rpm) > 0.001) {
 		SHUTDOWN_RESET();
 	}
@@ -689,6 +706,11 @@ void mc_interface_set_pid_pos(float pos) {
 }
 
 void mc_interface_set_current(float current) {
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(current) > 0.001) {
 		SHUTDOWN_RESET();
 	}
@@ -747,6 +769,11 @@ void mc_interface_set_brake_current(float current) {
  * The relative current value, range [-1.0 1.0]
  */
 void mc_interface_set_current_rel(float val) {
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(val) > 0.001) {
 		SHUTDOWN_RESET();
 	}
@@ -755,8 +782,12 @@ void mc_interface_set_current_rel(float val) {
 	float duty = mc_interface_get_duty_cycle_now();
 
 	if (fabsf(duty) < 0.02 || SIGN(val) == SIGN(duty)) {
-		mc_interface_set_current(val * cfg->lo_current_max);
+		// HAZZA: Apply assist current scaling here (drive path only).
+		// lo_current_max is now the unscaled hardware limit; assist level
+		// reduces the commanded torque but leaves FW/RPM-taper headroom intact.
+		mc_interface_set_current(val * cfg->lo_current_max * m_assist_current_scale);
 	} else {
+		// Brake path - always full braking regardless of assist level
 		mc_interface_set_current(val * fabsf(cfg->lo_current_min));
 	}
 
@@ -1828,6 +1859,32 @@ void mc_interface_set_throttle_limit_active(bool active) {
 	m_throttle_limit_active = active;
 }
 
+// HAZZA: Set assist level current scaling (0.0-1.0)
+// Level 1=20%, 2=40%, 3=60%, 4=80%, 5=100%
+// 0.0 = motor fully disabled (lock mode)
+void mc_interface_set_assist_current_scale(float scale) {
+	if (scale < 0.0f) scale = 0.0f;
+	if (scale > 1.0f) scale = 1.0f;
+	m_assist_current_scale = scale;
+}
+
+float mc_interface_get_assist_current_scale(void) {
+	return m_assist_current_scale;
+}
+
+// HAZZA: Hard motor lock — blocks ALL motor output (set_duty, set_current, etc.)
+// Used by display lock and stall detection.
+void mc_interface_set_motor_locked(bool locked) {
+	m_motor_locked = locked;
+	if (locked) {
+		mc_interface_release_motor();
+	}
+}
+
+bool mc_interface_is_motor_locked(void) {
+	return m_motor_locked;
+}
+
 setup_values mc_interface_get_setup_values(void) {
 	setup_values val = {0, 0, 0, 0, 0, 0, 0};
 	val.num_vescs = 1;
@@ -2492,6 +2549,10 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 #endif
 
 	const float l_current_min_tmp = conf->l_current_min * conf->l_current_min_scale;
+	// HAZZA: Assist scaling removed from limit calculation. Safety limits (RPM taper,
+	// temp derating, FW budget) use the full hardware current. Assist scaling is applied
+	// at the command level in set_current_rel() so the speed envelope stays constant
+	// across assist levels, and the FOC FW controller gets full id budget.
 	const float l_current_max_tmp = conf->l_current_max * conf->l_current_max_scale;
 
 	// Temperature MOSFET
@@ -2638,7 +2699,14 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 	}
 
 	// Wattage limits
-	const float lo_in_max_watt = conf->l_watt_max / v_in;
+	float watt_max = conf->l_watt_max;
+	
+	// Street mode: 250W limit when not in offroad mode
+	if (!m_offroad_mode && watt_max > STREET_MODE_WATT_LIMIT) {
+		watt_max = STREET_MODE_WATT_LIMIT;
+	}
+	
+	const float lo_in_max_watt = watt_max / v_in;
 	const float lo_in_min_watt = conf->l_watt_min / v_in;
 
 	float lo_in_max = utils_min_abs(lo_in_max_watt, lo_in_max_batt);

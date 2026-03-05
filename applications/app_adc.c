@@ -25,6 +25,7 @@
 #include "hal.h"
 #include "stm32f4xx_conf.h"
 #include "mc_interface.h"
+#include "mcpwm_foc.h"
 #include "timeout.h"
 #include "utils_math.h"
 #include "utils_sys.h"
@@ -126,17 +127,29 @@ uint8_t app_adc_get_assist_level(void) {
 	return assist_level;
 }
 
-// Set assist level from display (1-5)
-void app_adc_set_assist_level(uint8_t level) {
-	if (level >= 1 && level <= 5) {
-		assist_level = level;
-	}
-}
-
 // Get power multiplier for current assist level (0.2 to 1.0)
 static float get_assist_power_multiplier(void) {
 	// Level 1=20%, 2=40%, 3=60%, 4=80%, 5=100%
 	return (float)assist_level * 0.2f;
+}
+
+// Apply assist level to motor current limit (called when level changes or mode changes)
+static void apply_assist_current_limit(void) {
+	if (mc_interface_is_offroad_mode()) {
+		// Offroad: scale current by assist level
+		mc_interface_set_assist_current_scale(get_assist_power_multiplier());
+	} else {
+		// Street mode: full current (speed is limited instead)
+		mc_interface_set_assist_current_scale(1.0f);
+	}
+}
+
+// Set assist level from display (1-5)
+void app_adc_set_assist_level(uint8_t level) {
+	if (level >= 1 && level <= 5) {
+		assist_level = level;
+		apply_assist_current_limit();  // Apply new current scale
+	}
 }
 
 // Hazza throttle state (current control)
@@ -200,17 +213,8 @@ static haz_pas_duty_ctx_t haz_pas_duty_ctx = {
 	.last_step_count = 0
 };
 
-static void haz_pas_duty_reset(void) {
-	haz_pas_duty_ctx.duty_cmd = 0.0f;
-	haz_pas_duty_ctx.target_duty = 0.0f;
-	haz_pas_duty_ctx.cadence_smooth = 0.0f;
-	haz_pas_duty_ctx.idle_time = 0.0f;
-	haz_pas_duty_ctx.startup_progress = 0.0f;
-	haz_pas_duty_ctx.engaged = false;
-}
-
 // Simple PAS duty - cadence-based duty output with smooth ramping
-static float haz_pas_duty_process(const adc_config *conf, float dt_s) {
+static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	if (!conf->haz_pas_duty_enabled) {
 		haz_pas_duty_ctx.duty_cmd = 0.0f;
 		return 0.0f;
@@ -281,24 +285,70 @@ static float haz_pas_duty_process(const adc_config *conf, float dt_s) {
 
 	bool is_idle = (haz_pas_duty_ctx.idle_time > idle_timeout);
 
-	// Get pedal RPM and smooth it
-	float pedal_rpm = app_pas_get_pedal_rpm();
-	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, pedal_rpm, 0.1f);
-
-	// Apply assist level multiplier (1-5 = 20-100%)
-	// In offroad mode: Level 5 = normal VESC limits, 1-4 = reduced power
-	// In street mode: Level is ignored (already limited by speed)
-	float assist_mult = 1.0f;
-	if (mc_interface_is_offroad_mode()) {
-		assist_mult = get_assist_power_multiplier();
+	// Get pedal RPM with MEDIAN FILTER (outlier rejection)
+	// Tunable via VESC Tool settings:
+	// - PAS Duty: LP Smoothing (variation_threshold): 1-10 (1=responsive, 10=smooth)
+	// - PAS Duty: Median Buffer (ramp_rise_time): 3-11 samples
+	
+	// Buffer size: direct integer from setting (3-11 samples)
+	int buf_size = (int)conf->haz_pas_duty_ramp_rise_time;
+	if (buf_size < 3) buf_size = 3;
+	if (buf_size > 11) buf_size = 11;
+	
+	// LP filter: setting 1-10 maps to factor 0.5-0.01 (inverted: 1=responsive, 10=smooth)
+	int lp_setting = (int)conf->haz_pas_duty_variation_threshold;
+	if (lp_setting < 1) lp_setting = 1;
+	if (lp_setting > 10) lp_setting = 10;
+	float lp_factor = 0.5f - (lp_setting - 1) * (0.49f / 9.0f);  // 1→0.5, 10→0.01
+	
+	// Fixed 11-element buffer, always use full buffer for consistency
+	// (changing buf_size only affects how many samples we consider for median)
+	static float rpm_buffer[11] = {0};
+	static int rpm_idx = 0;
+	static int buf_filled = 0;  // Track how many valid samples we have
+	
+	float pedal_rpm_raw = app_pas_get_pedal_rpm();
+	rpm_buffer[rpm_idx] = pedal_rpm_raw;
+	rpm_idx = (rpm_idx + 1) % 11;  // Always wrap at 11
+	if (buf_filled < 11) buf_filled++;
+	
+	// Use minimum of buf_size and buf_filled for median calculation
+	int samples_to_use = (buf_filled < buf_size) ? buf_filled : buf_size;
+	if (samples_to_use < 3) samples_to_use = 3;
+	
+	// Copy most recent samples for sorting
+	float sorted[11];
+	for (int i = 0; i < samples_to_use; i++) {
+		int idx = (rpm_idx - 1 - i + 11) % 11;  // Work backwards from most recent
+		sorted[i] = rpm_buffer[idx];
 	}
+	
+	// Sort (simple insertion sort)
+	for (int i = 1; i < samples_to_use; i++) {
+		float key = sorted[i];
+		int j = i - 1;
+		while (j >= 0 && sorted[j] > key) {
+			sorted[j + 1] = sorted[j];
+			j--;
+		}
+		sorted[j + 1] = key;
+	}
+	
+	// Take median (middle value)
+	float pedal_rpm = sorted[samples_to_use / 2];
+	
+	// LP filter on top (tunable)
+	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, pedal_rpm, lp_factor);
+
+	// Assist level now scales duty target at the output (in app_adc main loop)
+	// This reduces speed/torque proportionally to assist level
 
 	// Calculate target - zero if idle, otherwise from cadence
 	float target_duty = 0.0f;
 	if (!is_idle && haz_pas_duty_ctx.cadence_smooth > 3.0f) {
 		float cadence_ratio = haz_pas_duty_ctx.cadence_smooth / max_cadence;
 		if (cadence_ratio > 1.0f) cadence_ratio = 1.0f;
-		target_duty = cadence_ratio * max_duty * power_scale * speed_power_scale * assist_mult;
+		target_duty = cadence_ratio * max_duty * power_scale * speed_power_scale;
 	}
 
 	// Ramp to target
@@ -651,6 +701,21 @@ static float haz_pas_follow_process(float dt_s) {
 		return 0.0f;
 	}
 
+	// ========== SPEED LIMIT CHECK (STREET MODE ONLY) ==========
+	// PAS current mode also respects 15.5 mph limit in street mode
+	if (!mc_interface_is_offroad_mode()) {
+		const float pas_speed_limit_ms = 15.5f * 0.44704f;  // mph to m/s
+		float wheel_speed = fabsf(mc_interface_get_speed());
+		if (wheel_speed >= pas_speed_limit_ms) {
+			// At or above limit - return zero, force ramp down
+			haz_pas_follow_ctx.current_rel_cmd *= 0.9f; // Quick decay
+			if (haz_pas_follow_ctx.current_rel_cmd < 0.01f) {
+				haz_pas_follow_ctx.current_rel_cmd = 0.0f;
+			}
+			return 0.0f;
+		}
+	}
+
 	const float start_rotations = haz_pas_conf_clamp(
 		pas_conf->pas_follow_start_rotations,
 		PAS_FOLLOW_START_ROTATIONS_DEFAULT,
@@ -927,6 +992,10 @@ static THD_FUNCTION(adc_thread, arg) {
 
 	chRegSetThreadName("APP_ADC");
 	is_running = true;
+	
+	// Apply initial assist current limit based on mode and level
+	apply_assist_current_limit();
+	static bool last_offroad_mode = false;
 
 	for(;;) {
 		// Sleep for a time according to the specified rate
@@ -937,6 +1006,13 @@ static THD_FUNCTION(adc_thread, arg) {
 			sleep_time = 1;
 		}
 		chThdSleep(sleep_time);
+		
+		// Check if offroad mode changed - update assist current limit
+		bool current_offroad = mc_interface_is_offroad_mode();
+		if (current_offroad != last_offroad_mode) {
+			last_offroad_mode = current_offroad;
+			apply_assist_current_limit();
+		}
 
 		if (stop_now) {
 			is_running = false;
@@ -1240,6 +1316,10 @@ static THD_FUNCTION(adc_thread, arg) {
 
 				float throttle_mag = fabsf(pwr);
 				if (throttle_mag > 1.0f) throttle_mag = 1.0f;
+				
+				// Pass throttle position to FOC for FW scaling
+				// (90-100% throttle = FW boost zone)
+				mcpwm_foc_set_throttle_pos(throttle_mag);
 
 				// Throttle ALWAYS takes priority - PAS only when throttle is truly zero
 				bool throttle_active = (throttle_mag > 0.001f);
@@ -1356,48 +1436,95 @@ static THD_FUNCTION(adc_thread, arg) {
 								}
 							}
 							
-							// Apply assist level multiplier (1-5 = 20-100%)
-							// In offroad mode: Level 5 = normal VESC limits, 1-4 = reduced power
-							// In street mode: Level is ignored (already limited by speed)
-							float assist_mult = 1.0f;
-							if (mc_interface_is_offroad_mode()) {
-								assist_mult = get_assist_power_multiplier();
-							}
-							// Street mode: already speed-limited, no assist scaling needed
+							// Assist level scales duty target in offroad mode
+							// (In street mode, speed is limited by speed_scale instead)
+							// This reduces torque by limiting how much duty the motor gets
+							float assist_scale = mc_interface_is_offroad_mode() ?
+								get_assist_power_multiplier() : 1.0f;
 							
-							float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale * assist_mult;
-							float duty_gap = fabsf(duty_target - osf_duty_ramped);
+											// Normal throttle: 0-100% = 0-100% duty
+											// FW boost triggers automatically at 95% duty in FOC layer
+											float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale * assist_scale;
+											float duty_gap = fabsf(duty_target - osf_duty_ramped);
 
+											// Configurable ramp rates (duty/s)
+											// Street mode: VERY slow ramp (0.05/s) to avoid slingshot past speed limit
+											// with low-resolution 1 pulse/rotation speed sensor
+											const bool street_mode = !mc_interface_is_offroad_mode();
+											const float ramp_up_slow = street_mode ? 0.05f : config.haz_hybrid_ramp_up_slow;
+											const float ramp_up_fast = street_mode ? 0.05f : config.haz_hybrid_ramp_up_fast;
+											const float ramp_down_slow = config.haz_hybrid_ramp_down_slow;
+											const float ramp_down_fast = config.haz_hybrid_ramp_down_fast;
 
-							// Configurable ramp rates (duty/s)
-							const float ramp_up_slow = config.haz_hybrid_ramp_up_slow;
-							const float ramp_up_fast = config.haz_hybrid_ramp_up_fast;
-							const float ramp_down_slow = config.haz_hybrid_ramp_down_slow;
-							const float ramp_down_fast = config.haz_hybrid_ramp_down_fast;
+											// =============================================================================
+											// HAZZA: Throttle Velocity + Gap-Based Ramp Scaling
+											// Fast throttle movements = snappy response (up to 3x ramp speed)
+											// Slow/micro throttle movements = precise duty control
+											// Gap-based: big gap = fast ramp, small gap = smooth landing
+											// =============================================================================
+											static float throttle_prev = 0.0f;
+											float throttle_velocity = fabsf(throttle_mag - throttle_prev) / dt_s;
+											throttle_prev = throttle_mag;
+											
+											// Throttle velocity multiplier: 1x at rest, up to 3x when slamming throttle
+											// velocity > 2.0 means moving full range in 0.5s (fast slam)
+											float velocity_mult = 1.0f;
+											if (throttle_velocity > 0.5f) {
+												// Scale from 1x at 0.5/s to 3x at 3.0/s
+												velocity_mult = 1.0f + fminf((throttle_velocity - 0.5f) / 2.5f, 1.0f) * 2.0f;
+											}
+											
+											// Gap-based scaling: big gap = fast ramp, small gap = smooth landing
+											const float fast_threshold = 0.15f;  // Above 15% gap = full fast
+											const float slow_threshold = 0.02f;  // Below 2% gap = full slow
+											float gap_fraction = duty_gap / mcconf->l_max_duty;
+											float gap_ratio;
+											
+											if (gap_fraction >= fast_threshold) {
+												gap_ratio = 1.0f;  // Full fast
+											} else if (gap_fraction <= slow_threshold) {
+												gap_ratio = 0.0f;  // Full slow (smooth landing)
+											} else {
+												// Linear blend between thresholds
+												gap_ratio = (gap_fraction - slow_threshold) / (fast_threshold - slow_threshold);
+											}
 
-							// Scale ramp by how far we are from target
-							float gap_ratio = duty_gap / mcconf->l_max_duty;
-							if (gap_ratio > 1.0f) gap_ratio = 1.0f;
-
-							if (duty_target > osf_duty_ramped) {
-								// Ramping UP
-								float ramp_rate = ramp_up_slow + (ramp_up_fast - ramp_up_slow) * gap_ratio;
-								osf_duty_ramped += ramp_rate * dt_s;
-								if (osf_duty_ramped > duty_target) osf_duty_ramped = duty_target;
-							} else {
-								// Ramping DOWN
-								float ramp_rate = ramp_down_slow + (ramp_down_fast - ramp_down_slow) * gap_ratio;
-								osf_duty_ramped -= ramp_rate * dt_s;
-								if (osf_duty_ramped < duty_target) osf_duty_ramped = duty_target;
+											if (duty_target > osf_duty_ramped) {
+												// Ramping UP - apply both gap ratio and velocity mult
+												float ramp_rate = ramp_up_slow + (ramp_up_fast - ramp_up_slow) * gap_ratio;
+												ramp_rate *= velocity_mult;  // Fast throttle slam = faster ramp
+												osf_duty_ramped += ramp_rate * dt_s;
+												if (osf_duty_ramped > duty_target) osf_duty_ramped = duty_target;
+											} else {
+												// Ramping DOWN - apply both gap ratio and velocity mult
+												float ramp_rate = ramp_down_slow + (ramp_down_fast - ramp_down_slow) * gap_ratio;
+												ramp_rate *= velocity_mult;  // Fast throttle release = quicker response
+												osf_duty_ramped -= ramp_rate * dt_s;
+												if (osf_duty_ramped < duty_target) osf_duty_ramped = duty_target;
 							}
 
 							// Clamp
 							if (osf_duty_ramped < 0.0f) osf_duty_ramped = 0.0f;
 							if (osf_duty_ramped > mcconf->l_max_duty) osf_duty_ramped = mcconf->l_max_duty;
 
-							if (osf_duty_ramped > 0.001f) {
+							// ========== CRITICAL: HARD SPEED LIMIT ENFORCEMENT ==========
+							// Even if ramped duty is high, NEVER allow motor assist above speed limit
+							// This is a safety clamp - applies the speed_scale to the actual output
+							float duty_to_send = osf_duty_ramped;
+							if (!mc_interface_is_offroad_mode()) {
+								// In street mode, hard-limit the duty based on current speed
+								// This ensures motor can NEVER push past the speed limit
+								duty_to_send *= speed_scale;
+								
+								// If we're at or above speed limit, force release motor
+								if (speed_scale <= 0.0f) {
+									duty_to_send = 0.0f;
+								}
+							}
+
+							if (duty_to_send > 0.001f) {
 								mc_interface_set_throttle_limit_active(true);
-								mc_interface_set_duty(pwr >= 0.0f ? osf_duty_ramped : -osf_duty_ramped);
+								mc_interface_set_duty(pwr >= 0.0f ? duty_to_send : -duty_to_send);
 								send_duty = true;
 							} else {
 								mc_interface_release_motor();
@@ -1409,6 +1536,10 @@ static THD_FUNCTION(adc_thread, arg) {
 						// If PAS duty mode is enabled, ONLY use that (no fallback to current PAS)
 						if (config.haz_pas_duty_enabled) {
 							float pas_duty = haz_pas_duty_process(&config, dt_s);
+							// Scale PAS duty by assist level in offroad mode
+							if (mc_interface_is_offroad_mode()) {
+								pas_duty *= get_assist_power_multiplier();
+							}
 							if (pas_duty > 0.001f) {
 								// PAS Duty active - use DUTY control (not current!)
 								osf_duty_ramped = pas_duty;

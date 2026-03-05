@@ -768,13 +768,59 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		app_nunchuk_update_output(&chuck_d_tmp);
 	} break;
 
-	case COMM_CUSTOM_APP_DATA:
+	case COMM_CUSTOM_APP_DATA: {
+		// HAZZA display lock state - prevents HA/HB from overriding when locked
+		static volatile bool display_locked = false;
+		static volatile int pre_lock_boost = 0;
+
+		// Check for Hazza display lock command (process FIRST)
+		// Format: [0x48] [0x4C] [0/1] = "HL" + lock_state
+		// When locked: hard-lock motor (blocks ALL output including duty commands)
+		// When unlocked: restore assist level + boost to pre-lock state
+		if (len >= 3 && data[0] == 0x48 && data[1] == 0x4C) {
+			if (data[2] == 1) {
+				// LOCK: Save boost level, then hard-lock motor
+				pre_lock_boost = mcpwm_foc_get_mtpa_boost();
+				display_locked = true;
+				mc_interface_set_motor_locked(true);
+				mcpwm_foc_set_mtpa_boost(0);
+			} else {
+				// UNLOCK: Remove hard lock, restore assist level and boost
+				display_locked = false;
+				mc_interface_set_motor_locked(false);
+				app_adc_set_assist_level(app_adc_get_assist_level());
+				mcpwm_foc_set_mtpa_boost(pre_lock_boost);
+			}
+		}
 		// Check for Hazza display assist level command
 		// Format: [0x48] [0x41] [level 1-5] = "HA" + level
-		if (len >= 3 && data[0] == 0x48 && data[1] == 0x41) {
+		// Ignored while display_locked to prevent override
+		if (len >= 3 && data[0] == 0x48 && data[1] == 0x41 && !display_locked) {
 			uint8_t level = data[2];
 			if (level >= 1 && level <= 5) {
 				app_adc_set_assist_level(level);
+			}
+		}
+		// Check for Hazza display MTPA boost command
+		// Format: [0x48] [0x42] [level 0-5] = "HB" + level (0=off, 1-5=boost levels)
+		// Ignored while display_locked to prevent override
+		if (len >= 3 && data[0] == 0x48 && data[1] == 0x42 && !display_locked) {
+			int boost_level = data[2];
+			mcpwm_foc_set_mtpa_boost(boost_level);
+		}
+		// Hazza stall detection control
+		// Format: [0x48] [0x53] [cmd] = "HS" + command
+		// cmd=0x01: enable stall monitoring (display connected)
+		// cmd=0x00: restart motor (clear stall condition)
+		// cmd=0xFF: disable stall monitoring (display disconnecting)
+		if (len >= 3 && data[0] == 0x48 && data[1] == 0x53) {
+			uint8_t cmd = data[2];
+			if (cmd == 0x01) {
+				mcpwm_foc_stall_set_enabled(true);
+			} else if (cmd == 0x00) {
+				mcpwm_foc_stall_clear();
+			} else if (cmd == 0xFF) {
+				mcpwm_foc_stall_set_enabled(false);
 			}
 		}
 		if (appdata_func) {
@@ -783,7 +829,7 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 #ifdef USE_LISPBM
 		lispif_process_custom_app_data(data, len);
 #endif
-		break;
+	} break;
 
 	case COMM_CUSTOM_HW_DATA:
 		if (hwdata_func) {

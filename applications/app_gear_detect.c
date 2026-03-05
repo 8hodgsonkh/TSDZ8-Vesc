@@ -118,8 +118,9 @@ int app_gear_detect_get(float speed_kph, int32_t erpm, float duty_cycle, float m
     
     const gear_detection_config *conf = &appconf->gear_detect_conf;
     
-    // Only calculate gear when under load (duty > 5% or motor current > 2A)
-    bool under_load = (duty_cycle > 5.0f) || (motor_amps > 2.0f);
+    // Only calculate gear when chain is tensioned (motor current > 10A)
+    // Hardcoded to match freewheel catch chain tension detection threshold
+    bool under_load = (motor_amps > 10.0f);
     
     int raw_gear = detect_gear_raw(speed_kph, erpm, conf);
     int display_gear = s_last_gear;

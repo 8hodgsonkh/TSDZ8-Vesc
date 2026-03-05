@@ -547,6 +547,7 @@ typedef struct {
 	bool foc_phase_filter_disable_fault;
 	float foc_phase_filter_max_erpm;
 	MTPA_MODE foc_mtpa_mode;
+	bool foc_mtpa_power_cap; // Scale id/iq together to respect battery current limit while maintaining MTPA angle
 	// Field Weakening
 	float foc_fw_current_max;
 	float foc_fw_duty_start;

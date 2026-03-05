@@ -105,6 +105,10 @@ bool mc_street_mode_sensor_bypass_detected(void);  // Safety: wheel sensor missi
 void mc_interface_set_offroad_mode(bool enabled);
 bool mc_interface_is_offroad_mode(void);
 void mc_interface_set_throttle_limit_active(bool active);
+void mc_interface_set_assist_current_scale(float scale);  // HAZZA: 0.2-1.0 for assist levels
+float mc_interface_get_assist_current_scale(void);
+void mc_interface_set_motor_locked(bool locked);    // HAZZA: Hard lock blocks ALL motor output
+bool mc_interface_is_motor_locked(void);
 
 setup_values mc_interface_get_setup_values(void);
 volatile gnss_data *mc_interface_gnss(void);

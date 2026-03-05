@@ -45,6 +45,7 @@
 // Private variables
 static volatile bool m_dccal_done = false;
 static volatile bool m_init_done = false;
+static volatile bool m_stall_enabled = false;  // HAZZA: Stall detection (enabled by display via BLE)
 static volatile motor_all_state_t m_motor_1;
 #ifdef HW_HAS_DUAL_MOTORS
 static volatile motor_all_state_t m_motor_2;
@@ -371,6 +372,7 @@ void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2) {
 	m_motor_1.m_hall_dt_diff_last = 1.0;
 	m_motor_1.m_hall_dt_diff_now = 1.0;
 	m_motor_1.m_ang_hall_int_prev = -1;
+	m_motor_1.m_mtpa_boost_active = true; // HAZZA: Boost ON by default
 	foc_precalc_values((motor_all_state_t*)&m_motor_1);
 	update_hfi_samples(m_motor_1.m_conf->foc_hfi_samples, &m_motor_1);
 	init_audio_state(&m_motor_1.m_audio);
@@ -706,6 +708,7 @@ void mcpwm_foc_stop_pwm(bool is_second_motor) {
 
 	motor->m_control_mode = CONTROL_MODE_NONE;
 	motor->m_state = MC_STATE_OFF;
+
 	stop_pwm_hw(motor);
 }
 
@@ -815,10 +818,11 @@ void mcpwm_foc_set_current(float current) {
 }
 
 void mcpwm_foc_release_motor(void) {
-	get_motor_now()->m_control_mode = CONTROL_MODE_CURRENT;
-	get_motor_now()->m_iq_set = 0.0;
-	get_motor_now()->m_id_set = 0.0;
-	get_motor_now()->m_motor_released = true;
+	volatile motor_all_state_t *motor = get_motor_now();
+	motor->m_control_mode = CONTROL_MODE_CURRENT;
+	motor->m_iq_set = 0.0;
+	motor->m_id_set = 0.0;
+	motor->m_motor_released = true;
 }
 
 /**
@@ -1101,6 +1105,75 @@ void mcpwm_foc_get_observer_state(float *x1, float *x2) {
 	*x2 = motor->m_observer_state.x2;
 }
 
+// HAZZA MID-DRIVE: Get tracking status for debugging/monitoring
+// tracking_quality: 0.0 = lost, 1.0 = perfect tracking
+// safe_power_limit: Current max duty we're allowing
+// power_scale: How much we've reduced power (1.0 = full, 0.3 = minimum)
+void mcpwm_foc_get_tracking_status(float *tracking_quality, float *safe_power_limit, float *power_scale) {
+	volatile motor_all_state_t *motor = get_motor_now();
+	*tracking_quality = motor->m_tracking_quality;
+	*safe_power_limit = motor->m_safe_power_limit;
+	*power_scale = motor->m_power_scale;
+}
+
+float mcpwm_foc_get_tracking_quality_now(void) {
+	return get_motor_now()->m_tracking_quality;
+}
+
+// HAZZA: Manual MTPA boost button control (for ESP32 display)
+// When active, enables duty-based field weakening boost
+// Level 0 = off, Level 1-5 = increasing field weakening
+void mcpwm_foc_set_mtpa_boost(int level) {
+	bool active = (level > 0 && level <= 5);
+	int clamped_level = active ? level : 0;
+	
+	// Set on BOTH motors to be safe (single motor setup still works)
+	m_motor_1.m_mtpa_boost_active = active;
+	m_motor_1.m_mtpa_boost_level = clamped_level;
+	if (!active) m_motor_1.m_mtpa_boost_iq = 0.0f;  // Reset ramp when disabled
+#ifdef HW_HAS_DUAL_MOTORS
+	m_motor_2.m_mtpa_boost_active = active;
+	m_motor_2.m_mtpa_boost_level = clamped_level;
+	if (!active) m_motor_2.m_mtpa_boost_iq = 0.0f;
+#endif
+}
+
+int mcpwm_foc_get_mtpa_boost(void) {
+	return m_motor_1.m_mtpa_boost_active ? m_motor_1.m_mtpa_boost_level : 0;
+}
+
+// HAZZA: Get MTPV debug info
+float mcpwm_foc_get_mtpv_id(void) {
+	return m_motor_1.m_mtpa_boost_iq;  // Current -Id offset being applied
+}
+
+float mcpwm_foc_get_throttle_pos(void) {
+	return m_motor_1.m_throttle_pos;
+}
+
+float mcpwm_foc_get_fw_mod(void) {
+	return m_motor_1.m_fw_mod_now;
+}
+
+bool mcpwm_foc_get_fw_at_ceiling(void) {
+	return m_motor_1.m_fw_at_ceiling;
+}
+
+bool mcpwm_foc_get_fw_in_boost(void) {
+	return m_motor_1.m_fw_in_boost;
+}
+
+// HAZZA: Set throttle position for FW scaling (0-1)
+// Called from app_adc so FOC knows where throttle is
+void mcpwm_foc_set_throttle_pos(float throttle) {
+	if (throttle < 0.0f) throttle = 0.0f;
+	if (throttle > 1.0f) throttle = 1.0f;
+	m_motor_1.m_throttle_pos = throttle;
+#ifdef HW_HAS_DUAL_MOTORS
+	m_motor_2.m_throttle_pos = throttle;
+#endif
+}
+
 /**
  * Set current off delay. Prevent the current controller from switching off modulation
  * for target currents < cc_min_current for this amount of time.
@@ -1109,6 +1182,38 @@ void mcpwm_foc_set_current_off_delay(float delay_sec) {
 	if (get_motor_now()->m_current_off_delay < delay_sec) {
 		get_motor_now()->m_current_off_delay = delay_sec;
 	}
+}
+
+// =============================================================================
+// HAZZA: Stall Detection API
+// =============================================================================
+void mcpwm_foc_stall_set_enabled(bool enabled) {
+	m_stall_enabled = enabled;
+	if (!enabled) {
+		// Clear any active stall when disabling
+		m_motor_1.m_stall_active = false;
+		m_motor_1.m_stall_reason = STALL_REASON_NONE;
+		m_motor_1.m_stall_timer = 0.0f;
+	}
+}
+
+bool mcpwm_foc_stall_is_active(void) {
+	return m_motor_1.m_stall_active;
+}
+
+uint8_t mcpwm_foc_stall_get_reason(void) {
+	return m_motor_1.m_stall_reason;
+}
+
+void mcpwm_foc_stall_clear(void) {
+	m_motor_1.m_stall_active = false;
+	m_motor_1.m_stall_reason = STALL_REASON_NONE;
+	m_motor_1.m_stall_timer = 0.0f;
+	m_motor_1.m_stall_current_var = 0.0f;
+	m_motor_1.m_stall_tracking_osc = 0.0f;
+	// Remove hard lock and restore motor power from assist level
+	mc_interface_set_motor_locked(false);
+	app_adc_set_assist_level(app_adc_get_assist_level());
 }
 
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor) {
@@ -3410,9 +3515,27 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			} else {
 				// If the duty cycle is less than or equal to the set duty cycle just limit
 				// the modulation and use the maximum allowed current.
+				// 
+				// HAZZA FIX: At very low duty, scale current proportionally instead of using max.
+				// This prevents violent vibration/arcing when duty is tiny but current is maxed.
+				// Also respect l_min_duty - below this threshold, don't drive the motor at all.
+				const float min_duty = conf_now->l_min_duty;
+				const float duty_abs_set = fabsf(duty_set);
+				
 				motor_now->m_duty_i_term = state_now->iq / current_max_for_duty;
 				state_now->max_duty = duty_set;
-				if (duty_set > 0.0) {
+				
+				if (duty_abs_set < min_duty) {
+					// Below minimum duty - don't drive motor
+					iq_set_tmp = 0.0;
+				} else if (duty_abs_set < 0.05) {
+					// Low duty (< 5%) - scale current proportionally to prevent stall vibration
+					// This ramps from 0 current at min_duty to full current at 5% duty
+					float current_scale = (duty_abs_set - min_duty) / (0.05 - min_duty);
+					if (current_scale < 0.0) current_scale = 0.0;
+					if (current_scale > 1.0) current_scale = 1.0;
+					iq_set_tmp = SIGN(duty_set) * current_scale * current_max_for_duty;
+				} else if (duty_set > 0.0) {
 					iq_set_tmp = current_max_for_duty;
 				} else {
 					iq_set_tmp = -current_max_for_duty;
@@ -3559,18 +3682,145 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		FOC_PROFILE_LINE_FINE();
 
 		// Apply MTPA. See: https://github.com/vedderb/bldc/pull/179
+		// Only enable above 250 ERPM to prevent stall vibration at startup
 		const float ld_lq_diff = conf_now->foc_motor_ld_lq_diff;
+		const float erpm_now = fabsf(RADPS2RPM_f(motor_now->m_pll_speed));
 		if (conf_now->foc_mtpa_mode != MTPA_MODE_OFF && ld_lq_diff != 0.0 &&
-				motor_now->m_control_mode != CONTROL_MODE_OPENLOOP_PHASE) {
+				motor_now->m_control_mode != CONTROL_MODE_OPENLOOP_PHASE &&
+				erpm_now > 250.0f) {
 			const float lambda = conf_now->foc_motor_flux_linkage;
 
 			float iq_ref = iq_set_tmp;
 			if (conf_now->foc_mtpa_mode == MTPA_MODE_IQ_MEASURED) {
 				iq_ref = utils_min_abs(iq_set_tmp, state_now->iq_filter);
 			}
+			// IQ_TARGET mode: Use commanded iq directly (default behavior)
 
-			id_set_tmp = (lambda - sqrtf(SQ(lambda) + 8.0 * SQ(ld_lq_diff * iq_ref))) / (4.0 * ld_lq_diff);
-			iq_set_tmp = SIGN(iq_set_tmp) * sqrtf(SQ(iq_set_tmp) - SQ(id_set_tmp));
+			// HAZZA FIX: When MTPA boost (FW via MTPA path) is active, always use
+			// measured Iq for the MTPA formula, regardless of mode setting.
+			// In duty mode the duty controller commands lo_current_max (assist-scaled)
+			// as Iq even at no-load. The MTPA formula takes this phantom command and
+			// generates proportional -Id for torque-angle optimization. At assist 5
+			// that can be -25A+ of MTPA Id on top of the boost's -18A = over-demagnetization
+			// that kills top speed. Using measured Iq means MTPA only generates Id
+			// proportional to ACTUAL torque current, so under no-load MTPA Id ≈ 0
+			// and only the boost Id provides flux weakening — assist-independent.
+			if (motor_now->m_mtpa_boost_active && motor_now->m_mtpa_boost_iq < -0.1f) {
+				iq_ref = utils_min_abs(iq_set_tmp, state_now->iq_filter);
+			}
+
+			// Calculate optimal MTPA id for this iq
+			float id_mtpa = (lambda - sqrtf(SQ(lambda) + 8.0 * SQ(ld_lq_diff * iq_ref))) / (4.0 * ld_lq_diff);
+			float iq_mtpa = SIGN(iq_set_tmp) * sqrtf(SQ(iq_set_tmp) - SQ(id_mtpa));
+
+			// =============================================================================
+			// HAZZA: Simple Field Weakening with Boost Level
+			// When approaching duty ceiling (90-95%), ramp up negative Id
+			// At 90% duty = 0% FW, at 95% duty = 100% FW
+			// Boost level controls max FW: Level N = max -3.6N amps
+			//   Level 0 = disabled, Level 5 = -18A max
+			// FW effect increases ERPM beyond what voltage alone can do.
+			// =============================================================================
+			if (motor_now->m_mtpa_boost_active) {
+				const float omega_e = erpm_now * (2.0f * M_PI / 60.0f);  // Electrical rad/s
+				
+				// Check modulation depth
+				float mod_now = sqrtf(SQ(state_now->mod_d) + SQ(state_now->mod_q_filter));
+				const float fw_start = conf_now->l_max_duty * 0.90f;  // Start FW at 90%
+				const float fw_full = conf_now->l_max_duty * 0.95f;   // Full FW at 95%
+				bool in_fw_zone = (mod_now > fw_start);
+				
+				// Store for debug
+				motor_now->m_fw_mod_now = mod_now;
+				motor_now->m_fw_at_ceiling = (mod_now > fw_full * 0.99f);
+				motor_now->m_fw_in_boost = in_fw_zone;
+				
+				float id_fw_target = 0.0f;
+				if (in_fw_zone && omega_e > 100.0f) {
+					// Scale 0-1 from 90% to 95% duty
+					// At 90% = 0, at 92.5% = 0.5, at 95% = 1.0
+					float fw_depth = (mod_now - fw_start) / (fw_full - fw_start);
+					fw_depth = fmaxf(0.0f, fminf(1.0f, fw_depth));
+					
+					// Max FW current based on boost level: Level N = -3.6N amps
+					// Level 5 = -18A max
+					float id_fw_max = -3.6f * motor_now->m_mtpa_boost_level;
+					
+					// Target scales with depth into FW zone
+					id_fw_target = id_fw_max * fw_depth;
+				}
+				
+				// Ramp towards target for smooth transitions
+				const float ramp_rate = 0.001f;  // ~30A/s at 30kHz (0.33s to 10A)
+				
+				if (motor_now->m_mtpa_boost_iq > id_fw_target) {
+					motor_now->m_mtpa_boost_iq -= ramp_rate;
+					if (motor_now->m_mtpa_boost_iq < id_fw_target) {
+						motor_now->m_mtpa_boost_iq = id_fw_target;
+					}
+				} else if (motor_now->m_mtpa_boost_iq < id_fw_target) {
+					motor_now->m_mtpa_boost_iq += ramp_rate;
+					if (motor_now->m_mtpa_boost_iq > id_fw_target) {
+						motor_now->m_mtpa_boost_iq = id_fw_target;
+					}
+				}
+				
+				// Apply the field weakening offset to Id
+				id_mtpa += motor_now->m_mtpa_boost_iq;
+			} else {
+				// Boost disabled - ramp back to zero
+				if (motor_now->m_mtpa_boost_iq < 0.0f) {
+					motor_now->m_mtpa_boost_iq += 0.001f;
+					if (motor_now->m_mtpa_boost_iq > 0.0f) {
+						motor_now->m_mtpa_boost_iq = 0.0f;
+					}
+				}
+			}
+
+			// =============================================================================
+			// HAZZA: Power-Capped MTPA
+			// Standard MTPA keeps motor current magnitude constant but ignores battery power.
+			// For high-saliency IPM motors, the id component adds significant battery draw.
+			// This mode scales the entire MTPA vector down to respect battery current limits.
+			// =============================================================================
+			if (conf_now->foc_mtpa_power_cap) {
+				// Estimate battery current for this MTPA current vector
+				// I_batt = mod_d * id + mod_q * iq
+				// We use the measured/filtered modulation values as our best estimate
+				const float mod_d = state_now->mod_d;
+				const float mod_q = state_now->mod_q_filter;
+				
+				// Predicted battery current with MTPA currents
+				float i_batt_mtpa = mod_d * id_mtpa + mod_q * iq_mtpa;
+				
+				// Check against battery current limit
+				float i_batt_limit = (iq_mtpa > 0) ? conf_now->lo_in_current_max : -conf_now->lo_in_current_min;
+				
+				if (fabsf(i_batt_mtpa) > fabsf(i_batt_limit) && fabsf(i_batt_mtpa) > 0.1f) {
+					// HAZZA FIX: Only scale the torque components (MTPA id + iq),
+					// but preserve the FW id component (m_mtpa_boost_iq) unscaled.
+					//
+					// The power cap prediction uses COMMANDED iq which can be much
+					// higher than actual iq (especially at no-load / high RPM where
+					// voltage saturation limits real current). Scaling the FW -id
+					// proportionally based on this phantom iq kills field weakening
+					// and inversely correlates assist level with no-load top speed.
+					//
+					// FW -id creates mostly reactive power (circulating, not drawn
+					// from the battery), so preserving it doesn't risk battery overcurrent.
+					float id_fw = motor_now->m_mtpa_boost_iq;  // FW component (negative)
+					float id_pure_mtpa = id_mtpa - id_fw;      // Pure MTPA component
+					float scale = fabsf(i_batt_limit / i_batt_mtpa);
+					if (scale < 1.0f) {
+						id_pure_mtpa *= scale;
+						iq_mtpa *= scale;
+						id_mtpa = id_pure_mtpa + id_fw;  // Reconstruct with unscaled FW
+					}
+				}
+			}
+
+			id_set_tmp = id_mtpa;
+			iq_set_tmp = iq_mtpa;
 		}
 
 		const float mod_q = state_now->mod_q_filter;
@@ -3604,8 +3854,32 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		}
 
 		float current_max_abs = fabsf(utils_max_abs(conf_now->lo_current_max, conf_now->lo_current_min));
-		utils_truncate_number_abs(&id_set_tmp, current_max_abs);
-		utils_truncate_number_abs(&iq_set_tmp, sqrtf(SQ(current_max_abs) - SQ(id_set_tmp)));
+
+		// HAZZA: When MTPA boost (field weakening) is active, the FW Id component
+		// must NOT be clamped by the assist-scaled current limit. The assist level
+		// should only limit torque (Iq), not the flux-weakening current (Id).
+		// Without this, high assist levels push the motor into the ERPM cutback zone
+		// where lo_current_max drops toward 0, killing the FW Id and preventing boost.
+		//
+		// HAZZA FIX v2: Also use unscaled limit for the Iq HEADROOM calculation.
+		// Previously headroom used assist-scaled current_max_abs, so at low assist
+		// (e.g. 20A) the boost Id (-18A) consumed nearly all headroom leaving
+		// Iq ≈ 0 — motor lost all torque authority. Iq is ALREADY clamped to
+		// lo_current_max (assist-scaled) by the truncate above, so using the
+		// unscaled limit here just prevents the Id/Iq circle constraint from
+		// double-penalizing the assist scaling. The motor's physical current
+		// rating (unscaled) is the correct circle to enforce.
+		if (motor_now->m_mtpa_boost_active && motor_now->m_mtpa_boost_iq < -0.1f) {
+			// Use unscaled motor current max for BOTH Id clamping AND Iq headroom
+			float id_limit = conf_now->l_current_max * conf_now->l_current_max_scale;
+			utils_truncate_number_abs(&id_set_tmp, id_limit);
+			// Iq headroom from the unscaled current circle (Iq already assist-clamped above)
+			float iq_headroom = SQ(id_limit) - SQ(id_set_tmp);
+			utils_truncate_number_abs(&iq_set_tmp, iq_headroom > 0.0f ? sqrtf(iq_headroom) : 0.0f);
+		} else {
+			utils_truncate_number_abs(&id_set_tmp, current_max_abs);
+			utils_truncate_number_abs(&iq_set_tmp, sqrtf(SQ(current_max_abs) - SQ(id_set_tmp)));
+		}
 
 		if (!state_now->id_override_hfi) {
 			state_now->id_target = id_set_tmp;
@@ -3989,7 +4263,8 @@ static void timer_update(motor_all_state_t *motor, float dt) {
 	utils_truncate_number_abs(&openloop_rpm_max, conf_now->foc_openloop_rpm);
 
 	float openloop_rpm = openloop_rpm_max;
-	if (conf_now->foc_sensor_mode != FOC_SENSOR_MODE_ENCODER) {
+	if (conf_now->foc_sensor_mode != FOC_SENSOR_MODE_ENCODER &&
+			conf_now->foc_sensor_mode != FOC_SENSOR_MODE_HALL) {
 		float time_fwd = t_lock + t_ramp + t_const - motor->m_min_rpm_timer;
 		if (time_fwd < t_lock) {
 			openloop_rpm = 0.0;
@@ -4019,8 +4294,10 @@ static void timer_update(motor_all_state_t *motor, float dt) {
 		motor->m_min_rpm_hyst_timer -= dt;
 	}
 
-	// Don't use this in brake mode.
+	// Don't use this in brake mode, or in hall sensor mode (hall sensors provide
+	// angle at all speeds, openloop override is not needed and causes restart bugs).
 	if (motor->m_control_mode == CONTROL_MODE_CURRENT_BRAKE ||
+			conf_now->foc_sensor_mode == FOC_SENSOR_MODE_HALL ||
 			(motor->m_state == MC_STATE_RUNNING && fabsf(motor->m_motor_state.duty_now) < 0.001)) {
 		motor->m_min_rpm_hyst_timer = 0.0;
 		motor->m_min_rpm_timer = 0.0;
@@ -4109,6 +4386,89 @@ static void timer_update(motor_all_state_t *motor, float dt) {
 		UTILS_LP_FAST(motor->m_conf->foc_offsets_current[0], motor->m_currents_adc[0], 0.0001);
 		UTILS_LP_FAST(motor->m_conf->foc_offsets_current[1], motor->m_currents_adc[1], 0.0001);
 		UTILS_LP_FAST(motor->m_conf->foc_offsets_current[2], motor->m_currents_adc[2], 0.0001);
+	}
+
+	// =============================================================================
+	// HAZZA MID-DRIVE: Stall Detection
+	// Uses observer intelligence to detect when motor isn't running correctly.
+	// Only active when m_stall_enabled is true (set by ESP32 display via BLE).
+	// On stall: zeros current scale, sends notification to display.
+	// =============================================================================
+	if (m_stall_enabled && !motor->m_stall_active && motor->m_state == MC_STATE_RUNNING) {
+		const float abs_current = mcpwm_foc_get_abs_motor_current();
+		const float rpm = mcpwm_foc_get_rpm();
+		const float tracking = motor->m_tracking_quality;
+		const float erpm_abs = fabsf(rpm);
+
+		// --- Current variance ("machine gun" pattern detection) ---
+		const float current_delta = fabsf(abs_current - motor->m_stall_current_prev);
+		UTILS_LP_FAST(motor->m_stall_current_var, current_delta, 0.01f);
+		motor->m_stall_current_prev = abs_current;
+
+		// --- Tracking quality oscillation detector ---
+		const float tracking_delta = fabsf(tracking - motor->m_stall_tracking_prev);
+		UTILS_LP_FAST(motor->m_stall_tracking_osc, tracking_delta, 0.01f);
+		motor->m_stall_tracking_prev = tracking;
+
+		// --- Detection logic ---
+		uint8_t reason = STALL_REASON_NONE;
+
+		// HARD STALL: Drawing current but not spinning
+		if (abs_current > 3.0f && erpm_abs < 50.0f) {
+			motor->m_stall_timer += dt;
+			if (motor->m_stall_timer > 1.0f) {
+				reason = STALL_REASON_HARD_STALL;
+			}
+		}
+		// OBSERVER LOST: Tracking quality collapsed while trying to drive
+		else if (abs_current > 2.0f && tracking < 0.2f) {
+			motor->m_stall_timer += dt;
+			if (motor->m_stall_timer > 0.5f) {
+				reason = STALL_REASON_OBSERVER_LOST;
+			}
+		}
+		// GEAR DAMAGE: High current variance (erratic "machine gun" draw)
+		else if (abs_current > 2.0f && motor->m_stall_current_var > 5.0f && erpm_abs < 500.0f) {
+			motor->m_stall_timer += dt;
+			if (motor->m_stall_timer > 1.5f) {
+				reason = STALL_REASON_GEAR_DAMAGE;
+			}
+		}
+		// CLUTCH FAILURE: Tracking oscillating rapidly (observer bouncing)
+		else if (abs_current > 2.0f && motor->m_stall_tracking_osc > 0.15f && erpm_abs < 300.0f) {
+			motor->m_stall_timer += dt;
+			if (motor->m_stall_timer > 2.0f) {
+				reason = STALL_REASON_CLUTCH_FAILURE;
+			}
+		}
+		// PHASE TIMING: Power scale bottomed out (controller gave up)
+		else if (motor->m_power_scale <= 0.31f && abs_current > 1.0f) {
+			motor->m_stall_timer += dt;
+			if (motor->m_stall_timer > 3.0f) {
+				reason = STALL_REASON_PHASE_TIMING;
+			}
+		}
+		else {
+			// Conditions not met — decay timer
+			utils_step_towards(&motor->m_stall_timer, 0.0f, dt * 2.0f);
+		}
+
+		// TRIGGER STALL
+		if (reason != STALL_REASON_NONE) {
+			motor->m_stall_active = true;
+			motor->m_stall_reason = reason;
+			motor->m_stall_timer = 0.0f;
+			// Hard-lock motor (blocks ALL output including duty commands)
+			mc_interface_set_motor_locked(true);
+			// Notify display via COMM_CUSTOM_APP_DATA: "HS" + reason
+			uint8_t notify[3] = {0x48, 0x53, reason};  // "HS" + reason byte
+			commands_send_app_data(notify, 3);
+		}
+	} else if (!m_stall_enabled || motor->m_state != MC_STATE_RUNNING) {
+		// Reset timers when motor not running or stall detection disabled
+		motor->m_stall_timer = 0.0f;
+		motor->m_stall_current_var = 0.0f;
+		motor->m_stall_tracking_osc = 0.0f;
 	}
 }
 
@@ -4554,6 +4914,15 @@ static void control_current(motor_all_state_t *motor, float dt) {
 
 	float max_duty = fabsf(state_m->max_duty);
 	utils_truncate_number(&max_duty, 0.0, conf_now->l_max_duty);
+	
+	// =============================================================================
+	// HAZZA MID-DRIVE: Apply safe power limit in CURRENT control mode
+	// When tracking is bad, we limit how much voltage can be applied.
+	// This prevents the runaway feedback loop that causes grinding/lockup.
+	// =============================================================================
+	if (motor->m_control_mode == CONTROL_MODE_CURRENT && motor->m_safe_power_limit > 0.01f) {
+		max_duty = fminf(max_duty, motor->m_safe_power_limit);
+	}
 
 	// Park transform: transforms the currents from stator to the rotor reference frame
 	state_m->id = c * state_m->i_alpha + s * state_m->i_beta;
@@ -4613,6 +4982,29 @@ static void control_current(motor_all_state_t *motor, float dt) {
 
 	state_m->vd -= dec_vd; //Negative sign as in the PMSM equations
 	state_m->vq += dec_vq + dec_bemf;
+	
+	// =============================================================================
+	// HAZZA MID-DRIVE: Smooth voltage changes when tracking is poor
+	// Sudden voltage jumps confuse position tracking even more.
+	// When tracking quality is low, we smooth out voltage changes.
+	// =============================================================================
+	if (motor->m_control_mode == CONTROL_MODE_CURRENT && motor->m_tracking_quality < 0.8f) {
+		// How much can voltage change per cycle? Less when tracking is bad.
+		const float smoothing_strength = 0.5f + 0.5f * motor->m_tracking_quality;  // 0.5 to 1.0
+		const float max_voltage_change = state_m->v_bus * 0.1f * smoothing_strength;
+		
+		// Limit how fast voltage can change
+		float voltage_delta = state_m->vq - motor->m_voltage_smoothed;
+		utils_truncate_number(&voltage_delta, -max_voltage_change, max_voltage_change);
+		motor->m_voltage_smoothed += voltage_delta;
+		
+		// Blend smoothed and raw voltage based on tracking quality
+		// Bad tracking = more smoothing, Good tracking = more raw
+		state_m->vq = motor->m_voltage_smoothed * (1.0f - motor->m_tracking_quality) + 
+		              state_m->vq * motor->m_tracking_quality;
+	} else {
+		motor->m_voltage_smoothed = state_m->vq;  // Keep tracking when not smoothing
+	}
 
 	// Calculate the max length of the voltage space vector without overmodulation.
 	// Is simply 1/sqrt(3) * v_bus. See https://microchipdeveloper.com/mct5001:start. Adds margin with max_duty.

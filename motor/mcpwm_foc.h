@@ -138,7 +138,32 @@ void mcpwm_foc_get_currents_adc(
 float mcpwm_foc_get_ts(void);
 bool mcpwm_foc_is_using_encoder(void);
 void mcpwm_foc_get_observer_state(float *x1, float *x2);
+// HAZZA MID-DRIVE: Observer confidence monitoring
+void mcpwm_foc_get_tracking_status(float *tracking_quality, float *safe_power_limit, float *power_scale);
+float mcpwm_foc_get_tracking_quality_now(void);
+// HAZZA: Manual MTPA boost button control (for ESP32 display)
+void mcpwm_foc_set_mtpa_boost(int level);  // 0=off, 1-5=boost levels
+int mcpwm_foc_get_mtpa_boost(void);
+float mcpwm_foc_get_mtpv_id(void);         // Get current MTPV -Id offset
+float mcpwm_foc_get_throttle_pos(void);    // Get throttle position sent to FOC
+void mcpwm_foc_set_throttle_pos(float throttle);  // 0-1 for FW scaling
+float mcpwm_foc_get_fw_mod(void);          // Debug: current modulation
+bool mcpwm_foc_get_fw_at_ceiling(void);    // Debug: at duty ceiling?
+bool mcpwm_foc_get_fw_in_boost(void);      // Debug: in boost zone?
 void mcpwm_foc_set_current_off_delay(float delay_sec);
+
+// HAZZA: Stall detection for mid-drive safety
+// Only active when display is connected (stall_enabled=true)
+#define STALL_REASON_NONE              0x00
+#define STALL_REASON_HARD_STALL        0x01  // Motor not spinning despite current
+#define STALL_REASON_OBSERVER_LOST     0x02  // Tracking quality collapsed
+#define STALL_REASON_GEAR_DAMAGE       0x03  // Abnormal current pattern (stripping)
+#define STALL_REASON_CLUTCH_FAILURE    0x04  // Oscillating engagement (one-way bearing)
+#define STALL_REASON_PHASE_TIMING      0x05  // Back-EMF doesn't match expected
+void mcpwm_foc_stall_set_enabled(bool enabled);  // ESP32 enables/disables
+bool mcpwm_foc_stall_is_active(void);             // Check if stall is active
+uint8_t mcpwm_foc_stall_get_reason(void);         // Get stall reason code
+void mcpwm_foc_stall_clear(void);                 // Clear stall (restart motor)
 
 // Functions where the motor can be selected
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor);
