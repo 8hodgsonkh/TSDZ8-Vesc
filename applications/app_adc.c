@@ -1436,15 +1436,14 @@ static THD_FUNCTION(adc_thread, arg) {
 								}
 							}
 							
-							// Assist level scales duty target in offroad mode
-							// (In street mode, speed is limited by speed_scale instead)
-							// This reduces torque by limiting how much duty the motor gets
-							float assist_scale = mc_interface_is_offroad_mode() ?
-								get_assist_power_multiplier() : 1.0f;
+							// Assist level is applied via current scaling only
+							// (mc_interface_set_assist_current_scale in apply_assist_current_limit)
+							// Duty target is NOT scaled by assist — must reach l_max_duty
+							// for field weakening to engage at 90% duty threshold
 							
 											// Normal throttle: 0-100% = 0-100% duty
 											// FW boost triggers automatically at 95% duty in FOC layer
-											float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale * assist_scale;
+											float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale;
 											float duty_gap = fabsf(duty_target - osf_duty_ramped);
 
 											// Configurable ramp rates (duty/s)
