@@ -1539,6 +1539,60 @@ float mcpwm_foc_get_mod_beta_raw(void) {
 	return get_motor_now()->m_motor_state.mod_beta_raw;
 }
 
+/**
+ * HAZZA: Get packed performance analytics metrics.
+ * Returns 4 uint8 values packed into a uint32:
+ *   Byte 0 (bits 0-7):   power_factor  (0-200 = 0.0-1.0, |Iq|/|Itotal|)
+ *   Byte 1 (bits 8-15):  voltage_sat   (0-200 = 0.0-1.0, modulation depth)
+ *   Byte 2 (bits 16-23): iq_tracking   (0-200 = 0.0-1.0, command tracking quality)
+ *   Byte 3 (bits 24-31): torque_angle  (0-180, degrees, current vector angle in d-q plane)
+ *
+ * Power factor: How much of total current produces torque. 1.0 = pure Iq (ideal).
+ *   Drops during field weakening or MTPA when Id is nonzero.
+ * Voltage saturation: How close to the voltage limit circle. 1.0 = fully saturated.
+ *   At 1.0 the controller can't command more voltage — physics wall.
+ * Iq tracking: How well measured Iq follows commanded Iq. 1.0 = perfect.
+ *   Low values mean voltage-starved, bad PI gains, or oscillation.
+ * Torque angle: atan2(-Id, Iq) in degrees. 0° = pure Iq (no MTPA/FW).
+ *   Nonzero shows MTPA reluctance torque angle + field weakening depth combined.
+ *   This is the FOC equivalent of the "phase advance" setting in trapezoidal drives.
+ */
+uint32_t mcpwm_foc_get_perf_metrics(void) {
+	volatile const motor_all_state_t *motor = get_motor_now();
+	const volatile motor_state_t *st = &motor->m_motor_state;
+
+	// --- Power Factor: |Iq| / sqrt(Id² + Iq²) ---
+	float id_f = st->id_filter;
+	float iq_f = st->iq_filter;
+	float i_total = sqrtf(SQ(id_f) + SQ(iq_f));
+	float pf = (i_total > 0.5f) ? (fabsf(iq_f) / i_total) : 1.0f;  // Default 1.0 at near-zero current
+	uint8_t pf_byte = (uint8_t)(fminf(pf, 1.0f) * 200.0f);
+
+	// --- Voltage Saturation: sqrt(mod_d² + mod_q²) ---
+	float mod_mag = sqrtf(SQ(st->mod_d) + SQ(st->mod_q_filter));
+	uint8_t vsat_byte = (uint8_t)(fminf(mod_mag, 1.0f) * 200.0f);
+
+	// --- Iq Tracking: 1 - |iq_error| / |iq_target| ---
+	float iq_target = st->iq_target;
+	float iq_err = fabsf(iq_f - iq_target);
+	float iq_ref = fmaxf(fabsf(iq_target), 1.0f);  // Avoid div-by-zero, 1A floor
+	float tracking = 1.0f - fminf(iq_err / iq_ref, 1.0f);
+	uint8_t track_byte = (uint8_t)(tracking * 200.0f);
+
+	// --- Torque Angle: atan2(-Id, Iq) in degrees ---
+	// 0° = pure q-axis (no MTPA/FW), increases with MTPA + field weakening
+	float angle_rad = atan2f(-id_f, fabsf(iq_f) + 0.01f);  // +0.01 avoids atan2(0,0)
+	float angle_deg = angle_rad * (180.0f / M_PI);
+	if (angle_deg < 0.0f) angle_deg = 0.0f;
+	if (angle_deg > 180.0f) angle_deg = 180.0f;
+	uint8_t angle_byte = (uint8_t)angle_deg;
+
+	return ((uint32_t)angle_byte << 24) |
+	       ((uint32_t)track_byte << 16) |
+	       ((uint32_t)vsat_byte  << 8)  |
+	       ((uint32_t)pf_byte);
+}
+
 float mcpwm_foc_get_mod_alpha_measured(void) {
 	return get_motor_now()->m_motor_state.mod_alpha_measured;
 }

@@ -110,6 +110,25 @@ float mc_interface_get_assist_current_scale(void);
 void mc_interface_set_motor_locked(bool locked);    // HAZZA: Hard lock blocks ALL motor output
 bool mc_interface_is_motor_locked(void);
 
+// HAZZA: Bottleneck/limit detector — bitmask showing what's currently limiting performance
+// Computed each timer tick in update_override_limits(), 0 = no active limits
+#define BOTTLENECK_MOTOR_CURRENT    (1 << 0)  // Motor phase current at effective limit
+#define BOTTLENECK_BATT_CURRENT     (1 << 1)  // Battery input current at limit
+#define BOTTLENECK_DUTY             (1 << 2)  // Duty cycle / voltage headroom exhausted
+#define BOTTLENECK_ERPM             (1 << 3)  // ERPM at speed limit
+#define BOTTLENECK_TEMP_FET         (1 << 4)  // FET temperature derating active
+#define BOTTLENECK_TEMP_MOTOR       (1 << 5)  // Motor temperature derating active
+#define BOTTLENECK_WATT             (1 << 6)  // Watt limit reached
+#define BOTTLENECK_BATT_VOLTAGE     (1 << 7)  // Battery voltage near cutoff
+uint16_t mc_interface_get_bottleneck_reasons(void);
+
+// HAZZA: Performance analytics — 4 packed uint8 metrics
+// Byte 0: power_factor (0-200 = 0-100%, Iq/Itotal)
+// Byte 1: voltage_sat (0-200 = 0-100%, modulation depth)
+// Byte 2: iq_tracking (0-200 = 0-100%, how well Iq follows target)
+// Byte 3: torque_angle (0-180, degrees, current vector angle)
+uint32_t mc_interface_get_perf_metrics(void);
+
 setup_values mc_interface_get_setup_values(void);
 volatile gnss_data *mc_interface_gnss(void);
 

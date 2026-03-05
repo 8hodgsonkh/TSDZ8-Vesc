@@ -86,6 +86,7 @@ float mcpwm_foc_get_vd(void);
 float mcpwm_foc_get_vq(void);
 float mcpwm_foc_get_mod_alpha_raw(void);
 float mcpwm_foc_get_mod_beta_raw(void);
+uint32_t mcpwm_foc_get_perf_metrics(void);  // HAZZA: packed performance analytics
 float mcpwm_foc_get_mod_alpha_measured(void);
 float mcpwm_foc_get_mod_beta_measured(void);
 float mcpwm_foc_get_v_alpha(void);

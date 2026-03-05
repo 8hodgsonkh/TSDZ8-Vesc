@@ -124,6 +124,9 @@ typedef struct {
 	float m_temp_override;
 	float m_i_in_filter;
 
+	// HAZZA: Bottleneck detector — computed each timer tick
+	uint16_t m_bottleneck_reasons;
+
 	// Backup data counters
 	uint64_t m_odometer_last;
 	uint64_t m_runtime_last;
@@ -1885,6 +1888,14 @@ bool mc_interface_is_motor_locked(void) {
 	return m_motor_locked;
 }
 
+uint16_t mc_interface_get_bottleneck_reasons(void) {
+	return motor_now()->m_bottleneck_reasons;
+}
+
+uint32_t mc_interface_get_perf_metrics(void) {
+	return mcpwm_foc_get_perf_metrics();
+}
+
 setup_values mc_interface_get_setup_values(void) {
 	setup_values val = {0, 0, 0, 0, 0, 0, 0};
 	val.num_vescs = 1;
@@ -2757,6 +2768,50 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 
 	conf->lo_current_max = lo_max;
 	conf->lo_current_min = lo_min;
+
+	// HAZZA: Compute bottleneck reasons bitmask
+	// Detect which limits are actively constraining motor performance.
+	// Uses individual limit components (available here) + actual measured values.
+	{
+		uint16_t reasons = 0;
+		const float eps = 0.5f;  // Tolerance for component comparison (amps)
+
+		// Temperature derating: check if temp-reduced component is the binding limit
+		if (lo_max_mos < l_current_max_tmp - eps && motor->m_temp_fet > conf->l_temp_fet_start)
+			reasons |= BOTTLENECK_TEMP_FET;
+		// Only flag motor temp if sensor is actually enabled (not repurposed for wheel speed etc)
+		if (conf->m_motor_temp_sens_type != TEMP_SENSOR_DISABLED &&
+			lo_max_mot < l_current_max_tmp - eps && motor->m_temp_motor > conf->l_temp_motor_start)
+			reasons |= BOTTLENECK_TEMP_MOTOR;
+
+		// Duty cycle / voltage headroom: duty component is limiting current
+		if (fabsf(lo_max_duty) < l_current_max_tmp - eps)
+			reasons |= BOTTLENECK_DUTY;
+
+		// ERPM limit: rpm taper is limiting current
+		if (fabsf(lo_max_rpm) < l_current_max_tmp - eps)
+			reasons |= BOTTLENECK_ERPM;
+
+		// Battery current at effective limit (measured vs computed limit)
+		if (motor->m_i_in_filter > conf->lo_in_current_max * 0.90f && conf->lo_in_current_max > 0.5f)
+			reasons |= BOTTLENECK_BATT_CURRENT;
+
+		// Watt limit: check if watt-derived input limit is binding
+		const float lo_in_max_watt = conf->l_watt_max / (v_in > 10.0f ? v_in : 10.0f);
+		if (lo_in_max_watt < conf->l_in_current_max * 0.95f && conf->l_watt_max > 10.0f)
+			reasons |= BOTTLENECK_WATT;
+
+		// Battery voltage low (approaching cutoff)
+		if (v_in < conf->l_battery_cut_start + 1.0f && v_in > 10.0f)
+			reasons |= BOTTLENECK_BATT_VOLTAGE;
+
+		// Motor current at effective limit (actual motor current near lo_current_max)
+		float i_motor_abs = fabsf(mcpwm_foc_get_iq());
+		if (i_motor_abs > fabsf(lo_max) * 0.90f && i_motor_abs > 1.0f)
+			reasons |= BOTTLENECK_MOTOR_CURRENT;
+
+		motor->m_bottleneck_reasons = reasons;
+	}
 }
 
 static volatile motor_if_state_t *motor_now(void) {

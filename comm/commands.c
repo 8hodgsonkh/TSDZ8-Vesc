@@ -479,6 +479,12 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 			status |= timeout_kill_sw_active() << 1;
 			send_buffer[ind++] = status;
 		}
+		if (mask & ((uint32_t)1 << 22)) {
+			buffer_append_uint16(send_buffer, mc_interface_get_bottleneck_reasons(), &ind);
+		}
+		if (mask & ((uint32_t)1 << 23)) {
+			buffer_append_uint32(send_buffer, mc_interface_get_perf_metrics(), &ind);
+		}
 
 		reply_func(send_buffer, ind);
 		mempools_free_packet_buffer(send_buffer);
@@ -769,6 +775,10 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 	} break;
 
 	case COMM_CUSTOM_APP_DATA: {
+		// DEBUG: Log ALL custom app data arrivals
+		commands_printf("CUSTOM_APP_DATA len=%d data=[%02X %02X %02X]",
+			len, len >= 1 ? data[0] : 0, len >= 2 ? data[1] : 0, len >= 3 ? data[2] : 0);
+
 		// HAZZA display lock state - prevents HA/HB from overriding when locked
 		static volatile bool display_locked = false;
 		static volatile int pre_lock_boost = 0;
@@ -798,6 +808,7 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		if (len >= 3 && data[0] == 0x48 && data[1] == 0x41 && !display_locked) {
 			uint8_t level = data[2];
 			if (level >= 1 && level <= 5) {
+				commands_printf("HA: assist level=%d", level);
 				app_adc_set_assist_level(level);
 			}
 		}
@@ -806,6 +817,7 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		// Ignored while display_locked to prevent override
 		if (len >= 3 && data[0] == 0x48 && data[1] == 0x42 && !display_locked) {
 			int boost_level = data[2];
+			commands_printf("HB: boost level=%d", boost_level);
 			mcpwm_foc_set_mtpa_boost(boost_level);
 		}
 		// Hazza stall detection control
@@ -937,6 +949,12 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		}
 		if (mask & ((uint32_t)1 << 21)) {
 			buffer_append_uint32(send_buffer, chVTGetSystemTimeX() / (CH_CFG_ST_FREQUENCY / 1000), &ind);
+		}
+		if (mask & ((uint32_t)1 << 22)) {
+			buffer_append_uint16(send_buffer, mc_interface_get_bottleneck_reasons(), &ind);
+		}
+		if (mask & ((uint32_t)1 << 23)) {
+			buffer_append_uint32(send_buffer, mc_interface_get_perf_metrics(), &ind);
 		}
 
 		reply_func(send_buffer, ind);
