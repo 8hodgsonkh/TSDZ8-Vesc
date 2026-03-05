@@ -373,6 +373,8 @@ void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2) {
 	m_motor_1.m_hall_dt_diff_now = 1.0;
 	m_motor_1.m_ang_hall_int_prev = -1;
 	m_motor_1.m_mtpa_boost_active = true; // HAZZA: Boost ON by default
+	m_motor_1.m_tracking_quality = 1.0;  // HAZZA: Start assuming good tracking
+	m_motor_1.m_power_scale = 1.0;       // HAZZA: Start at full power
 	foc_precalc_values((motor_all_state_t*)&m_motor_1);
 	update_hfi_samples(m_motor_1.m_conf->foc_hfi_samples, &m_motor_1);
 	init_audio_state(&m_motor_1.m_audio);
@@ -4443,6 +4445,43 @@ static void timer_update(motor_all_state_t *motor, float dt) {
 	}
 
 	// =============================================================================
+	// HAZZA MID-DRIVE: Tracking Quality Computation
+	// Compare observer PM flux magnitude to expected lambda. When the observer is
+	// tracking well, PM flux ≈ lambda. Large deviation = lost tracking.
+	// For Ortega: x1,x2 include L*i term, must subtract it.
+	// For MxLemming: x1,x2 ARE the PM flux directly.
+	// =============================================================================
+	{
+		float lambda_cfg = motor->m_conf->foc_motor_flux_linkage;
+		if (lambda_cfg > 0.0001f) {
+			float pm_flux_mag;
+			if (conf_now->foc_observer_type == FOC_OBSERVER_MXLEMMING ||
+				conf_now->foc_observer_type == FOC_OBSERVER_MXLEMMING_LAMBDA_COMP) {
+				// MxLemming: x1,x2 are PM flux directly
+				pm_flux_mag = NORM2_f(motor->m_observer_state.x1, motor->m_observer_state.x2);
+			} else {
+				// Ortega/MxV: x1,x2 include L*i, subtract it to get PM flux
+				float L = conf_now->foc_motor_l;
+				float L_ia = L * motor->m_motor_state.i_alpha;
+				float L_ib = L * motor->m_motor_state.i_beta;
+				pm_flux_mag = NORM2_f(motor->m_observer_state.x1 - L_ia,
+				                      motor->m_observer_state.x2 - L_ib);
+			}
+
+			// Use lambda_est if observer computes it, else config lambda
+			float lambda_ref = (motor->m_observer_state.lambda_est > 0.0001f) ?
+			                   motor->m_observer_state.lambda_est : lambda_cfg;
+
+			float tq = 1.0f - fabsf(pm_flux_mag - lambda_ref) / lambda_ref;
+			if (tq < 0.0f) tq = 0.0f;
+			if (tq > 1.0f) tq = 1.0f;
+			UTILS_LP_FAST(motor->m_tracking_quality, tq, 0.01f);
+		} else {
+			motor->m_tracking_quality = 1.0f;
+		}
+	}
+
+	// =============================================================================
 	// HAZZA MID-DRIVE: Stall Detection
 	// Uses observer intelligence to detect when motor isn't running correctly.
 	// Only active when m_stall_enabled is true (set by ESP32 display via BLE).
@@ -5036,29 +5075,6 @@ static void control_current(motor_all_state_t *motor, float dt) {
 
 	state_m->vd -= dec_vd; //Negative sign as in the PMSM equations
 	state_m->vq += dec_vq + dec_bemf;
-	
-	// =============================================================================
-	// HAZZA MID-DRIVE: Smooth voltage changes when tracking is poor
-	// Sudden voltage jumps confuse position tracking even more.
-	// When tracking quality is low, we smooth out voltage changes.
-	// =============================================================================
-	if (motor->m_control_mode == CONTROL_MODE_CURRENT && motor->m_tracking_quality < 0.8f) {
-		// How much can voltage change per cycle? Less when tracking is bad.
-		const float smoothing_strength = 0.5f + 0.5f * motor->m_tracking_quality;  // 0.5 to 1.0
-		const float max_voltage_change = state_m->v_bus * 0.1f * smoothing_strength;
-		
-		// Limit how fast voltage can change
-		float voltage_delta = state_m->vq - motor->m_voltage_smoothed;
-		utils_truncate_number(&voltage_delta, -max_voltage_change, max_voltage_change);
-		motor->m_voltage_smoothed += voltage_delta;
-		
-		// Blend smoothed and raw voltage based on tracking quality
-		// Bad tracking = more smoothing, Good tracking = more raw
-		state_m->vq = motor->m_voltage_smoothed * (1.0f - motor->m_tracking_quality) + 
-		              state_m->vq * motor->m_tracking_quality;
-	} else {
-		motor->m_voltage_smoothed = state_m->vq;  // Keep tracking when not smoothing
-	}
 
 	// Calculate the max length of the voltage space vector without overmodulation.
 	// Is simply 1/sqrt(3) * v_bus. See https://microchipdeveloper.com/mct5001:start. Adds margin with max_duty.

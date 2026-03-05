@@ -243,7 +243,6 @@ typedef struct {
 	// =============================================================================
 	float m_tracking_quality;         // 0.0 = completely lost, 1.0 = perfect (how well we know motor position)
 	float m_tracking_error_buildup;   // Accumulated position tracking errors over time
-	float m_voltage_smoothed;         // Smoothed voltage to prevent sudden jumps
 	float m_safe_power_limit;         // How much power we're allowing (reduces when struggling)
 	float m_speed_change_rate;        // How fast motor speed is changing (detects chain snap)
 	float m_speed_prev;               // Previous speed for calculating change rate
