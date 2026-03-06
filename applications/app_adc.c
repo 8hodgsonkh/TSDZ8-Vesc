@@ -135,8 +135,8 @@ static float get_assist_power_multiplier(void) {
 
 // Apply assist level to motor current limit (called when level changes or mode changes)
 static void apply_assist_current_limit(void) {
-	// Current scaling applies to current-control paths (PAS follow, current mode)
-	// Duty-control paths (hybrid duty throttle, PAS duty) scale duty_target directly
+	// Current scaling applied at limit enforcement level in mc_interface.c
+	// This scales l_current_max for ALL motor modes (duty, current, PAS, etc.)
 	mc_interface_set_assist_current_scale(get_assist_power_multiplier());
 }
 
@@ -1432,33 +1432,10 @@ static THD_FUNCTION(adc_thread, arg) {
 								}
 							}
 							
-							// Assist level scales total power output for BOTH throttle and PAS
-							// Level 1=20%, 2=40%, 3=60%, 4=80%, 5=100%
-							float assist_mult = get_assist_power_multiplier();
-							
-											// Normal throttle: 0-100% maps to 0-100% of assist-scaled duty
-											float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale * assist_mult;
-											
-											// Launch boost: minimum duty at standstill to overcome gearbox friction
-											// Uses same config params as current-mode launch boost
-											const float lb_rel = config.haz_throttle_launch_boost_rel;
-											const float lb_release_duty = config.haz_throttle_launch_boost_release_duty;
-											const float lb_release_erpm = config.haz_throttle_launch_boost_release_erpm;
-											const float lb_throttle = config.haz_throttle_launch_boost_throttle;
-											float abs_duty_now = fabsf(mc_interface_get_duty_cycle_now());
-											if (lb_rel > 0.001f && abs_duty_now < lb_release_duty && 
-												current_erpm < lb_release_erpm && throttle_mag > 0.001f) {
-												float boost_mix = 1.0f - (throttle_mag / fmaxf(lb_throttle, 0.01f));
-												utils_truncate_number(&boost_mix, 0.0f, 1.0f);
-												float min_duty = lb_rel * mcconf->l_max_duty * boost_mix * assist_mult;
-												if (duty_target < min_duty) {
-													duty_target = min_duty;
-												}
-											}
-											
-											float duty_gap = fabsf(duty_target - osf_duty_ramped);
-
-											// Configurable ramp rates (duty/s)
+													// Normal throttle: 0-100% maps to 0-100% duty
+													// Assist level limits current via mc_interface.c limit enforcement
+													float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale;
+													float duty_gap = fabsf(duty_target - osf_duty_ramped);
 											// Street mode: VERY slow ramp (0.05/s) to avoid slingshot past speed limit
 											// with low-resolution 1 pulse/rotation speed sensor
 											const bool street_mode = !mc_interface_is_offroad_mode();

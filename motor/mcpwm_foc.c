@@ -3741,33 +3741,37 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		// Only enable above 250 ERPM to prevent stall vibration at startup
 		const float ld_lq_diff = conf_now->foc_motor_ld_lq_diff;
 		const float erpm_now = fabsf(RADPS2RPM_f(motor_now->m_pll_speed));
-		if (conf_now->foc_mtpa_mode != MTPA_MODE_OFF && ld_lq_diff != 0.0 &&
+		const bool mtpa_enabled = (conf_now->foc_mtpa_mode != MTPA_MODE_OFF && ld_lq_diff != 0.0);
+		const bool boost_active = motor_now->m_mtpa_boost_active;
+
+		// Enter block if MTPA is enabled OR if FW boost is active
+		if ((mtpa_enabled || boost_active) &&
 				motor_now->m_control_mode != CONTROL_MODE_OPENLOOP_PHASE &&
 				erpm_now > 250.0f) {
 			const float lambda = conf_now->foc_motor_flux_linkage;
 
-			float iq_ref = iq_set_tmp;
-			if (conf_now->foc_mtpa_mode == MTPA_MODE_IQ_MEASURED) {
-				iq_ref = utils_min_abs(iq_set_tmp, state_now->iq_filter);
-			}
-			// IQ_TARGET mode: Use commanded iq directly (default behavior)
+			float id_mtpa = 0.0f;
+			float iq_mtpa = iq_set_tmp;
 
-			// HAZZA FIX: When MTPA boost (FW via MTPA path) is active, always use
-			// measured Iq for the MTPA formula, regardless of mode setting.
-			// In duty mode the duty controller commands lo_current_max (assist-scaled)
-			// as Iq even at no-load. The MTPA formula takes this phantom command and
-			// generates proportional -Id for torque-angle optimization. At assist 5
-			// that can be -25A+ of MTPA Id on top of the boost's -18A = over-demagnetization
-			// that kills top speed. Using measured Iq means MTPA only generates Id
-			// proportional to ACTUAL torque current, so under no-load MTPA Id ≈ 0
-			// and only the boost Id provides flux weakening — assist-independent.
-			if (motor_now->m_mtpa_boost_active && motor_now->m_mtpa_boost_iq < -0.1f) {
-				iq_ref = utils_min_abs(iq_set_tmp, state_now->iq_filter);
-			}
+			// MTPA torque angle optimization (only when MTPA mode is enabled)
+			if (mtpa_enabled) {
+				float iq_ref = iq_set_tmp;
+				if (conf_now->foc_mtpa_mode == MTPA_MODE_IQ_MEASURED) {
+					iq_ref = utils_min_abs(iq_set_tmp, state_now->iq_filter);
+				}
+				// IQ_TARGET mode: Use commanded iq directly (default behavior)
 
-			// Calculate optimal MTPA id for this iq
-			float id_mtpa = (lambda - sqrtf(SQ(lambda) + 8.0 * SQ(ld_lq_diff * iq_ref))) / (4.0 * ld_lq_diff);
-			float iq_mtpa = SIGN(iq_set_tmp) * sqrtf(SQ(iq_set_tmp) - SQ(id_mtpa));
+				// HAZZA FIX: When FW boost is active, always use measured Iq for the
+				// MTPA formula. In duty mode the duty controller commands lo_current_max
+				// as Iq even at no-load — using measured prevents phantom MTPA Id.
+				if (boost_active && motor_now->m_mtpa_boost_iq < -0.1f) {
+					iq_ref = utils_min_abs(iq_set_tmp, state_now->iq_filter);
+				}
+
+				// Calculate optimal MTPA id for this iq
+				id_mtpa = (lambda - sqrtf(SQ(lambda) + 8.0 * SQ(ld_lq_diff * iq_ref))) / (4.0 * ld_lq_diff);
+				iq_mtpa = SIGN(iq_set_tmp) * sqrtf(SQ(iq_set_tmp) - SQ(id_mtpa));
+			}
 
 			// =============================================================================
 			// HAZZA: Simple Field Weakening with Boost Level
@@ -3834,12 +3838,12 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			}
 
 			// =============================================================================
-			// HAZZA: Power-Capped MTPA
+			// HAZZA: Power-Capped MTPA (only when MTPA is enabled)
 			// Standard MTPA keeps motor current magnitude constant but ignores battery power.
 			// For high-saliency IPM motors, the id component adds significant battery draw.
 			// This mode scales the entire MTPA vector down to respect battery current limits.
 			// =============================================================================
-			if (conf_now->foc_mtpa_power_cap) {
+			if (mtpa_enabled && conf_now->foc_mtpa_power_cap) {
 				// Estimate battery current for this MTPA current vector
 				// I_batt = mod_d * id + mod_q * iq
 				// We use the measured/filtered modulation values as our best estimate

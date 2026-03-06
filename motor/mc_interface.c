@@ -785,10 +785,10 @@ void mc_interface_set_current_rel(float val) {
 	float duty = mc_interface_get_duty_cycle_now();
 
 	if (fabsf(duty) < 0.02 || SIGN(val) == SIGN(duty)) {
-		// HAZZA: Apply assist current scaling here (drive path only).
-		// lo_current_max is now the unscaled hardware limit; assist level
-		// reduces the commanded torque but leaves FW/RPM-taper headroom intact.
-		mc_interface_set_current(val * cfg->lo_current_max * m_assist_current_scale);
+		// HAZZA: Assist current scaling is now applied at the limit enforcement level
+		// (l_current_max_tmp *= m_assist_current_scale), which flows into lo_current_max.
+		// No additional scaling needed here — lo_current_max is already assist-scaled.
+		mc_interface_set_current(val * cfg->lo_current_max);
 	} else {
 		// Brake path - always full braking regardless of assist level
 		mc_interface_set_current(val * fabsf(cfg->lo_current_min));
@@ -2560,11 +2560,10 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 #endif
 
 	const float l_current_min_tmp = conf->l_current_min * conf->l_current_min_scale;
-	// HAZZA: Assist scaling removed from limit calculation. Safety limits (RPM taper,
-	// temp derating, FW budget) use the full hardware current. Assist scaling is applied
-	// at the command level in set_current_rel() so the speed envelope stays constant
-	// across assist levels, and the FOC FW controller gets full id budget.
-	const float l_current_max_tmp = conf->l_current_max * conf->l_current_max_scale;
+	// HAZZA: Assist current scaling applied at limit level so it affects ALL motor modes
+	// (duty, current, PAS). This clips Iq to assist_level * 20% of configured max.
+	// Duty stays at full range, but the FOC current controller enforces the lower limit.
+	const float l_current_max_tmp = conf->l_current_max * conf->l_current_max_scale * m_assist_current_scale;
 
 	// Temperature MOSFET
 	float lo_min_mos = l_current_min_tmp;
