@@ -135,13 +135,9 @@ static float get_assist_power_multiplier(void) {
 
 // Apply assist level to motor current limit (called when level changes or mode changes)
 static void apply_assist_current_limit(void) {
-	if (mc_interface_is_offroad_mode()) {
-		// Offroad: scale current by assist level
-		mc_interface_set_assist_current_scale(get_assist_power_multiplier());
-	} else {
-		// Street mode: full current (speed is limited instead)
-		mc_interface_set_assist_current_scale(1.0f);
-	}
+	// Current scaling applies to current-control paths (PAS follow, current mode)
+	// Duty-control paths (hybrid duty throttle, PAS duty) scale duty_target directly
+	mc_interface_set_assist_current_scale(get_assist_power_multiplier());
 }
 
 // Set assist level from display (1-5)
@@ -1436,14 +1432,30 @@ static THD_FUNCTION(adc_thread, arg) {
 								}
 							}
 							
-							// Assist level is applied via current scaling only
-							// (mc_interface_set_assist_current_scale in apply_assist_current_limit)
-							// Duty target is NOT scaled by assist — must reach l_max_duty
-							// for field weakening to engage at 90% duty threshold
+							// Assist level scales total power output for BOTH throttle and PAS
+							// Level 1=20%, 2=40%, 3=60%, 4=80%, 5=100%
+							float assist_mult = get_assist_power_multiplier();
 							
-											// Normal throttle: 0-100% = 0-100% duty
-											// FW boost triggers automatically at 95% duty in FOC layer
-											float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale;
+											// Normal throttle: 0-100% maps to 0-100% of assist-scaled duty
+											float duty_target = throttle_mag * mcconf->l_max_duty * speed_scale * assist_mult;
+											
+											// Launch boost: minimum duty at standstill to overcome gearbox friction
+											// Uses same config params as current-mode launch boost
+											const float lb_rel = config.haz_throttle_launch_boost_rel;
+											const float lb_release_duty = config.haz_throttle_launch_boost_release_duty;
+											const float lb_release_erpm = config.haz_throttle_launch_boost_release_erpm;
+											const float lb_throttle = config.haz_throttle_launch_boost_throttle;
+											float abs_duty_now = fabsf(mc_interface_get_duty_cycle_now());
+											if (lb_rel > 0.001f && abs_duty_now < lb_release_duty && 
+												current_erpm < lb_release_erpm && throttle_mag > 0.001f) {
+												float boost_mix = 1.0f - (throttle_mag / fmaxf(lb_throttle, 0.01f));
+												utils_truncate_number(&boost_mix, 0.0f, 1.0f);
+												float min_duty = lb_rel * mcconf->l_max_duty * boost_mix * assist_mult;
+												if (duty_target < min_duty) {
+													duty_target = min_duty;
+												}
+											}
+											
 											float duty_gap = fabsf(duty_target - osf_duty_ramped);
 
 											// Configurable ramp rates (duty/s)
@@ -1535,10 +1547,8 @@ static THD_FUNCTION(adc_thread, arg) {
 						// If PAS duty mode is enabled, ONLY use that (no fallback to current PAS)
 						if (config.haz_pas_duty_enabled) {
 							float pas_duty = haz_pas_duty_process(&config, dt_s);
-							// Scale PAS duty by assist level in offroad mode
-							if (mc_interface_is_offroad_mode()) {
-								pas_duty *= get_assist_power_multiplier();
-							}
+							// Scale PAS duty by assist level (always, not just offroad)
+							pas_duty *= get_assist_power_multiplier();
 							if (pas_duty > 0.001f) {
 								// PAS Duty active - use DUTY control (not current!)
 								osf_duty_ramped = pas_duty;
