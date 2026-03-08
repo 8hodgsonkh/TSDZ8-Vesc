@@ -2560,10 +2560,11 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 #endif
 
 	const float l_current_min_tmp = conf->l_current_min * conf->l_current_min_scale;
-	// HAZZA: Assist current scaling applied at limit level so it affects ALL motor modes
-	// (duty, current, PAS). This clips Iq to assist_level * 20% of configured max.
-	// Duty stays at full range, but the FOC current controller enforces the lower limit.
-	const float l_current_max_tmp = conf->l_current_max * conf->l_current_max_scale * m_assist_current_scale;
+	// HAZZA: Assist scaling NOT applied here. Limit enforcement must stay at full
+	// hardware current so duty controller, RPM taper, and duty taper work correctly.
+	// Assist Iq clamp is applied in the FOC loop (mcpwm_foc.c) after the duty
+	// controller generates its current command.
+	const float l_current_max_tmp = conf->l_current_max * conf->l_current_max_scale;
 
 	// Temperature MOSFET
 	float lo_min_mos = l_current_min_tmp;

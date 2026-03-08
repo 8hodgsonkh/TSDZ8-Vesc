@@ -3913,6 +3913,17 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			utils_truncate_number(&iq_set_tmp, -conf_now->lo_current_max, -conf_now->lo_current_min);
 		}
 
+		// HAZZA: Assist level Iq clamp — applied AFTER lo_current_max clamp so
+		// duty controller, RPM taper, and duty taper all use full hardware limits.
+		// This only reduces torque current (Iq), not FW current (Id).
+		{
+			float assist_scale = mc_interface_get_assist_current_scale();
+			if (assist_scale < 0.99f) {
+				float iq_assist_max = conf_now->l_current_max * conf_now->l_current_max_scale * assist_scale;
+				utils_truncate_number(&iq_set_tmp, -iq_assist_max, iq_assist_max);
+			}
+		}
+
 		float current_max_abs = fabsf(utils_max_abs(conf_now->lo_current_max, conf_now->lo_current_min));
 
 		// HAZZA: When MTPA boost (field weakening) is active, the FW Id component
