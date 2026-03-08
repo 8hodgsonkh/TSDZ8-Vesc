@@ -785,10 +785,9 @@ void mc_interface_set_current_rel(float val) {
 	float duty = mc_interface_get_duty_cycle_now();
 
 	if (fabsf(duty) < 0.02 || SIGN(val) == SIGN(duty)) {
-		// HAZZA: Assist current scaling is now applied at the limit enforcement level
-		// (l_current_max_tmp *= m_assist_current_scale), which flows into lo_current_max.
-		// No additional scaling needed here — lo_current_max is already assist-scaled.
-		mc_interface_set_current(val * cfg->lo_current_max);
+		// HAZZA: Assist current scaling for current-mode paths (PAS follow, throttle
+		// current mode). lo_current_max is unscaled — multiply by assist scale here.
+		mc_interface_set_current(val * cfg->lo_current_max * m_assist_current_scale);
 	} else {
 		// Brake path - always full braking regardless of assist level
 		mc_interface_set_current(val * fabsf(cfg->lo_current_min));
