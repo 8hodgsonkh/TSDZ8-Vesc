@@ -1524,8 +1524,8 @@ static THD_FUNCTION(adc_thread, arg) {
 						// If PAS duty mode is enabled, ONLY use that (no fallback to current PAS)
 						if (config.haz_pas_duty_enabled) {
 							float pas_duty = haz_pas_duty_process(&config, dt_s);
-							// Scale PAS duty by assist level (always, not just offroad)
-							pas_duty *= get_assist_power_multiplier();
+							// Assist scaling handled by current_max_for_duty in FOC loop
+							// Do NOT scale duty here — that would change motor RPM vs cadence
 							if (pas_duty > 0.001f) {
 								// PAS Duty active - use DUTY control (not current!)
 								osf_duty_ramped = pas_duty;
