@@ -183,18 +183,20 @@ static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
 // =============================================================================
 // PAS DUTY MODE - Simple, Smooth Duty-Based PAS
 // =============================================================================
-// Concept: Match motor speed to pedals using duty commands (not current/PID)
-// Much simpler than original - just smooth ramping to a cadence-based target
+// ERPM-tracking PAS duty: match motor speed to pedal cadence through drivetrain
 //
-// target_duty = (pedal_rpm / max_rpm) * max_duty * power_scale
-// Ramp smoothly to target. That's it.
+// motor_erpm = cadence_rpm × gear_ratio × pole_pairs
+// target_duty = (target_erpm / max_erpm) × max_duty
+//
+// The motor runs at (or slightly ahead of) the speed your legs dictate,
+// regardless of battery voltage, switching frequency, or load.
 
 typedef struct {
 	float duty_cmd;              // Current duty output (smoothed)
 	float target_duty;           // Target duty we're ramping toward
 	float cadence_smooth;        // Smoothed pedal RPM
+	float cadence_prev;          // Previous cadence for acceleration detection
 	float idle_time;             // Time since last pedal activity
-	float startup_progress;      // Track startup rotations
 	bool engaged;                // PAS currently active
 	uint32_t last_step_count;    // For activity detection
 } haz_pas_duty_ctx_t;
@@ -203,30 +205,62 @@ static haz_pas_duty_ctx_t haz_pas_duty_ctx = {
 	.duty_cmd = 0.0f,
 	.target_duty = 0.0f,
 	.cadence_smooth = 0.0f,
+	.cadence_prev = 0.0f,
 	.idle_time = 0.0f,
-	.startup_progress = 0.0f,
 	.engaged = false,
 	.last_step_count = 0
 };
 
-// Simple PAS duty - cadence-based duty output with smooth ramping
+// ERPM-tracking PAS duty - motor matches cadence through drivetrain
 static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	if (!conf->haz_pas_duty_enabled) {
 		haz_pas_duty_ctx.duty_cmd = 0.0f;
 		return 0.0f;
 	}
 
-	// Get configs
+	// Motor config
 	const volatile mc_configuration *mcconf = mc_interface_get_configuration();
 	float max_duty = mcconf->l_max_duty;
 	if (max_duty < 0.1f) max_duty = 0.95f;
 
-	// Simple config
-	const float ramp_up = fmaxf(conf->haz_pas_duty_ramp_up, 0.1f);
-	const float ramp_down = fmaxf(conf->haz_pas_duty_ramp_down, 0.2f);
-	const float power_scale = fmaxf(conf->haz_pas_duty_effort_gain, 0.1f);
-	const float max_cadence = fmaxf(conf->haz_pas_duty_erpm_boost * 100.0f, 60.0f);
+	int poles = mcconf->si_motor_poles;
+	if (poles <= 0) poles = 8;
+	float pole_pairs = (float)poles * 0.5f;
+
+	float lambda = mcconf->foc_motor_flux_linkage;
+	if (!isfinite(lambda) || lambda < 1e-6f) lambda = 0.01259f;
+
+	float v_bus = mc_interface_get_input_voltage_filtered();
+	if (!isfinite(v_bus) || v_bus < 10.0f) v_bus = 48.0f;
+
+	// Drivetrain: internal gearbox ratio (e.g. 38:1 for TSDZ8)
+	const app_configuration *appconf = app_get_configuration();
+	float gear_ratio = appconf->gear_detect_conf.internal_ratio;
+	if (!isfinite(gear_ratio) || gear_ratio <= 0.0f) gear_ratio = 38.0f;
+
+	// Config params (clean names matching VESC Tool labels):
+	// smoothing          → LP filter: 0.0 (raw) to 1.0 (max smooth)
+	// lead_pct           → Lead %: 0-2 range, each 0.10 = 1% lead → 2.0 = 20% lead
+	// accel_gain         → Cadence accel boost strength
+	// load_gain          → Load/current boost strength
+	// median_filter      → Median Filter: 0=off, 1=latest, 3-11=median samples
+	// ramp_up/down       → duty/s slew rate limits
+	// idle_timeout       → seconds before power ramp-down after pedaling stops
+	const float ramp_up = fmaxf(conf->haz_pas_duty_ramp_up, 0.05f);
+	const float ramp_down = fmaxf(conf->haz_pas_duty_ramp_down, 0.05f);
+	const float accel_gain = fmaxf(conf->haz_pas_duty_accel_gain, 0.0f);
+	const float load_gain = fmaxf(conf->haz_pas_duty_load_gain, 0.0f);
+	// Map 0-2 range to 1.0-1.20 lead factor (0=exact match, 0.5=5% ahead, 2.0=20% ahead)
+	float lead_raw = conf->haz_pas_duty_lead_pct;
+	if (lead_raw < 0.0f) lead_raw = 0.0f;
+	if (lead_raw > 2.0f) lead_raw = 2.0f;
+	const float lead_factor = 1.0f + lead_raw * 0.10f;
 	const float idle_timeout = fmaxf(conf->haz_pas_duty_idle_timeout, 0.1f);
+
+	// ERPM→duty conversion factor from motor physics:
+	// duty = ERPM × lambda × sqrt(3) × 2π / (v_bus × 60)
+	// This auto-adjusts for battery voltage — no max_erpm setting needed.
+	const float erpm_to_duty = (lambda * 1.7320508f * 6.2831853f) / (v_bus * 60.0f);
 
 	// ========== SPEED LIMIT CHECK (STREET MODE ONLY) ==========
 	// PAS cuts off at 15.5 mph in STREET MODE only
@@ -281,70 +315,189 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 
 	bool is_idle = (haz_pas_duty_ctx.idle_time > idle_timeout);
 
-	// Get pedal RPM with MEDIAN FILTER (outlier rejection)
-	// Tunable via VESC Tool settings:
-	// - PAS Duty: LP Smoothing (variation_threshold): 1-10 (1=responsive, 10=smooth)
-	// - PAS Duty: Median Buffer (ramp_rise_time): 3-11 samples
+	// Get pedal RPM with optional MEDIAN FILTER (outlier rejection)
+	// Tunable via VESC Tool:
+	// - PAS Duty: Smoothing (smoothing): 0.0=raw, 1.0=max smooth
+	// - PAS Duty: Median Filter (median_filter): 0=off, 1=latest, 3-11=median
 	
-	// Buffer size: direct integer from setting (3-11 samples)
-	int buf_size = (int)conf->haz_pas_duty_ramp_rise_time;
-	if (buf_size < 3) buf_size = 3;
+	// Median buffer size: direct integer from setting (0-11)
+	int buf_size = (int)(conf->haz_pas_duty_median_filter + 0.5f);  // round
+	if (buf_size < 0) buf_size = 0;
 	if (buf_size > 11) buf_size = 11;
 	
-	// LP filter: setting 1-10 maps to factor 0.5-0.01 (inverted: 1=responsive, 10=smooth)
-	int lp_setting = (int)conf->haz_pas_duty_variation_threshold;
-	if (lp_setting < 1) lp_setting = 1;
-	if (lp_setting > 10) lp_setting = 10;
-	float lp_factor = 0.5f - (lp_setting - 1) * (0.49f / 9.0f);  // 1→0.5, 10→0.01
+	// LP filter: 0.0 = no filtering (pass-through), 1.0 = maximum smoothing
+	// Maps to UTILS_LP_FAST factor: 0.0→1.0 (instant), 1.0→0.01 (heavy smooth)
+	float smoothing = conf->haz_pas_duty_smoothing;
+	if (smoothing < 0.0f) smoothing = 0.0f;
+	if (smoothing > 1.0f) smoothing = 1.0f;
+	float lp_factor = (smoothing < 0.01f) ? 1.0f : (1.0f - smoothing * 0.99f);
 	
-	// Fixed 11-element buffer, always use full buffer for consistency
-	// (changing buf_size only affects how many samples we consider for median)
+	// Fixed 11-element ring buffer
 	static float rpm_buffer[11] = {0};
 	static int rpm_idx = 0;
-	static int buf_filled = 0;  // Track how many valid samples we have
+	static int buf_filled = 0;
 	
 	float pedal_rpm_raw = app_pas_get_pedal_rpm();
 	rpm_buffer[rpm_idx] = pedal_rpm_raw;
-	rpm_idx = (rpm_idx + 1) % 11;  // Always wrap at 11
+	rpm_idx = (rpm_idx + 1) % 11;
 	if (buf_filled < 11) buf_filled++;
 	
-	// Use minimum of buf_size and buf_filled for median calculation
-	int samples_to_use = (buf_filled < buf_size) ? buf_filled : buf_size;
-	if (samples_to_use < 3) samples_to_use = 3;
-	
-	// Copy most recent samples for sorting
-	float sorted[11];
-	for (int i = 0; i < samples_to_use; i++) {
-		int idx = (rpm_idx - 1 - i + 11) % 11;  // Work backwards from most recent
-		sorted[i] = rpm_buffer[idx];
-	}
-	
-	// Sort (simple insertion sort)
-	for (int i = 1; i < samples_to_use; i++) {
-		float key = sorted[i];
-		int j = i - 1;
-		while (j >= 0 && sorted[j] > key) {
-			sorted[j + 1] = sorted[j];
-			j--;
+	float pedal_rpm;
+	if (buf_size <= 1) {
+		// 0 or 1 = no median, use raw (or latest) value directly
+		pedal_rpm = pedal_rpm_raw;
+	} else {
+		// Median filter with buf_size samples
+		int samples_to_use = (buf_filled < buf_size) ? buf_filled : buf_size;
+		if (samples_to_use < 3) samples_to_use = 3;  // median needs at least 3
+		
+		float sorted[11];
+		for (int i = 0; i < samples_to_use; i++) {
+			int idx = (rpm_idx - 1 - i + 11) % 11;
+			sorted[i] = rpm_buffer[idx];
 		}
-		sorted[j + 1] = key;
+		
+		// Insertion sort
+		for (int i = 1; i < samples_to_use; i++) {
+			float key = sorted[i];
+			int j = i - 1;
+			while (j >= 0 && sorted[j] > key) {
+				sorted[j + 1] = sorted[j];
+				j--;
+			}
+			sorted[j + 1] = key;
+		}
+		
+		pedal_rpm = sorted[samples_to_use / 2];
 	}
-	
-	// Take median (middle value)
-	float pedal_rpm = sorted[samples_to_use / 2];
 	
 	// LP filter on top (tunable)
 	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, pedal_rpm, lp_factor);
 
-	// Assist level now scales duty target at the output (in app_adc main loop)
-	// This reduces speed/torque proportionally to assist level
-
-	// Calculate target - zero if idle, otherwise from cadence
+	// ========== ERPM-TRACKING + SMOOTH DYNAMIC ASSIST ==========
+	// Base: convert cadence → motor ERPM → duty via back-EMF physics.
+	//
+	// Dynamic assist multiplier (no torque sensor — use available signals):
+	// Instead of spiking ERPM accumulators, compute a smooth "assist_mult"
+	// that scales how far ahead the motor leads the rider's cadence.
+	//
+	// Two signal sources feed into one multiplier:
+	//
+	// 1. CADENCE ACCEL: period-based acceleration from PAS quadrature decoder.
+	//    Positive rpm_rate (RPM/s) → rider is speeding up pedaling → increase lead.
+	//    Smoothed and capped so a single stomp doesn't cause a surge.
+	//
+	// 2. LOAD SIGNAL: motor current fraction as effort proxy.
+	//    High current at constant cadence = riding uphill or pushing hard.
+	//    Anti-runaway: reduced when motor ERPM already exceeds base target.
+	//
+	// Result: effective_lead = lead_factor × (1.0 + assist_extra)
+	//   assist_extra smoothly tracks 0.0 to ~0.40 based on riding conditions.
+	//
+	// lead_factor (lead_pct setting): base steady-state lead. 1.0=match, 1.1=10% ahead
+	// accel_gain (accel_gain setting): 0=no boost, 1.0=moderate, 2.0=aggressive
+	// load_gain (load_gain setting): 0=no boost, 1.0=moderate, 2.0=aggressive
+	static float smooth_accel_mult = 0.0f;   // Smoothed accel contribution (0..0.30)
+	static float smooth_load_mult = 0.0f;    // Smoothed load contribution (0..0.20)
+	static float prev_event_period = 0.0f;   // For period-based accel detection
+	static uint32_t prev_step_count = 0;     // Edge counter for new-edge detection
+	static float accel_rate_smooth = 0.0f;   // LP-filtered RPM/s
 	float target_duty = 0.0f;
 	if (!is_idle && haz_pas_duty_ctx.cadence_smooth > 3.0f) {
-		float cadence_ratio = haz_pas_duty_ctx.cadence_smooth / max_cadence;
-		if (cadence_ratio > 1.0f) cadence_ratio = 1.0f;
-		target_duty = cadence_ratio * max_duty * power_scale * speed_power_scale;
+
+		// === CADENCE ACCEL SIGNAL (period-based, LP-filtered) ===
+		float event_period = app_pas_get_event_period();
+		uint32_t cur_step_count = app_pas_get_step_count();
+		float raw_rpm_rate = 0.0f;
+
+		if (cur_step_count != prev_step_count && prev_event_period > 1e-4f && event_period > 1e-4f) {
+			float magnets = fmaxf(1.0f, (float)appconf->app_pas_conf.magnets);
+			float delta_rpm = (60.0f / magnets) * (1.0f/event_period - 1.0f/prev_event_period);
+			raw_rpm_rate = delta_rpm / event_period;  // RPM/s
+			prev_event_period = event_period;
+			prev_step_count = cur_step_count;
+		} else if (cur_step_count != prev_step_count) {
+			prev_event_period = event_period;
+			prev_step_count = cur_step_count;
+		}
+
+		// Heavy LP filter on rpm_rate — τ ≈ 300ms at 1kHz (kills spikes)
+		// Only update toward positive values (acceleration), decay toward zero
+		if (raw_rpm_rate > 0.0f) {
+			UTILS_LP_FAST(accel_rate_smooth, raw_rpm_rate, 0.01f);  // Slow ramp up
+		} else {
+			accel_rate_smooth *= 0.995f;  // ~200ms decay to zero
+		}
+
+		// Convert RPM/s rate to a multiplier contribution (0..0.30)
+		// At 10 RPM/s with gain=1.0 → 0.10 contribution (10% extra lead)
+		// At 30 RPM/s with gain=1.0 → 0.30 contribution (30% extra lead, capped)
+		float accel_target = accel_rate_smooth * accel_gain * 0.01f;
+		if (accel_target > 0.30f) accel_target = 0.30f;
+		if (accel_target < 0.0f) accel_target = 0.0f;
+
+		// Smooth ramp toward accel target (prevents jumps)
+		float accel_ramp = 0.5f * dt_s;  // Can reach 0.30 in ~600ms
+		if (accel_target > smooth_accel_mult) {
+			smooth_accel_mult += fminf(accel_ramp, accel_target - smooth_accel_mult);
+		} else {
+			smooth_accel_mult += (accel_target - smooth_accel_mult) * 4.0f * dt_s;  // ~250ms decay
+		}
+
+		// === LOAD SIGNAL (current-based effort proxy) ===
+		float motor_current = fabsf(mc_interface_get_tot_current_filtered());
+		float max_current = mcconf->l_current_max;
+		if (max_current < 1.0f) max_current = 30.0f;
+		float load_fraction = motor_current / max_current;
+		if (load_fraction > 1.0f) load_fraction = 1.0f;
+
+		// Base target ERPM (needed for overshoot check)
+		float base_target_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * lead_factor;
+
+		// Anti-runaway: reduce load contribution when motor already ahead
+		float actual_erpm = fabsf(mc_interface_get_rpm());
+		float overshoot_ratio = 0.0f;
+		if (base_target_erpm > 100.0f) {
+			overshoot_ratio = (actual_erpm - base_target_erpm) / base_target_erpm;
+		}
+		float overshoot_scale = 1.0f - (overshoot_ratio * 5.0f);  // 0%→1.0, 20%→0.0
+		if (overshoot_scale > 1.0f) overshoot_scale = 1.0f;
+		if (overshoot_scale < 0.0f) overshoot_scale = 0.0f;
+
+		// Load contribution: load_fraction maps to 0..0.20 multiplier
+		// Only above 10% load threshold (ignores idle current noise)
+		float load_target = 0.0f;
+		if (load_fraction > 0.10f && load_gain > 0.01f) {
+			// At 50% load with gain=1.0 → 0.10 contribution (10% extra lead)
+			// At 100% load with gain=1.0 → 0.20 contribution (20% extra lead)
+			load_target = load_fraction * 0.20f * load_gain * overshoot_scale;
+			if (load_target > 0.20f) load_target = 0.20f;
+		}
+
+		// Smooth ramp for load contribution
+		float load_ramp = 0.4f * dt_s;
+		if (load_target > smooth_load_mult) {
+			smooth_load_mult += fminf(load_ramp, load_target - smooth_load_mult);
+		} else {
+			smooth_load_mult += (load_target - smooth_load_mult) * 6.0f * dt_s;  // ~170ms decay
+		}
+		if (smooth_load_mult < 0.0f) smooth_load_mult = 0.0f;
+
+		// === COMBINE: dynamic assist multiplier ===
+		float assist_extra = smooth_accel_mult + smooth_load_mult;
+		if (assist_extra > 0.40f) assist_extra = 0.40f;  // Cap total at 40% extra lead
+
+		float effective_lead = lead_factor * (1.0f + assist_extra);
+		float target_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * effective_lead;
+
+		// Convert ERPM to duty using physics (voltage-independent)
+		target_duty = target_erpm * erpm_to_duty;
+
+		// Apply speed limit (street mode)
+		target_duty *= speed_power_scale;
+
+		if (target_duty > max_duty) target_duty = max_duty;
+		if (target_duty < 0.0f) target_duty = 0.0f;
 	}
 
 	// Ramp to target
@@ -363,6 +516,9 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	// Clamp
 	if (haz_pas_duty_ctx.duty_cmd < 0.0f) haz_pas_duty_ctx.duty_cmd = 0.0f;
 	if (haz_pas_duty_ctx.duty_cmd > max_duty) haz_pas_duty_ctx.duty_cmd = max_duty;
+
+	// Update previous cadence for next cycle's acceleration detection
+	haz_pas_duty_ctx.cadence_prev = haz_pas_duty_ctx.cadence_smooth;
 
 	return haz_pas_duty_ctx.duty_cmd;
 }
@@ -482,14 +638,14 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 		return pwr_in;
 	}
 
-	float mag = fabsf(pwr_in);
-	if (mag > 1.0f) {
-		mag = 1.0f;
+	float mag_raw = fabsf(pwr_in);
+	if (mag_raw > 1.0f) {
+		mag_raw = 1.0f;
 	}
 	float alpha = throttle_filter_hz * dt_s;
 	utils_truncate_number(&alpha, 0.0f, 1.0f);
-	haz_throttle_filtered += (mag - haz_throttle_filtered) * alpha;
-	mag = haz_throttle_filtered;
+	haz_throttle_filtered += (mag_raw - haz_throttle_filtered) * alpha;
+	float mag = haz_throttle_filtered;  // Filtered for target calculation
 	if (mag < release_eps) {
 		haz_throttle_ctx.current_rel_cmd = haz_throttle_step(
 			haz_throttle_ctx.current_rel_cmd, 0.0f, ramp_down_a, dt_s);
@@ -644,15 +800,17 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 	haz_throttle_ctx.target_erpm = 0.0f;
 	haz_throttle_ctx.erpm_integral = 0.0f;
 
-	// Two-segment ramp curve: min→mid→max based on throttle position
+	// Two-segment ramp curve: min→mid→max based on RAW throttle position
+	// Using raw (unfiltered) so a fast wrist flick immediately gets max ramp rate
+	// even though the filtered target is still climbing
 	float ramp_up_base_a;
-	if (mag <= ramp_up_mid_throttle) {
+	if (mag_raw <= ramp_up_mid_throttle) {
 		// Lower segment: interpolate from min to mid
-		float t = mag / ramp_up_mid_throttle;
+		float t = mag_raw / ramp_up_mid_throttle;
 		ramp_up_base_a = ramp_up_min_a + (ramp_up_mid_a - ramp_up_min_a) * t;
 	} else {
 		// Upper segment: interpolate from mid to max
-		float t = (mag - ramp_up_mid_throttle) / (1.0f - ramp_up_mid_throttle);
+		float t = (mag_raw - ramp_up_mid_throttle) / (1.0f - ramp_up_mid_throttle);
 		ramp_up_base_a = ramp_up_mid_a + (ramp_up_max_a - ramp_up_mid_a) * t;
 	}
 	if (ramp_up_base_a > ramp_up_max_a) {
@@ -1449,18 +1607,29 @@ static THD_FUNCTION(adc_thread, arg) {
 											// Fast throttle movements = snappy response (up to 3x ramp speed)
 											// Slow/micro throttle movements = precise duty control
 											// Gap-based: big gap = fast ramp, small gap = smooth landing
+											// Velocity mult has MEMORY — decays slowly so a fast slam sustains
+											// the boost while duty catches up, not just for one cycle.
 											// =============================================================================
 											static float throttle_prev = 0.0f;
+											static float velocity_mult_held = 1.0f;
 											float throttle_velocity = fabsf(throttle_mag - throttle_prev) / dt_s;
 											throttle_prev = throttle_mag;
 											
-											// Throttle velocity multiplier: 1x at rest, up to 3x when slamming throttle
-											// velocity > 2.0 means moving full range in 0.5s (fast slam)
-											float velocity_mult = 1.0f;
+											// Compute instantaneous velocity multiplier: 1x at rest, up to 1.5x
+											float velocity_mult_instant = 1.0f;
 											if (throttle_velocity > 0.5f) {
-												// Scale from 1x at 0.5/s to 3x at 3.0/s
-												velocity_mult = 1.0f + fminf((throttle_velocity - 0.5f) / 2.5f, 1.0f) * 2.0f;
+												velocity_mult_instant = 1.0f + fminf((throttle_velocity - 0.5f) / 2.5f, 1.0f) * 0.5f;
 											}
+											
+											// Hold the peak and decay: fast slam sustains boost while ramp catches up
+											if (velocity_mult_instant > velocity_mult_held) {
+												velocity_mult_held = velocity_mult_instant;  // Instant peak capture
+											} else {
+												// Decay toward 1.0 over ~0.5s (blend rate 4/s)
+												velocity_mult_held += (1.0f - velocity_mult_held) * fminf(4.0f * dt_s, 1.0f);
+												if (velocity_mult_held < 1.0f) velocity_mult_held = 1.0f;
+											}
+											float velocity_mult = velocity_mult_held;
 											
 											// Gap-based scaling: big gap = fast ramp, small gap = smooth landing
 											const float fast_threshold = 0.15f;  // Above 15% gap = full fast
@@ -1478,9 +1647,9 @@ static THD_FUNCTION(adc_thread, arg) {
 											}
 
 											if (duty_target > osf_duty_ramped) {
-												// Ramping UP - apply both gap ratio and velocity mult
+												// Ramping UP — velocity mult directly scales the FINAL rate
 												float ramp_rate = ramp_up_slow + (ramp_up_fast - ramp_up_slow) * gap_ratio;
-												ramp_rate *= velocity_mult;  // Fast throttle slam = faster ramp
+												ramp_rate *= velocity_mult;  // Flick speed multiplies everything
 												osf_duty_ramped += ramp_rate * dt_s;
 												if (osf_duty_ramped > duty_target) osf_duty_ramped = duty_target;
 											} else {

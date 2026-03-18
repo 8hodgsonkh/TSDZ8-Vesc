@@ -3788,44 +3788,40 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			if (motor_now->m_mtpa_boost_active) {
 				const float omega_e = erpm_now * (2.0f * M_PI / 60.0f);  // Electrical rad/s
 				
-				// Check modulation depth
-				float mod_now = sqrtf(SQ(state_now->mod_d) + SQ(state_now->mod_q_filter));
-				const float fw_start = conf_now->l_max_duty * 0.90f;  // Start FW at 90%
-				const float fw_full = conf_now->l_max_duty * 0.95f;   // Full FW at 95%
-				bool in_fw_zone = (mod_now > fw_start);
+				// FW activates only when duty hits the actual ceiling (max_duty).
+				// No proportional band — just a time-based ramp once at the wall.
+				// This avoids wasting current as heat when voltage headroom exists.
+				float duty_abs = fabsf(state_now->duty_now);
+				const float fw_threshold = conf_now->l_max_duty - 0.005f;  // Within 0.5% of ceiling
+				bool at_ceiling = (duty_abs > fw_threshold) && (omega_e > 100.0f);
 				
 				// Store for debug
-				motor_now->m_fw_mod_now = mod_now;
-				motor_now->m_fw_at_ceiling = (mod_now > fw_full * 0.99f);
-				motor_now->m_fw_in_boost = in_fw_zone;
+				motor_now->m_fw_mod_now = duty_abs;
+				motor_now->m_fw_at_ceiling = at_ceiling;
+				motor_now->m_fw_in_boost = (motor_now->m_mtpa_boost_iq < -0.1f);
 				
-				float id_fw_target = 0.0f;
-				if (in_fw_zone && omega_e > 100.0f) {
-					// Scale 0-1 from 90% to 95% duty
-					// At 90% = 0, at 92.5% = 0.5, at 95% = 1.0
-					float fw_depth = (mod_now - fw_start) / (fw_full - fw_start);
-					fw_depth = fmaxf(0.0f, fminf(1.0f, fw_depth));
-					
-					// Max FW current based on boost level: Level N = -3.6N amps
-					// Level 5 = -18A max
-					float id_fw_max = -3.6f * motor_now->m_mtpa_boost_level;
-					
-					// Target scales with depth into FW zone
-					id_fw_target = id_fw_max * fw_depth;
-				}
+				// Max FW current based on boost level: Level N = -3.6N amps
+				// Level 5 = -18A max
+				float id_fw_max = -3.6f * motor_now->m_mtpa_boost_level;
 				
-				// Ramp towards target for smooth transitions
-				const float ramp_rate = 0.001f;  // ~30A/s at 30kHz (0.33s to 10A)
+				// Time-based ramp: ~18A/s at 30kHz = 1.0s to reach -18A (level 5)
+				const float ramp_rate = 0.0006f;
 				
-				if (motor_now->m_mtpa_boost_iq > id_fw_target) {
-					motor_now->m_mtpa_boost_iq -= ramp_rate;
-					if (motor_now->m_mtpa_boost_iq < id_fw_target) {
-						motor_now->m_mtpa_boost_iq = id_fw_target;
+				if (at_ceiling) {
+					// At the wall — ramp Id toward full FW current
+					if (motor_now->m_mtpa_boost_iq > id_fw_max) {
+						motor_now->m_mtpa_boost_iq -= ramp_rate;
+						if (motor_now->m_mtpa_boost_iq < id_fw_max) {
+							motor_now->m_mtpa_boost_iq = id_fw_max;
+						}
 					}
-				} else if (motor_now->m_mtpa_boost_iq < id_fw_target) {
-					motor_now->m_mtpa_boost_iq += ramp_rate;
-					if (motor_now->m_mtpa_boost_iq > id_fw_target) {
-						motor_now->m_mtpa_boost_iq = id_fw_target;
+				} else {
+					// Below ceiling — ramp back to zero
+					if (motor_now->m_mtpa_boost_iq < 0.0f) {
+						motor_now->m_mtpa_boost_iq += ramp_rate;
+						if (motor_now->m_mtpa_boost_iq > 0.0f) {
+							motor_now->m_mtpa_boost_iq = 0.0f;
+						}
 					}
 				}
 				

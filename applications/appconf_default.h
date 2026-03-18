@@ -215,14 +215,17 @@
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_ENABLED
 #define APPCONF_ADC_HAZ_PAS_DUTY_ENABLED			false
 #endif
-#ifndef APPCONF_ADC_HAZ_PAS_DUTY_VARIATION_THRESHOLD
-#define APPCONF_ADC_HAZ_PAS_DUTY_VARIATION_THRESHOLD	0.15f	// UNUSED in new version
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_SMOOTHING
+#define APPCONF_ADC_HAZ_PAS_DUTY_SMOOTHING			0.15f	// LP filter: 0.0=raw, 1.0=max smooth
 #endif
-#ifndef APPCONF_ADC_HAZ_PAS_DUTY_ERPM_BOOST
-#define APPCONF_ADC_HAZ_PAS_DUTY_ERPM_BOOST			1.0f	// Max Cadence scale (1.0 = 100 RPM for max duty)
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_LEAD_PCT
+#define APPCONF_ADC_HAZ_PAS_DUTY_LEAD_PCT			1.0f	// Lead %: 0=match, 1.0=10% ahead, 2.0=20% ahead
 #endif
-#ifndef APPCONF_ADC_HAZ_PAS_DUTY_EFFORT_GAIN
-#define APPCONF_ADC_HAZ_PAS_DUTY_EFFORT_GAIN			0.7f	// Power Scale (0.5 = 50%, 1.0 = 100%)
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_ACCEL_GAIN
+#define APPCONF_ADC_HAZ_PAS_DUTY_ACCEL_GAIN			0.7f	// Cadence accel boost (0=off, 2.0=aggressive)
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_LOAD_GAIN
+#define APPCONF_ADC_HAZ_PAS_DUTY_LOAD_GAIN			0.5f	// Load/current boost (0=off, 2.0=aggressive)
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP
 #define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP			0.3f	// Duty/s ramp up (lower = smoother)
@@ -230,8 +233,8 @@
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN
 #define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN			0.5f	// Duty/s ramp down
 #endif
-#ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_RISE_TIME
-#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_RISE_TIME		0.3f	// UNUSED in new version
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_MEDIAN_FILTER
+#define APPCONF_ADC_HAZ_PAS_DUTY_MEDIAN_FILTER			5.0f	// Median samples: 0=off, 1=latest, 3-11=median
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_IDLE_TIMEOUT
 #define APPCONF_ADC_HAZ_PAS_DUTY_IDLE_TIMEOUT			0.5f	// Idle timeout (s)

@@ -780,12 +780,13 @@ typedef struct {
 	float haz_freewheel_catch_modifier;           // Tweak timing (1.0=normal, <1=earlier)
 	// PAS Duty - sexy duty-based PAS control
 	bool haz_pas_duty_enabled;
-	float haz_pas_duty_variation_threshold;
-	float haz_pas_duty_erpm_boost;
-	float haz_pas_duty_effort_gain;
+	float haz_pas_duty_smoothing;
+	float haz_pas_duty_lead_pct;
+	float haz_pas_duty_accel_gain;
+	float haz_pas_duty_load_gain;
 	float haz_pas_duty_ramp_up;
 	float haz_pas_duty_ramp_down;
-	float haz_pas_duty_ramp_rise_time;
+	float haz_pas_duty_median_filter;
 	float haz_pas_duty_idle_timeout;
 } adc_config;
 
