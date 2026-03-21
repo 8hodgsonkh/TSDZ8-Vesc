@@ -13,4 +13,5 @@ HWSRC =	\
 
 HWINC = hwconf \
 		hwconf/luna \
+		hwconf/luna/bbshd \
 		hwconf/other

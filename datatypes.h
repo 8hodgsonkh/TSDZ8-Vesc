@@ -788,6 +788,16 @@ typedef struct {
 	float haz_pas_duty_ramp_down;
 	float haz_pas_duty_median_filter;
 	float haz_pas_duty_idle_timeout;
+	// Torque Sensor Mode - external torque sensor via ESP32 BLE
+	// When enabled, replaces cadence accel + load accel with real torque data.
+	// Still uses PAS cadence for speed matching. Torque modulates how hard motor pushes.
+	bool haz_torque_enabled;                  // Enable torque sensor for hybrid duty PAS mode
+	float haz_torque_strength;                // Assist multiplier (0.1-5.0, default 1.0)
+	float haz_torque_smoothing;               // LP filter on torque 0.0-1.0 (default 0.3)
+	float haz_torque_start_threshold;         // Min normalized torque to engage (0-50, default 5)
+	float haz_torque_idle_timeout;            // Seconds no torque before rampdown (default 0.5)
+	float haz_torque_responsiveness;          // Curve shape: 0=gentle 1=linear 2=aggressive (default 1.0)
+	bool haz_torque_enable_current_pas;       // Enable torque sensor for current control PAS mode
 } adc_config;
 
 // Nunchuk control types
@@ -828,17 +838,15 @@ typedef struct {
 	float ramp_time_neg;
 	uint32_t update_rate_hz;
 	float max_current;
-	float pas_follow_start_rotations;
-	float pas_follow_idle_timeout_s;
-	float pas_follow_base_current_frac;
-	float pas_follow_base_rpm_full;
-	float pas_follow_kp_a_per_erpm;
-	float pas_follow_deadband_erpm;
-	float pas_follow_target_lead;
-	float pas_follow_ramp_up_base_a_per_s;
-	float pas_follow_ramp_up_full_a_per_s;
-	float pas_follow_ramp_up_rise_time_s;
-	float pas_follow_ramp_down_a_per_s;
+	// Speed PID PAS follow
+	float pas_follow_start_rotations;     // Pedal rotations before motor engages
+	float pas_follow_idle_timeout_s;      // Seconds before motor disengages
+	float pas_follow_target_lead;         // Motor ERPM = cadence × ratio × lead
+	float pas_follow_erpm_ramp_rate;      // Target ERPM smoothing rate (ERPM/s)
+	float pas_follow_cadence_filter;      // LP filter for target ERPM tracking (0-1, lower=smoother)
+	float pas_follow_ramp_down_mult;      // Ramp-down rate in ERPM/s (how fast motor slows when you stop)
+	float pas_follow_speed_limit_kmh;     // Street mode PAS speed limit (km/h, 0=off)
+	float pas_follow_speed_limit_decay;   // Target decay factor at speed limit (0.5-0.99)
 } pas_config;
 
 // NRF Datatypes

@@ -32,6 +32,22 @@
 #include "comm_can.h"
 #include "datatypes.h"
 
+// Weak default for non-BBSHD boards (BBSHD provides strong symbol in hw_luna_bbshd.c)
+__attribute__((weak)) bool hw_bbshd_has_fixed_throttle_level(void) { return false; }
+
+// ── Up-Down-Up-Down-Up-Down offroad toggle ──
+// Press UP then DOWN alternating 6 times (U-D-U-D-U-D) to toggle offroad/street.
+// Each press must come within 2 seconds of the previous one.
+// Sequence resets on timeout or wrong direction.
+#define OFFROAD_COMBO_LEN       6
+#define OFFROAD_COMBO_TIMEOUT_MS 2000
+static volatile int combo_step = 0;           // 0..5, how many correct presses so far
+static volatile systime_t combo_last_time = 0; // timestamp of last valid press
+static volatile int8_t combo_prev_level = -1;  // previous numeric PAS level (0-9)
+
+// Forward declaration — defined after LUNA_PAS_LEVEL enum
+static int8_t pas_code_to_numeric(uint8_t code);
+
 #define CMD_READ			0x11
 #define CMD_WRITE			0x16
 
@@ -71,6 +87,23 @@ typedef enum {
 	PAS_LEVEL_9 = 0x03,
 	PAS_LEVEL_WALK = 0x06,
 } LUNA_PAS_LEVEL;
+
+// Convert Bafang PAS code to numeric 0-9 (-1 for walk/unknown)
+static int8_t pas_code_to_numeric(uint8_t code) {
+	switch (code) {
+		case PAS_LEVEL_0: return 0;
+		case PAS_LEVEL_1: return 1;
+		case PAS_LEVEL_2: return 2;
+		case PAS_LEVEL_3: return 3;
+		case PAS_LEVEL_4: return 4;
+		case PAS_LEVEL_5: return 5;
+		case PAS_LEVEL_6: return 6;
+		case PAS_LEVEL_7: return 7;
+		case PAS_LEVEL_8: return 8;
+		case PAS_LEVEL_9: return 9;
+		default: return -1;
+	}
+}
 
 typedef enum {
 	WRITE_LOW_BATTERY_ERROR = 0x00,
@@ -215,6 +248,43 @@ static bool check_assist_level(uint8_t assist_code) {
 static void set_assist_level(uint8_t assist_code) {
 	float current_scale;
     volatile mc_configuration *mcconf = (volatile mc_configuration*) mc_interface_get_configuration();
+
+	// ── Up-Down-Up-Down-Up-Down offroad toggle ──
+	// Detect alternating direction changes: U-D-U-D-U-D
+	// Even steps (0,2,4) expect UP, odd steps (1,3,5) expect DOWN
+	{
+		int8_t numeric = pas_code_to_numeric(assist_code);
+		if (numeric >= 0 && combo_prev_level >= 0 && numeric != combo_prev_level) {
+			systime_t now = chVTGetSystemTimeX();
+			bool is_up = (numeric > combo_prev_level);
+			// Expected direction: even steps = UP, odd steps = DOWN
+			bool expected_up = ((combo_step & 1) == 0);
+
+			if (combo_step > 0 && ST2MS(now - combo_last_time) > OFFROAD_COMBO_TIMEOUT_MS) {
+				combo_step = 0; // Timeout — reset
+			}
+
+			if (is_up == expected_up) {
+				combo_step++;
+				combo_last_time = now;
+
+				if (combo_step >= OFFROAD_COMBO_LEN) {
+					bool new_mode = !mc_interface_is_offroad_mode();
+					mc_interface_set_offroad_mode(new_mode);
+					commands_printf("Offroad mode %s (U-D-U-D-U-D combo)",
+								   new_mode ? "ON" : "OFF");
+					combo_step = 0;
+				}
+			} else {
+				// Wrong direction — if this was an UP, it could be start of a new sequence
+				combo_step = is_up ? 1 : 0;
+				combo_last_time = now;
+			}
+		}
+		if (numeric >= 0) {
+			combo_prev_level = numeric;
+		}
+	}
 
 	switch (assist_code) {
 		case PAS_LEVEL_0: current_scale = 0.0; break;

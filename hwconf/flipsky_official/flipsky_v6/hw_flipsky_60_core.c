@@ -28,7 +28,7 @@
 
 // Variables
 static volatile bool i2c_running = false;
-#if defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)
+#if (defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)) && defined(HW_SHUTDOWN_GPIO)
 static mutex_t shutdown_mutex;
 static float bt_diff = 0.0;
 #endif
@@ -40,13 +40,13 @@ static const I2CConfig i2cfg = {
 		STD_DUTY_CYCLE
 };
 
-#if defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)
+#if (defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)) && defined(HW_SHUTDOWN_GPIO)
 static void terminal_shutdown_now(int argc, const char **argv);
 static void terminal_button_test(int argc, const char **argv);
 #endif
 
 void hw_init_gpio(void) {
-#if defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)
+#if (defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)) && defined(HW_SHUTDOWN_GPIO)
 	chMtxObjectInit(&shutdown_mutex);
 #endif
 
@@ -155,7 +155,7 @@ void hw_init_gpio(void) {
 
 	drv8301_init();
 
-#if defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)
+#if (defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)) && defined(HW_SHUTDOWN_GPIO)
 	terminal_register_command_callback(
 		"shutdown",
 		"Shutdown VESC now.",
@@ -307,7 +307,7 @@ void hw_try_restore_i2c(void) {
 	}
 }
 
-#if defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)
+#if (defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)) && defined(HW_SHUTDOWN_GPIO)
 bool hw_sample_shutdown_button(void) {
 	chMtxLock(&shutdown_mutex);
 

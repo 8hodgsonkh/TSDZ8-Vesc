@@ -61,6 +61,10 @@
 #include "events.h"
 #include "main.h"
 
+#ifdef HW_HAS_LUNA_SERIAL_DISPLAY
+#include "luna_display_serial.h"
+#endif
+
 #ifdef CAN_ENABLE
 #include "comm_can.h"
 #define CAN_FRAME_MAX_PL_SIZE	8
@@ -310,6 +314,13 @@ int main(void) {
 	app_uartcomm_start(UART_PORT_EXTRA_HEADER);
 	app_set_configuration(appconf);
 
+#ifdef HW_HAS_LUNA_SERIAL_DISPLAY
+	// Start Bafang display protocol on HW_UART_DEV (must come AFTER app_set_configuration
+	// so UART_PORT_COMM_HEADER isn't also claimed by app_uartcomm for VESC protocol).
+	// Kartman's app_to_use must be APP_ADC (not APP_ADC_UART) to avoid conflict.
+	luna_display_serial_start(5);  // Default PAS level 5 (full power)
+#endif
+
 	// This reads the appconf, that must be initialized first.
 #if CAN_ENABLE
 	comm_can_init();
@@ -398,6 +409,9 @@ static bool detect_offroad_mode_on_boot(void) {
     }
 
     // Held for full 5s -> Return TRUE (Offroad Mode)
+    return true;
+#elif defined(HW_EBIKE_DEFAULT_OFFROAD)
+    // No power button — always boot into offroad (full power) mode
     return true;
 #else
     return false;

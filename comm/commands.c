@@ -835,6 +835,12 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 				mcpwm_foc_stall_set_enabled(false);
 			}
 		}
+		// Hazza torque sensor data from ESP32
+		// Format: [0x48] [0x54] [value_hi] [value_lo] = "HT" + uint16 (0-160 normalized)
+		if (len >= 4 && data[0] == 0x48 && data[1] == 0x54) {
+			uint16_t torque = ((uint16_t)data[2] << 8) | data[3];
+			app_adc_set_ext_torque(torque);
+		}
 		if (appdata_func) {
 			appdata_func(data, len);
 		}

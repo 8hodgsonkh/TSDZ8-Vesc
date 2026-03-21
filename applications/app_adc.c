@@ -41,17 +41,6 @@
 #define RPM_FILTER_SAMPLES				8
 #define TC_DIFF_MAX_PASS				60  // TODO: move to app_conf
 #define PAS_THROTTLE_IDLE_GATE		0.05f
-#define PAS_FOLLOW_START_ROTATIONS_DEFAULT	0.15f
-#define PAS_FOLLOW_IDLE_TIMEOUT_S_DEFAULT	0.6f
-#define PAS_FOLLOW_BASE_CURRENT_FRAC_DEFAULT	0.2f
-#define PAS_FOLLOW_BASE_RPM_FULL_DEFAULT	40.0f
-#define PAS_FOLLOW_KP_A_PER_ERPM_DEFAULT	0.01f
-#define PAS_FOLLOW_DEADBAND_ERPM_DEFAULT	30.0f
-#define PAS_FOLLOW_TARGET_LEAD_DEFAULT	1.08f
-#define PAS_FOLLOW_RAMP_UP_BASE_A_PER_S_DEFAULT	5.0f
-#define PAS_FOLLOW_RAMP_UP_FULL_A_PER_S_DEFAULT	25.0f
-#define PAS_FOLLOW_RAMP_UP_RISE_TIME_S_DEFAULT	2.0f
-#define PAS_FOLLOW_RAMP_DOWN_A_PER_S_DEFAULT	60.0f
 #define HAZ_THR_RELEASE_EPS_DEFAULT	0.01f
 #define HAZ_THR_DUTY_GATE_SPAN_DEFAULT	0.08f
 #define HAZ_THR_DUTY_GATE_MIN_SCALE_DEFAULT	0.60f
@@ -86,10 +75,6 @@
 			out = min_value;
 		}
 		return out;
-	}
-
-	static float haz_pas_conf_clamp(float value, float fallback, float min_value, float max_value) {
-		return haz_conf_clamp(value, fallback, min_value, max_value);
 	}
 
 // Threads
@@ -165,19 +150,23 @@ static haz_throttle_ctx_t haz_throttle_ctx = {
 static float haz_throttle_filtered = 0.0f;
 
 typedef struct {
-	float current_rel_cmd;
+	float target_erpm_smooth;  // Ramp-limited output ERPM for speed PID
+	float target_erpm_filtered; // LP-filtered target ERPM (smooth tracking)
 	float rotation_progress;
 	float idle_time;
 	bool engaged;
-	float ramp_elapsed;
+	uint32_t last_step_count;  // For step-rate idle detection
+	float step_rate_smooth;    // LP-filtered PAS step rate (steps/sec)
 } haz_pas_follow_ctx_t;
 
 static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
-	.current_rel_cmd = 0.0f,
+	.target_erpm_smooth = 0.0f,
+	.target_erpm_filtered = 0.0f,
 	.rotation_progress = 0.0f,
 	.idle_time = 0.0f,
 	.engaged = false,
-	.ramp_elapsed = 0.0f
+	.last_step_count = 0,
+	.step_rate_smooth = 0.0f
 };
 
 // =============================================================================
@@ -210,6 +199,24 @@ static haz_pas_duty_ctx_t haz_pas_duty_ctx = {
 	.engaged = false,
 	.last_step_count = 0
 };
+
+// =============================================================================
+// EXTERNAL TORQUE SENSOR (from ESP32 via BLE)
+// =============================================================================
+// ESP32 sends processed torque (0-160 normalized) via COMM_CUSTOM_APP_DATA "HT"
+static volatile uint16_t s_ext_torque = 0;        // 0-160 from ESP32
+static volatile systime_t s_ext_torque_ts = 0;    // Last receive timestamp
+static float s_ext_torque_smooth = 0.0f;          // LP-filtered torque
+
+void app_adc_set_ext_torque(uint16_t value) {
+	if (value > 160) value = 160;
+	s_ext_torque = value;
+	s_ext_torque_ts = chVTGetSystemTimeX();
+}
+
+uint16_t app_adc_get_ext_torque(void) {
+	return s_ext_torque;
+}
 
 // ERPM-tracking PAS duty - motor matches cadence through drivetrain
 static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
@@ -377,33 +384,83 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	// ========== ERPM-TRACKING + SMOOTH DYNAMIC ASSIST ==========
 	// Base: convert cadence → motor ERPM → duty via back-EMF physics.
 	//
-	// Dynamic assist multiplier (no torque sensor — use available signals):
-	// Instead of spiking ERPM accumulators, compute a smooth "assist_mult"
-	// that scales how far ahead the motor leads the rider's cadence.
+	// Two modes for dynamic assist determination:
 	//
-	// Two signal sources feed into one multiplier:
+	// A) TORQUE SENSOR MODE (haz_torque_enabled):
+	//    External torque sensor (0-160 normalized) from ESP32 via BLE.
+	//    Torque value directly modulates lead — harder push = more motor lead.
+	//    Replaces cadence accel + load accel entirely. Pure rider intent.
 	//
-	// 1. CADENCE ACCEL: period-based acceleration from PAS quadrature decoder.
-	//    Positive rpm_rate (RPM/s) → rider is speeding up pedaling → increase lead.
-	//    Smoothed and capped so a single stomp doesn't cause a surge.
-	//
-	// 2. LOAD SIGNAL: motor current fraction as effort proxy.
-	//    High current at constant cadence = riding uphill or pushing hard.
-	//    Anti-runaway: reduced when motor ERPM already exceeds base target.
+	// B) CADENCE INFERENCE MODE (original, no torque sensor):
+	//    Uses cadence acceleration + motor current as effort proxies.
+	//    Two signal sources feed into assist_extra multiplier.
 	//
 	// Result: effective_lead = lead_factor × (1.0 + assist_extra)
-	//   assist_extra smoothly tracks 0.0 to ~0.40 based on riding conditions.
-	//
-	// lead_factor (lead_pct setting): base steady-state lead. 1.0=match, 1.1=10% ahead
-	// accel_gain (accel_gain setting): 0=no boost, 1.0=moderate, 2.0=aggressive
-	// load_gain (load_gain setting): 0=no boost, 1.0=moderate, 2.0=aggressive
 	static float smooth_accel_mult = 0.0f;   // Smoothed accel contribution (0..0.30)
 	static float smooth_load_mult = 0.0f;    // Smoothed load contribution (0..0.20)
 	static float prev_event_period = 0.0f;   // For period-based accel detection
 	static uint32_t prev_step_count = 0;     // Edge counter for new-edge detection
 	static float accel_rate_smooth = 0.0f;   // LP-filtered RPM/s
 	float target_duty = 0.0f;
+	static float torque_duty_boost = 0.0f;  // Smoothed torque duty addition
 	if (!is_idle && haz_pas_duty_ctx.cadence_smooth > 3.0f) {
+
+		float assist_extra = 0.0f;
+
+		if (conf->haz_torque_enabled) {
+			// ========== TORQUE SENSOR MODE ==========
+			// Torque sensor adds a direct duty boost on top of cadence-derived
+			// base duty. Harder pedaling → more duty. Normal hybrid ramps
+			// handle all smoothing — no separate ramp overrides.
+			//
+			// torque_duty_boost is computed here but added AFTER the cadence
+			// inference path computes the base target_duty.
+
+			systime_t torque_age = chVTTimeElapsedSinceX(s_ext_torque_ts);
+			float torque_age_s = (float)torque_age / (float)CH_CFG_ST_FREQUENCY;
+			float torque_timeout = fmaxf(conf->haz_torque_idle_timeout, 0.1f);
+
+			float torque_raw = 0.0f;
+			if (torque_age_s < torque_timeout && s_ext_torque > 0) {
+				torque_raw = (float)s_ext_torque / 160.0f;
+			}
+
+			float start_thresh = conf->haz_torque_start_threshold / 160.0f;
+			if (torque_raw < start_thresh) torque_raw = 0.0f;
+
+			float t_smooth = fmaxf(conf->haz_torque_smoothing, 0.0f);
+			if (t_smooth > 0.99f) t_smooth = 0.99f;
+			float t_lp = (t_smooth < 0.01f) ? 1.0f : (1.0f - t_smooth * 0.99f);
+			UTILS_LP_FAST(s_ext_torque_smooth, torque_raw, t_lp);
+
+			float resp = fmaxf(conf->haz_torque_responsiveness, 0.0f);
+			if (resp > 2.0f) resp = 2.0f;
+			float shaped;
+			if (resp < 0.5f) {
+				shaped = s_ext_torque_smooth * s_ext_torque_smooth;
+			} else if (resp > 1.5f) {
+				shaped = sqrtf(s_ext_torque_smooth);
+			} else {
+				float t = s_ext_torque_smooth;
+				float blend = (resp - 0.5f);
+				shaped = (t * t) * (1.0f - blend) + sqrtf(fmaxf(t, 0.0f)) * blend;
+			}
+
+			// strength scales the duty boost:
+			// strength=1.0 at full torque → +0.30 duty
+			// strength=2.0 at full torque → +0.60 duty
+			// strength=0.5 at full torque → +0.15 duty
+			float strength = fmaxf(conf->haz_torque_strength, 0.1f);
+			if (strength > 5.0f) strength = 5.0f;
+			torque_duty_boost = shaped * strength * 0.30f;
+		} else {
+			torque_duty_boost = 0.0f;
+		}
+
+		// Cadence inference always runs (provides base assist_extra even in
+		// torque mode for the small cadence-accel/load signals; torque boost
+		// is additive on top via duty, not via lead)
+		{
 
 		// === CADENCE ACCEL SIGNAL (period-based, LP-filtered) ===
 		float event_period = app_pas_get_event_period();
@@ -422,26 +479,21 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		}
 
 		// Heavy LP filter on rpm_rate — τ ≈ 300ms at 1kHz (kills spikes)
-		// Only update toward positive values (acceleration), decay toward zero
 		if (raw_rpm_rate > 0.0f) {
-			UTILS_LP_FAST(accel_rate_smooth, raw_rpm_rate, 0.01f);  // Slow ramp up
+			UTILS_LP_FAST(accel_rate_smooth, raw_rpm_rate, 0.01f);
 		} else {
-			accel_rate_smooth *= 0.995f;  // ~200ms decay to zero
+			accel_rate_smooth *= 0.995f;
 		}
 
-		// Convert RPM/s rate to a multiplier contribution (0..0.30)
-		// At 10 RPM/s with gain=1.0 → 0.10 contribution (10% extra lead)
-		// At 30 RPM/s with gain=1.0 → 0.30 contribution (30% extra lead, capped)
 		float accel_target = accel_rate_smooth * accel_gain * 0.01f;
 		if (accel_target > 0.30f) accel_target = 0.30f;
 		if (accel_target < 0.0f) accel_target = 0.0f;
 
-		// Smooth ramp toward accel target (prevents jumps)
-		float accel_ramp = 0.5f * dt_s;  // Can reach 0.30 in ~600ms
+		float accel_ramp = 0.5f * dt_s;
 		if (accel_target > smooth_accel_mult) {
 			smooth_accel_mult += fminf(accel_ramp, accel_target - smooth_accel_mult);
 		} else {
-			smooth_accel_mult += (accel_target - smooth_accel_mult) * 4.0f * dt_s;  // ~250ms decay
+			smooth_accel_mult += (accel_target - smooth_accel_mult) * 4.0f * dt_s;
 		}
 
 		// === LOAD SIGNAL (current-based effort proxy) ===
@@ -451,47 +503,44 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		float load_fraction = motor_current / max_current;
 		if (load_fraction > 1.0f) load_fraction = 1.0f;
 
-		// Base target ERPM (needed for overshoot check)
 		float base_target_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * lead_factor;
 
-		// Anti-runaway: reduce load contribution when motor already ahead
 		float actual_erpm = fabsf(mc_interface_get_rpm());
 		float overshoot_ratio = 0.0f;
 		if (base_target_erpm > 100.0f) {
 			overshoot_ratio = (actual_erpm - base_target_erpm) / base_target_erpm;
 		}
-		float overshoot_scale = 1.0f - (overshoot_ratio * 5.0f);  // 0%→1.0, 20%→0.0
+		float overshoot_scale = 1.0f - (overshoot_ratio * 5.0f);
 		if (overshoot_scale > 1.0f) overshoot_scale = 1.0f;
 		if (overshoot_scale < 0.0f) overshoot_scale = 0.0f;
 
-		// Load contribution: load_fraction maps to 0..0.20 multiplier
-		// Only above 10% load threshold (ignores idle current noise)
 		float load_target = 0.0f;
 		if (load_fraction > 0.10f && load_gain > 0.01f) {
-			// At 50% load with gain=1.0 → 0.10 contribution (10% extra lead)
-			// At 100% load with gain=1.0 → 0.20 contribution (20% extra lead)
 			load_target = load_fraction * 0.20f * load_gain * overshoot_scale;
 			if (load_target > 0.20f) load_target = 0.20f;
 		}
 
-		// Smooth ramp for load contribution
 		float load_ramp = 0.4f * dt_s;
 		if (load_target > smooth_load_mult) {
 			smooth_load_mult += fminf(load_ramp, load_target - smooth_load_mult);
 		} else {
-			smooth_load_mult += (load_target - smooth_load_mult) * 6.0f * dt_s;  // ~170ms decay
+			smooth_load_mult += (load_target - smooth_load_mult) * 6.0f * dt_s;
 		}
 		if (smooth_load_mult < 0.0f) smooth_load_mult = 0.0f;
 
-		// === COMBINE: dynamic assist multiplier ===
-		float assist_extra = smooth_accel_mult + smooth_load_mult;
-		if (assist_extra > 0.40f) assist_extra = 0.40f;  // Cap total at 40% extra lead
+		assist_extra = smooth_accel_mult + smooth_load_mult;
+		if (assist_extra > 0.40f) assist_extra = 0.40f;
+
+		} // end cadence inference
 
 		float effective_lead = lead_factor * (1.0f + assist_extra);
 		float target_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * effective_lead;
 
 		// Convert ERPM to duty using physics (voltage-independent)
 		target_duty = target_erpm * erpm_to_duty;
+
+		// Add torque duty boost on top of cadence-derived base
+		target_duty += torque_duty_boost;
 
 		// Apply speed limit (street mode)
 		target_duty *= speed_power_scale;
@@ -500,7 +549,7 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		if (target_duty < 0.0f) target_duty = 0.0f;
 	}
 
-	// Ramp to target
+	// Ramp to target — normal hybrid PAS ramps, no torque overrides
 	if (target_duty > haz_pas_duty_ctx.duty_cmd) {
 		haz_pas_duty_ctx.duty_cmd += ramp_up * dt_s;
 		if (haz_pas_duty_ctx.duty_cmd > target_duty) {
@@ -840,186 +889,208 @@ static float haz_throttle_process(float pwr_in, float dt_s) {
 }
 
 static void haz_pas_follow_reset(void) {
-	haz_pas_follow_ctx.current_rel_cmd = 0.0f;
+	haz_pas_follow_ctx.target_erpm_smooth = 0.0f;
+	haz_pas_follow_ctx.target_erpm_filtered = 0.0f;
 	haz_pas_follow_ctx.rotation_progress = 0.0f;
 	haz_pas_follow_ctx.idle_time = 0.0f;
 	haz_pas_follow_ctx.engaged = false;
-	haz_pas_follow_ctx.ramp_elapsed = 0.0f;
+	haz_pas_follow_ctx.step_rate_smooth = 0.0f;
+	// Note: don't reset last_step_count — it's cumulative
 }
 
+// Returns:
+//   > 0  : PAS active, speed PID already set on motor — caller must NOT apply current/duty
+//   0.0  : PAS idle, caller should release motor
 static float haz_pas_follow_process(float dt_s) {
 	const app_configuration *appconf = app_get_configuration();
-	const pas_config *pas_conf = &appconf->app_pas_conf;
-	if (pas_conf->ctrl_type == PAS_CTRL_TYPE_NONE) {
+	const pas_config *pc = &appconf->app_pas_conf;
+	if (pc->ctrl_type == PAS_CTRL_TYPE_NONE) {
 		haz_pas_follow_reset();
 		return 0.0f;
 	}
 
+	// Read config — all values stored in proper units, no scaling hacks
+	const float start_rotations  = fmaxf(pc->pas_follow_start_rotations, 0.01f);
+	const float idle_timeout_s   = fmaxf(pc->pas_follow_idle_timeout_s, 0.05f);
+	const float target_lead      = fmaxf(pc->pas_follow_target_lead, 0.5f);
+	const float erpm_ramp_rate   = fmaxf(pc->pas_follow_erpm_ramp_rate, 100.0f);
+	const float cadence_filter   = fminf(fmaxf(pc->pas_follow_cadence_filter, 0.01f), 1.0f);
+	const float ramp_down_rate   = fmaxf(pc->pas_follow_ramp_down_mult, 500.0f); // ERPM/s
+
 	// ========== SPEED LIMIT CHECK (STREET MODE ONLY) ==========
-	// PAS current mode also respects 15.5 mph limit in street mode
+	// Hardcoded 25 km/h — smooth taper from 90%, instant cut at limit
 	if (!mc_interface_is_offroad_mode()) {
-		const float pas_speed_limit_ms = 15.5f * 0.44704f;  // mph to m/s
+		const float speed_limit_ms = 25.0f / 3.6f;  // 25 km/h
+		const float taper_start_ms = speed_limit_ms * 0.90f;
 		float wheel_speed = fabsf(mc_interface_get_speed());
-		if (wheel_speed >= pas_speed_limit_ms) {
-			// At or above limit - return zero, force ramp down
-			haz_pas_follow_ctx.current_rel_cmd *= 0.9f; // Quick decay
-			if (haz_pas_follow_ctx.current_rel_cmd < 0.01f) {
-				haz_pas_follow_ctx.current_rel_cmd = 0.0f;
-			}
+
+		if (wheel_speed >= speed_limit_ms) {
+			// At or above limit — instant cut
+			haz_pas_follow_ctx.target_erpm_smooth = 0.0f;
 			return 0.0f;
+		} else if (wheel_speed > taper_start_ms) {
+			// Approaching limit — scale target ERPM proportionally
+			float scale = (speed_limit_ms - wheel_speed) / (speed_limit_ms - taper_start_ms);
+			haz_pas_follow_ctx.target_erpm_smooth *= scale;
+			mc_interface_set_pid_speed(haz_pas_follow_ctx.target_erpm_smooth);
+			return 1.0f;
 		}
 	}
 
-	const float start_rotations = haz_pas_conf_clamp(
-		pas_conf->pas_follow_start_rotations,
-		PAS_FOLLOW_START_ROTATIONS_DEFAULT,
-		0.01f,
-		2.0f);
-	const float idle_timeout_s = haz_pas_conf_clamp(
-		pas_conf->pas_follow_idle_timeout_s,
-		PAS_FOLLOW_IDLE_TIMEOUT_S_DEFAULT,
-		0.05f,
-		5.0f);
-	const float base_current_frac = haz_pas_conf_clamp(
-		pas_conf->pas_follow_base_current_frac,
-		PAS_FOLLOW_BASE_CURRENT_FRAC_DEFAULT,
-		0.0f,
-		1.0f);
-	const float base_rpm_full = haz_pas_conf_clamp(
-		pas_conf->pas_follow_base_rpm_full,
-		PAS_FOLLOW_BASE_RPM_FULL_DEFAULT,
-		1.0f,
-		200.0f);
-	const float kp_a_per_erpm = haz_pas_conf_clamp(
-		pas_conf->pas_follow_kp_a_per_erpm,
-		PAS_FOLLOW_KP_A_PER_ERPM_DEFAULT,
-		0.0f,
-		2.0f);
-	const float deadband_erpm = haz_pas_conf_clamp(
-		pas_conf->pas_follow_deadband_erpm,
-		PAS_FOLLOW_DEADBAND_ERPM_DEFAULT,
-		0.0f,
-		500.0f);
-	const float target_lead = haz_pas_conf_clamp(
-		pas_conf->pas_follow_target_lead,
-		PAS_FOLLOW_TARGET_LEAD_DEFAULT,
-		0.5f,
-		2.0f);
-	float ramp_up_base_a = haz_pas_conf_clamp(
-		pas_conf->pas_follow_ramp_up_base_a_per_s,
-		PAS_FOLLOW_RAMP_UP_BASE_A_PER_S_DEFAULT,
-		0.0f,
-		200.0f);
-	float ramp_up_full_a = haz_pas_conf_clamp(
-		pas_conf->pas_follow_ramp_up_full_a_per_s,
-		PAS_FOLLOW_RAMP_UP_FULL_A_PER_S_DEFAULT,
-		0.0f,
-		400.0f);
-	const float ramp_up_rise_time_s = haz_pas_conf_clamp(
-		pas_conf->pas_follow_ramp_up_rise_time_s,
-		PAS_FOLLOW_RAMP_UP_RISE_TIME_S_DEFAULT,
-		0.01f,
-		10.0f);
-	const float ramp_down_a = haz_pas_conf_clamp(
-		pas_conf->pas_follow_ramp_down_a_per_s,
-		PAS_FOLLOW_RAMP_DOWN_A_PER_S_DEFAULT,
-		0.0f,
-		400.0f);
-	if (ramp_up_full_a < ramp_up_base_a) {
-		ramp_up_full_a = ramp_up_base_a;
+	// ========== STEP-COUNT IDLE DETECTION (robust, like duty hybrid) ==========
+	// Uses actual PAS magnet edge count instead of pedal_rpm, which can hold
+	// the last value for 1-2 seconds after stopping due to event_period timeout.
+	uint32_t step_count = app_pas_get_step_count();
+	uint32_t steps_this_cycle = 0;
+	if (step_count >= haz_pas_follow_ctx.last_step_count) {
+		steps_this_cycle = step_count - haz_pas_follow_ctx.last_step_count;
 	}
+	haz_pas_follow_ctx.last_step_count = step_count;
 
-	float target_erpm = app_pas_get_target_erpm();
-	float pedal_rpm = app_pas_get_pedal_rpm();
-	if (target_erpm <= 0.0f || pedal_rpm <= 0.1f) {
+	float step_rate = (float)steps_this_cycle / dt_s;
+	UTILS_LP_FAST(haz_pas_follow_ctx.step_rate_smooth, step_rate, 0.5f);
+
+	// With 20 magnets (quadrature pairs): 60 RPM = 20 steps/sec, 5 RPM ≈ 1.7 steps/sec
+	// Below 1.5 steps/sec = not pedalling
+	const float min_step_rate = 1.5f;
+	if (haz_pas_follow_ctx.step_rate_smooth < min_step_rate) {
 		haz_pas_follow_ctx.idle_time += dt_s;
-		if (haz_pas_follow_ctx.idle_time > idle_timeout_s) {
+	} else {
+		haz_pas_follow_ctx.idle_time = 0.0f;
+	}
+	bool is_idle = (haz_pas_follow_ctx.idle_time > idle_timeout_s);
+
+	// ========== GET RAW CADENCE (no LP filter — proportional ramp handles smoothness) ==========
+	float pedal_rpm = app_pas_get_pedal_rpm();
+
+	// ========== IDLE: RAMP DOWN AND RELEASE ==========
+	// Only apply idle detection once engaged — during startup, let rotation_progress
+	// be the sole gate so we don't fight the slow step_rate LP ramp-up.
+	if (is_idle && haz_pas_follow_ctx.engaged) {
+		if (haz_pas_follow_ctx.target_erpm_smooth > 0.0f) {
+			// Active ramp down to 0
+			float down_step = ramp_down_rate * dt_s;
+			haz_pas_follow_ctx.target_erpm_smooth -= down_step;
+			haz_pas_follow_ctx.target_erpm_filtered = haz_pas_follow_ctx.target_erpm_smooth;
+			if (haz_pas_follow_ctx.target_erpm_smooth <= 100.0f) {
+				// Close enough to 0 — release motor and reset fully
+				haz_pas_follow_ctx.target_erpm_smooth = 0.0f;
+				haz_pas_follow_ctx.target_erpm_filtered = 0.0f;
+				haz_pas_follow_reset();
+				return 0.0f; // Caller will release_motor()
+			}
+			mc_interface_set_pid_speed(haz_pas_follow_ctx.target_erpm_smooth);
+			return 1.0f; // Stay in control while ramping down
+		}
+
+		// Already at 0 or never engaged
+		if (haz_pas_follow_ctx.engaged) {
 			haz_pas_follow_reset();
 		}
 		return 0.0f;
 	}
 
-	haz_pas_follow_ctx.idle_time = 0.0f;
-	float rotations = (pedal_rpm / 60.0f) * dt_s;
-	haz_pas_follow_ctx.rotation_progress = fminf(haz_pas_follow_ctx.rotation_progress + rotations, start_rotations);
+	// ========== ACTIVELY PEDALLING ==========
+	// Engagement: count steps (magnet edges) rather than rotation_progress.
+	// pedal_rpm is 0 until first full quadrature cycle completes, but step_count
+	// fires on the very first edge. With 20 magnets, start_rotations=0.05 means
+	// 0.05 * 20 = 1 step needed. This engages on the first detected pedal movement.
 	if (!haz_pas_follow_ctx.engaged) {
-		if (haz_pas_follow_ctx.rotation_progress >= start_rotations) {
+		float steps_needed = fmaxf(start_rotations * 20.0f, 1.0f); // 20 magnets/rev
+		haz_pas_follow_ctx.rotation_progress += (float)steps_this_cycle;
+		if (haz_pas_follow_ctx.rotation_progress >= steps_needed) {
 			haz_pas_follow_ctx.engaged = true;
+			haz_pas_follow_ctx.target_erpm_smooth = fabsf(mc_interface_get_rpm());
 		} else {
 			return 0.0f;
 		}
 	}
 
 	const volatile mc_configuration *mcconf = mc_interface_get_configuration();
-	float max_phase_a = fabsf(mcconf->l_current_max);
-	if (max_phase_a < 0.1f) {
-		return 0.0f;
-	}
 
-	float pas_max_current = pas_conf->max_current;
-	float max_current = max_phase_a;
-	if (isfinite(pas_max_current) && pas_max_current > 0.0f) {
-		if (pas_max_current <= 1.0f) {
-			float ratio = pas_max_current;
-			utils_truncate_number(&ratio, 0.0f, 1.0f);
-			max_current = ratio * max_phase_a;
+	int poles = mcconf->si_motor_poles;
+	if (poles <= 0) poles = 8;
+	float pole_pairs = (float)poles * 0.5f;
+
+	float gear_ratio = appconf->gear_detect_conf.internal_ratio;
+	if (!isfinite(gear_ratio) || gear_ratio <= 0.0f) gear_ratio = 38.0f;
+
+	float effective_lead = target_lead;
+
+	// ========== TORQUE SENSOR: boost target speed ==========
+	if (appconf->app_adc_conf.haz_torque_enable_current_pas) {
+		systime_t torque_age = chVTTimeElapsedSinceX(s_ext_torque_ts);
+		float torque_age_s = (float)torque_age / (float)CH_CFG_ST_FREQUENCY;
+		float torque_timeout = fmaxf(appconf->app_adc_conf.haz_torque_idle_timeout, 0.1f);
+
+		float torque_raw = 0.0f;
+		if (torque_age_s < torque_timeout && s_ext_torque > 0) {
+			torque_raw = (float)s_ext_torque / 160.0f;
+		}
+
+		float start_thresh = appconf->app_adc_conf.haz_torque_start_threshold / 160.0f;
+		if (torque_raw < start_thresh) torque_raw = 0.0f;
+
+		// LP filter
+		float t_smooth = fmaxf(appconf->app_adc_conf.haz_torque_smoothing, 0.0f);
+		if (t_smooth > 0.99f) t_smooth = 0.99f;
+		float t_lp = (t_smooth < 0.01f) ? 1.0f : (1.0f - t_smooth * 0.99f);
+		UTILS_LP_FAST(s_ext_torque_smooth, torque_raw, t_lp);
+
+		// Responsiveness shaping
+		float resp = fmaxf(appconf->app_adc_conf.haz_torque_responsiveness, 0.0f);
+		if (resp > 2.0f) resp = 2.0f;
+		float shaped;
+		if (resp < 0.5f) {
+			shaped = s_ext_torque_smooth * s_ext_torque_smooth;
+		} else if (resp > 1.5f) {
+			shaped = sqrtf(s_ext_torque_smooth);
 		} else {
-			max_current = fminf(fabsf(pas_max_current), max_phase_a);
+			float t = s_ext_torque_smooth;
+			float blend = (resp - 0.5f);
+			shaped = (t * t) * (1.0f - blend) + sqrtf(fmaxf(t, 0.0f)) * blend;
 		}
-	}
-	if (max_current < 1e-3f) {
-		max_current = max_phase_a;
+
+		float strength = fmaxf(appconf->app_adc_conf.haz_torque_strength, 0.1f);
+		if (strength > 5.0f) strength = 5.0f;
+		effective_lead += shaped * strength * target_lead * 0.5f;
 	}
 
-	float target_erpm_lead = target_erpm * target_lead;
-	float erpm_now = mc_interface_get_rpm();
-	float erpm_err = target_erpm_lead - erpm_now;
-	if (fabsf(erpm_err) < deadband_erpm) {
-		erpm_err = 0.0f;
+	float target_erpm_raw = pedal_rpm * gear_ratio * pole_pairs * effective_lead;
+
+	// Clamp to configured max ERPM
+	float max_erpm = fabsf(mcconf->l_max_erpm);
+	if (max_erpm < 100.0f) max_erpm = 100000.0f;
+	if (target_erpm_raw > max_erpm) target_erpm_raw = max_erpm;
+
+	// ========== LP FILTER target ERPM (anti-alias cadence staircase) ==========
+	UTILS_LP_FAST(haz_pas_follow_ctx.target_erpm_filtered, target_erpm_raw, cadence_filter);
+	float target_erpm = haz_pas_follow_ctx.target_erpm_filtered;
+
+	// ========== PROPORTIONAL TRACKING with max rate clamp ==========
+	// Step size proportional to gap: small cadence jitter → tiny steps (inaudible).
+	// Big gap (acceleration/stomp) → capped to erpm_ramp_rate (responsive).
+	// K=8 Hz: 100 ERPM gap → 800 ERPM/s (smooth), 5000+ gap → clamped to max.
+	float gap = target_erpm - haz_pas_follow_ctx.target_erpm_smooth;
+	float prop_step = gap * 8.0f * dt_s;
+
+	float max_step_up = erpm_ramp_rate * dt_s;
+	float max_step_down = ramp_down_rate * dt_s;
+	if (prop_step > max_step_up) prop_step = max_step_up;
+	if (prop_step < -max_step_down) prop_step = -max_step_down;
+
+	haz_pas_follow_ctx.target_erpm_smooth += prop_step;
+	if (haz_pas_follow_ctx.target_erpm_smooth < 0.0f) {
+		haz_pas_follow_ctx.target_erpm_smooth = 0.0f;
 	}
 
-	float trim_current = erpm_err * kp_a_per_erpm;
-	float base_current = max_current * base_current_frac;
-	if (pedal_rpm < base_rpm_full) {
-		float scale = base_rpm_full > 1e-3f ? (pedal_rpm / base_rpm_full) : 0.0f;
-		utils_truncate_number(&scale, 0.0f, 1.0f);
-		base_current *= scale;
-	}
+	// ========== COMMAND SPEED PID ==========
+	mc_interface_set_pid_speed(haz_pas_follow_ctx.target_erpm_smooth);
 
-	float target_current = base_current + trim_current;
-	utils_truncate_number(&target_current, 0.0f, max_current);
-	float target_rel = target_current / max_phase_a;
-	if (target_rel >= haz_pas_follow_ctx.current_rel_cmd) {
-		haz_pas_follow_ctx.ramp_elapsed += dt_s;
-		if (haz_pas_follow_ctx.ramp_elapsed > ramp_up_rise_time_s) {
-			haz_pas_follow_ctx.ramp_elapsed = ramp_up_rise_time_s;
-		}
-	} else {
-		haz_pas_follow_ctx.ramp_elapsed = 0.0f;
-	}
-
-	float ramp_rate = 0.0f;
-	if (target_rel >= haz_pas_follow_ctx.current_rel_cmd) {
-		float ramp_ratio = 1.0f;
-		if (ramp_up_rise_time_s > 1e-3f) {
-			ramp_ratio = haz_pas_follow_ctx.ramp_elapsed / ramp_up_rise_time_s;
-		}
-		utils_truncate_number(&ramp_ratio, 0.0f, 1.0f);
-		float ramp_up_a = ramp_up_base_a + (ramp_up_full_a - ramp_up_base_a) * ramp_ratio;
-		ramp_rate = ramp_up_a / max_phase_a;
-	} else {
-		ramp_rate = ramp_down_a / max_phase_a;
-	}
-	haz_pas_follow_ctx.current_rel_cmd = haz_throttle_step(
-		haz_pas_follow_ctx.current_rel_cmd,
-		target_rel,
-		ramp_rate,
-		dt_s);
-
-	return haz_pas_follow_ctx.current_rel_cmd;
+	return 1.0f;
 }
 
-static bool haz_pas_try_takeover(float *pwr, float *current_rel, float loop_dt) {
+static bool haz_pas_try_takeover(float *pwr, bool *p_current_mode, float loop_dt) {
 	if (*pwr < 0.0f) {
 		haz_pas_follow_reset();
 		return false;
@@ -1031,12 +1102,12 @@ static bool haz_pas_try_takeover(float *pwr, float *current_rel, float loop_dt) 
 	}
 
 	if (fabsf(*pwr) < PAS_THROTTLE_IDLE_GATE) {
-		float pas_rel = haz_pas_follow_process(loop_dt);
-		if (pas_rel > 0.0f) {
-			*pwr = pas_rel;
-			if (current_rel) {
-				*current_rel = pas_rel;
-			}
+		float pas_ret = haz_pas_follow_process(loop_dt);
+		if (pas_ret > 0.0f) {
+			// Speed PID active — motor already commanded by mc_interface_set_pid_speed.
+			// Prevent downstream code from overriding with current control.
+			*p_current_mode = false;
+			*pwr = 0.001f;  // Non-zero to prevent timeout release
 			return true;
 		}
 		return false;
@@ -1073,6 +1144,11 @@ void app_adc_start(bool use_rx_tx) {
 	} else {
 		use_rx_tx_as_buttons = use_rx_tx;
 	}
+
+#ifdef HW_HAS_LUNA_SERIAL_DISPLAY
+	// Bafang display uses HW_UART TX/RX — never read them as buttons
+	use_rx_tx_as_buttons = false;
+#endif
 
 	stop_now = false;
 	chThdCreateStatic(adc_thread_wa, sizeof(adc_thread_wa), NORMALPRIO, adc_thread, NULL);
@@ -1393,7 +1469,7 @@ static THD_FUNCTION(adc_thread, arg) {
 			current_mode = true;
 			if (pwr >= 0.0f) {
 				const float throttle_cmd = pwr;
-				if (!haz_pas_try_takeover(&pwr, &current_rel, loop_dt)) {
+				if (!haz_pas_try_takeover(&pwr, &current_mode, loop_dt)) {
 					current_rel = pwr;
 					if (throttle_cmd > 0.0f) {
 						mc_interface_set_throttle_limit_active(true);
@@ -1417,7 +1493,7 @@ static THD_FUNCTION(adc_thread, arg) {
 			current_mode = true;
 			if (pwr >= 0.0f) {
 				const float throttle_cmd = pwr;
-				if (!haz_pas_try_takeover(&pwr, &current_rel, loop_dt)) {
+				if (!haz_pas_try_takeover(&pwr, &current_mode, loop_dt)) {
 					current_rel = pwr;
 					if (throttle_cmd > 0.0f) {
 						mc_interface_set_throttle_limit_active(true);
@@ -1707,14 +1783,13 @@ static THD_FUNCTION(adc_thread, arg) {
 								osf_duty_ramped = 0.0f;
 							}
 						} else {
-							// PAS duty disabled - use current-based PAS follow
-							float pas_current_rel = haz_pas_follow_process(dt_s);
-							if (pas_current_rel > 0.0f) {
-								// PAS active - use current control
+							// PAS duty disabled - use speed PID PAS follow
+							float pas_ret = haz_pas_follow_process(dt_s);
+							if (pas_ret > 0.0f) {
+								// Speed PID active — motor already commanded
 								osf_duty_ramped = fabsf(mc_interface_get_duty_cycle_now());
-								current_mode = true;
-								current_rel = pas_current_rel;
 								mc_interface_set_throttle_limit_active(true);
+								// DON'T set current_mode — speed PID handles it
 							} else {
 								// Nothing - release motor
 								mc_interface_release_motor();
