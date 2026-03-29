@@ -438,4 +438,13 @@
 bool hw_sample_shutdown_button(void);
 #endif
 
+#ifdef HW_HAS_WHEEL_SPEED_SENSOR
+void hw_update_speed_sensor(void);
+float hw_get_speed(void);
+float hw_get_distance_abs(void);
+uint32_t hw_wheel_speed_get_pulses(void);
+uint32_t hw_wheel_speed_get_pulse_age_ms(void);
+uint16_t hw_wheel_speed_get_adc_raw(void);
+#endif
+
 #endif /* HW_FLIPSKY_60_CORE_H_ */

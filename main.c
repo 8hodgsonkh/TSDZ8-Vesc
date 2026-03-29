@@ -310,14 +310,22 @@ int main(void) {
 	app_uartcomm_initialize();
 	app_configuration *appconf = mempools_alloc_appconf();
 	conf_general_read_app_configuration(appconf);
+#ifdef HW_HAS_LUNA_SERIAL_DISPLAY
+	// Luna/Bafang display owns HW_UART_DEV — do NOT start VESC protocol on it.
+	// Starting both causes two threads to fight over the same UART (one at 115200,
+	// one at 1200 baud), corrupting both and potentially wedging the system.
+	// UART_PORT_EXTRA_HEADER is safe if it uses a different peripheral.
+#ifdef HW_UART_P_DEV
+	app_uartcomm_start(UART_PORT_EXTRA_HEADER);
+#endif
+#else
 	app_uartcomm_start(UART_PORT_BUILTIN);
 	app_uartcomm_start(UART_PORT_EXTRA_HEADER);
+#endif
 	app_set_configuration(appconf);
 
 #ifdef HW_HAS_LUNA_SERIAL_DISPLAY
-	// Start Bafang display protocol on HW_UART_DEV (must come AFTER app_set_configuration
-	// so UART_PORT_COMM_HEADER isn't also claimed by app_uartcomm for VESC protocol).
-	// Kartman's app_to_use must be APP_ADC (not APP_ADC_UART) to avoid conflict.
+	// Start Bafang display protocol on HW_UART_DEV at 1200 baud.
 	luna_display_serial_start(5);  // Default PAS level 5 (full power)
 #endif
 
@@ -411,8 +419,9 @@ static bool detect_offroad_mode_on_boot(void) {
     // Held for full 5s -> Return TRUE (Offroad Mode)
     return true;
 #elif defined(HW_EBIKE_DEFAULT_OFFROAD)
-    // No power button — always boot into offroad (full power) mode
-    return true;
+    // No power button — boot into street mode (speed-limited).
+    // Use U-D-U-D-U-D combo on Bafang display to toggle offroad.
+    return false;
 #else
     return false;
 #endif

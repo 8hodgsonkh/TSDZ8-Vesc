@@ -347,3 +347,93 @@ static void terminal_button_test(int argc, const char **argv) {
 	}
 }
 #endif
+
+// ============================================================================
+// Wheel speed sensor (ADC-based hall sensor with hysteresis)
+// Shared implementation — enabled per-board via HW_HAS_WHEEL_SPEED_SENSOR
+// ============================================================================
+#ifdef HW_HAS_WHEEL_SPEED_SENSOR
+
+typedef enum {
+	WHEEL_SPEED_STATE_UNKNOWN = 0,
+	WHEEL_SPEED_STATE_HIGH,
+	WHEEL_SPEED_STATE_LOW
+} wheel_speed_state_t;
+
+static volatile uint32_t wheel_pulse_count = 0;
+static volatile uint32_t wheel_last_pulse_time = 0;
+static volatile uint32_t wheel_pulse_period_us = 0;
+static volatile wheel_speed_state_t wheel_state = WHEEL_SPEED_STATE_UNKNOWN;
+static volatile float wheel_speed_rps = 0.0f;
+
+void hw_update_speed_sensor(void) {
+	uint16_t adc_val = ADC_Value[HW_WHEEL_SPEED_ADC_CH];
+	uint32_t now_us = chVTGetSystemTimeX() * (1000000 / CH_CFG_ST_FREQUENCY);
+
+	wheel_speed_state_t new_state = wheel_state;
+
+	switch (wheel_state) {
+	case WHEEL_SPEED_STATE_UNKNOWN:
+		if (adc_val > HW_WHEEL_SPEED_THRESH_HIGH) {
+			new_state = WHEEL_SPEED_STATE_HIGH;
+		} else if (adc_val < HW_WHEEL_SPEED_THRESH_LOW) {
+			new_state = WHEEL_SPEED_STATE_LOW;
+		}
+		break;
+
+	case WHEEL_SPEED_STATE_HIGH:
+		if (adc_val < HW_WHEEL_SPEED_THRESH_LOW) {
+			new_state = WHEEL_SPEED_STATE_LOW;
+			wheel_pulse_count++;
+			if (wheel_last_pulse_time > 0) {
+				uint32_t period = now_us - wheel_last_pulse_time;
+				if (period > 1000 && period < 10000000) {
+					wheel_pulse_period_us = period;
+					wheel_speed_rps = 1000000.0f / ((float)period * HW_WHEEL_SPEED_MAGNETS);
+				}
+			}
+			wheel_last_pulse_time = now_us;
+		}
+		break;
+
+	case WHEEL_SPEED_STATE_LOW:
+		if (adc_val > HW_WHEEL_SPEED_THRESH_HIGH) {
+			new_state = WHEEL_SPEED_STATE_HIGH;
+		}
+		break;
+	}
+
+	wheel_state = new_state;
+
+	if (wheel_last_pulse_time > 0 && (now_us - wheel_last_pulse_time) > 2000000) {
+		wheel_speed_rps = 0.0f;
+		wheel_pulse_period_us = 0;
+	}
+}
+
+float hw_get_speed(void) {
+	const volatile mc_configuration *conf = mc_interface_get_configuration();
+	return wheel_speed_rps * conf->si_wheel_diameter * M_PI;
+}
+
+float hw_get_distance_abs(void) {
+	const volatile mc_configuration *conf = mc_interface_get_configuration();
+	float wheel_circumference = conf->si_wheel_diameter * M_PI;
+	return (float)wheel_pulse_count * wheel_circumference / (float)HW_WHEEL_SPEED_MAGNETS;
+}
+
+uint32_t hw_wheel_speed_get_pulses(void) {
+	return wheel_pulse_count;
+}
+
+uint32_t hw_wheel_speed_get_pulse_age_ms(void) {
+	if (wheel_last_pulse_time == 0) return 0;
+	uint32_t now_us = chVTGetSystemTimeX() * (1000000 / CH_CFG_ST_FREQUENCY);
+	return (now_us - wheel_last_pulse_time) / 1000;
+}
+
+uint16_t hw_wheel_speed_get_adc_raw(void) {
+	return ADC_Value[HW_WHEEL_SPEED_ADC_CH];
+}
+
+#endif // HW_HAS_WHEEL_SPEED_SENSOR

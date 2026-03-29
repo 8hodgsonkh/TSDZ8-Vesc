@@ -67,7 +67,172 @@ static volatile int fault_vec_write = 0;
 static terminal_callback_struct callbacks[CALLBACK_LEN];
 static int callback_write = 0;
 
-__attribute__((section(".text2"))) void terminal_process_string(char *str) {
+static void foc_ipm_sat_run(int argc, char **argv) {
+	float target_duty = 0.85f;
+	float max_id = 15.0f;
+	float r_override = 0.0f;
+
+	if (argc >= 2) sscanf(argv[1], "%f", &target_duty);
+	if (argc >= 3) sscanf(argv[2], "%f", &max_id);
+	if (argc >= 4) sscanf(argv[3], "%f", &r_override);
+
+	utils_truncate_number(&target_duty, 0.1f, 0.95f);
+	utils_truncate_number(&max_id, 1.0f, 40.0f);
+
+	mc_configuration *mcconf = mempools_alloc_mcconf();
+	*mcconf = *mc_interface_get_configuration();
+	mc_configuration *mcconf_old = mempools_alloc_mcconf();
+	*mcconf_old = *mc_interface_get_configuration();
+
+	if (mcconf->motor_type != MOTOR_TYPE_FOC) {
+		commands_printf("ERROR: Must be FOC mode.");
+		goto sat_cleanup;
+	}
+
+	float R = (r_override > 0.001f) ? r_override : mcconf->foc_motor_r;
+	if (R < 0.001f) R = 0.05f;
+
+	commands_printf("=== IPM Saturation Test === Duty:%.2f MaxId:%.0fA R:%.4f",
+		(double)target_duty, (double)max_id, (double)R);
+
+	mcconf->foc_sensor_mode = FOC_SENSOR_MODE_HALL;
+	mcconf->foc_cc_decoupling = FOC_CC_DECOUPLING_DISABLED;
+	mcconf->foc_mtpa_mode = MTPA_MODE_OFF;
+	mcconf->foc_fw_q_current_factor = 0.0f;
+	mc_interface_set_configuration(mcconf);
+
+	systime_t tout = timeout_get_timeout_msec();
+	float tout_c = timeout_get_brake_current();
+	KILL_SW_MODE tout_ksw = timeout_get_kill_sw_mode();
+	timeout_reset();
+	timeout_configure(60000, 0.0, KILL_SW_MODE_DISABLED);
+
+	int fault = FAULT_CODE_NONE;
+
+	// Ramp duty
+	{
+		float d_now = fabsf(mc_interface_get_duty_cycle_now());
+		int steps = (int)((target_duty - d_now) / 0.005f);
+		if (steps < 20) steps = 20;
+		for (int i = 0; i <= steps; i++) {
+			mc_interface_set_duty(d_now + ((float)i / steps) * (target_duty - d_now));
+			fault = mc_interface_get_fault();
+			if (fault != FAULT_CODE_NONE) break;
+			chThdSleepMilliseconds(30);
+		}
+		if (fault != FAULT_CODE_NONE) {
+			commands_printf("FAULT ramp: %s", mc_interface_fault_to_string(fault));
+			goto sat_cleanup;
+		}
+	}
+	chThdSleepMilliseconds(2000);
+	commands_printf("Stable: %.0f ERPM", (double)mc_interface_get_rpm());
+
+	// Id sweep
+	{
+		#define SAT_MAX_PTS 8
+		float id_steps[SAT_MAX_PTS];
+		int n_pts = 0;
+		id_steps[n_pts++] = 0.0f;
+		for (float id = 3.0f; id < max_id - 0.5f && n_pts < SAT_MAX_PTS - 1; id += 3.0f)
+			id_steps[n_pts++] = id;
+		if (n_pts < SAT_MAX_PTS && (n_pts < 2 || id_steps[n_pts-1] < max_id - 0.5f))
+			id_steps[n_pts++] = max_id;
+
+		float psi_arr[SAT_MAX_PTS], id_arr[SAT_MAX_PTS], obs_arr[SAT_MAX_PTS];
+
+		commands_printf("-Id(A) Id_m   Iq_m   Vq     Vd     ERPM   Duty  Psi(mWb) ObsErr");
+
+		for (int pt = 0; pt < n_pts; pt++) {
+			mcpwm_foc_set_fw_override(id_steps[pt]);
+			chThdSleepMilliseconds(1000);
+
+			fault = mc_interface_get_fault();
+			if (fault != FAULT_CODE_NONE) {
+				commands_printf("FAULT Id=%.0f: %s", (double)id_steps[pt], mc_interface_fault_to_string(fault));
+				break;
+			}
+
+			float vq_s=0, vd_s=0, iq_s=0, id_s=0, rpm_s=0, duty_s=0, oe_s=0, oe2=0;
+			int ns = 0;
+			for (int s = 0; s < 500; s++) {
+				fault = mc_interface_get_fault();
+				if (fault != FAULT_CODE_NONE) break;
+				vq_s += mcpwm_foc_get_vq();
+				vd_s += mcpwm_foc_get_vd();
+				iq_s += mcpwm_foc_get_iq();
+				id_s += mcpwm_foc_get_id();
+				rpm_s += mc_interface_get_rpm();
+				duty_s += mc_interface_get_duty_cycle_now();
+				float d = mcpwm_foc_get_phase_observer() - mcpwm_foc_get_phase_hall();
+				while (d > 180.0f) d -= 360.0f;
+				while (d < -180.0f) d += 360.0f;
+				oe_s += d; oe2 += d*d;
+				ns++;
+				chThdSleepMilliseconds(1);
+			}
+			if (fault != FAULT_CODE_NONE) break;
+
+			if (ns > 0) {
+				float inv = 1.0f / ns;
+				float vq=vq_s*inv, vd=vd_s*inv, iq=iq_s*inv, id_m=id_s*inv;
+				float rpm=rpm_s*inv, duty=duty_s*inv;
+				float oe_mean=oe_s*inv, oe_sd=sqrtf(fabsf(oe2*inv - oe_mean*oe_mean));
+				float w = RPM2RADPS_f(rpm);
+				float psi = (fabsf(w) > 10.0f) ? (vq - R*iq) / w : 0.0f;
+
+				psi_arr[pt] = psi; id_arr[pt] = id_m; obs_arr[pt] = oe_sd;
+
+				commands_printf("%5.1f %6.2f %6.2f %6.2f %6.2f %6.0f %.3f %8.4f %+.1f+/-%.1f",
+					(double)id_steps[pt], (double)id_m, (double)iq,
+					(double)vq, (double)vd, (double)rpm, (double)duty,
+					(double)(psi*1000.0f), (double)oe_mean, (double)oe_sd);
+			}
+		}
+
+		mcpwm_foc_set_fw_override(0.0f);
+
+		// Incremental Ld
+		commands_printf("--- Incremental Ld ---");
+		for (int i = 1; i < n_pts; i++) {
+			float di = id_arr[i] - id_arr[i-1];
+			if (fabsf(di) > 0.1f) {
+				float ld = (psi_arr[i] - psi_arr[i-1]) / di;
+				commands_printf("  %5.1f->%5.1fA: Ld=%.1fuH",
+					(double)id_arr[i-1], (double)id_arr[i], (double)(ld*1e6f));
+			}
+		}
+
+		// Lambda estimate
+		if (n_pts >= 3) {
+			float di = id_arr[n_pts-1] - id_arr[n_pts-2];
+			if (fabsf(di) > 0.1f) {
+				float ld = (psi_arr[n_pts-1] - psi_arr[n_pts-2]) / di;
+				float lam = psi_arr[n_pts-1] - ld * id_arr[n_pts-1];
+				commands_printf("Lambda@0: %.4f  Lambda@maxId: %.4f mWb (drop %.1f%%)",
+					(double)(psi_arr[0]*1000.0f), (double)(lam*1000.0f),
+					(double)((1.0f - lam/psi_arr[0])*100.0f));
+			}
+		}
+	}
+
+	commands_printf("Done.\n");
+
+sat_cleanup:
+	mcpwm_foc_set_fw_override(0.0f);
+	mc_interface_set_duty(0.0f);
+	chThdSleepMilliseconds(100);
+	mc_interface_set_current(0.0f);
+	chThdSleepMilliseconds(500);
+	mc_interface_release_motor();
+	mc_interface_wait_for_motor_release(1.0);
+	mc_interface_set_configuration(mcconf_old);
+	timeout_configure(tout, tout_c, tout_ksw);
+	mempools_free_mcconf(mcconf);
+	mempools_free_mcconf(mcconf_old);
+}
+
+void terminal_process_string(char *str) {
 	// Echo command so user can see what they previously ran
 	commands_printf("-> %s \n", str);
 
@@ -1215,6 +1380,8 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 	} else if (strcmp(argv[0], "rebootwdt") == 0) {
 		chSysLock();
 		for (;;) {__NOP();}
+	} else if (strcmp(argv[0], "foc_ipm_sat") == 0) {
+		foc_ipm_sat_run(argc, argv);
 	}
 
 	// The help command
@@ -1332,6 +1499,11 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 
 		commands_printf("rebootwdt");
 		commands_printf("  Reboot using the watchdog timer.");
+
+		commands_printf("foc_ipm_sat [duty] [max_id] [R_override]");
+		commands_printf("  Saturation test: spin at duty, sweep -Id 0 to max_id.");
+		commands_printf("  Measures Psi, incremental Ld, observer tracking vs Id.");
+		commands_printf("  Defaults: duty=0.85, max_id=15A. Chain off.");
 
 		for (int i = 0;i < callback_write;i++) {
 			if (callbacks[i].cbf == 0) {

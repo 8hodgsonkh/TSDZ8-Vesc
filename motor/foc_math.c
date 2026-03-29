@@ -45,9 +45,32 @@ void foc_observer_update(float v_alpha, float v_beta, float i_alpha, float i_bet
 		break;
 
 	case SAT_COMP_FACTOR: {
-		const float comp_fact = conf_now->foc_sat_comp * (motor->m_motor_state.i_abs_filter / conf_now->l_current_max);
-		L -= L * comp_fact;
-		lambda -= lambda * comp_fact;
+		if (fabsf(conf_now->foc_motor_ld_lq_diff) > 1e-9f) {
+			// IPM motor detected (has saliency): reduce only Lq with |Iq|.
+			// Q-axis flux path is through iron → saturates with Iq.
+			// D-axis path is through magnets → doesn't saturate.
+			// Lambda (PM flux) is current-independent.
+			float iq_abs = fabsf(motor->m_motor_state.iq_filter);
+			if (iq_abs > 0.5f) {
+				float sat_reduction = conf_now->foc_sat_comp * (iq_abs / conf_now->l_current_max);
+				utils_truncate_number(&sat_reduction, 0.0f, 0.85f);
+				// Reduce only Lq: L_avg and ld_lq_diff are adjusted together
+				// so that Ld stays constant and Lq shrinks.
+				// Lq_new = Lq * (1 - sat_reduction)
+				// Ld stays at L - diff/2
+				float Ld = L - conf_now->foc_motor_ld_lq_diff * 0.5f;
+				float Lq = L + conf_now->foc_motor_ld_lq_diff * 0.5f;
+				Lq *= (1.0f - sat_reduction);
+				if (Lq < Ld) { Lq = Ld; }
+				L = (Ld + Lq) * 0.5f;
+			}
+			// Don't touch lambda — PM flux doesn't saturate
+		} else {
+			// Non-salient motor: original uniform reduction
+			const float comp_fact = conf_now->foc_sat_comp * (motor->m_motor_state.i_abs_filter / conf_now->l_current_max);
+			L -= L * comp_fact;
+			lambda -= lambda * comp_fact;
+		}
 	} break;
 
 	case SAT_COMP_LAMBDA_AND_FACTOR: {

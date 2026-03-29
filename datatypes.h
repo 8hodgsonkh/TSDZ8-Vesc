@@ -798,6 +798,29 @@ typedef struct {
 	float haz_torque_idle_timeout;            // Seconds no torque before rampdown (default 0.5)
 	float haz_torque_responsiveness;          // Curve shape: 0=gentle 1=linear 2=aggressive (default 1.0)
 	bool haz_torque_enable_current_pas;       // Enable torque sensor for current control PAS mode
+	// Direct Torque Current Control — torque sensor drives phase current directly
+	// When enabled, bypasses Speed PID PAS. Torque in → current out, with
+	// cadence gating for safe low-RPM behavior and speed fade at limit.
+	bool haz_torque_direct_enable;            // Master toggle: ON = direct current, OFF = speed PID
+	float haz_torque_direct_max_current;      // Max phase current (A)
+	// 3-point torque→current curve (torque input 0.0-1.0, current output 0.0-1.0 × max)
+	float haz_torque_direct_in_low;           // Torque input low point (deadzone below)
+	float haz_torque_direct_out_low;          // Current ratio at low point
+	float haz_torque_direct_in_mid;           // Torque input mid point
+	float haz_torque_direct_out_mid;          // Current ratio at mid point
+	float haz_torque_direct_in_high;          // Torque input high point
+	float haz_torque_direct_out_high;         // Current ratio at high point
+	// Cadence gating — limits current at low/zero cadence to prevent chain shock
+	float haz_torque_direct_cadence_start;    // RPM below which current is limited
+	float haz_torque_direct_cadence_full;     // RPM above which full current available
+	float haz_torque_direct_cadence_min;      // Min current factor at zero cadence (0.0-1.0)
+	// Speed fade — soft current rolloff approaching speed limit
+	float haz_torque_direct_speed_fade;       // Fraction of speed limit where fade starts (0.0-1.0)
+	// Smoothing — current ramp rate for comfort
+	float haz_torque_direct_ramp_up;          // A/s ramp up rate
+	float haz_torque_direct_ramp_down;        // A/s ramp down rate
+	// Gear integration
+	bool haz_torque_direct_use_gears;         // Use gear detection for current scaling
 } adc_config;
 
 // Nunchuk control types
@@ -845,8 +868,6 @@ typedef struct {
 	float pas_follow_erpm_ramp_rate;      // Target ERPM smoothing rate (ERPM/s)
 	float pas_follow_cadence_filter;      // LP filter for target ERPM tracking (0-1, lower=smoother)
 	float pas_follow_ramp_down_mult;      // Ramp-down rate in ERPM/s (how fast motor slows when you stop)
-	float pas_follow_speed_limit_kmh;     // Street mode PAS speed limit (km/h, 0=off)
-	float pas_follow_speed_limit_decay;   // Target decay factor at speed limit (0.5-0.99)
 } pas_config;
 
 // NRF Datatypes
