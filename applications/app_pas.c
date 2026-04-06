@@ -157,8 +157,10 @@ typedef struct {
 	float last_ref_timestamp;
 	float event_period;
 	float last_step_timestamp;  // Timestamp of last valid forward step (any transition)
-	float step_period;          // Period between channel-A edges (same sensor, even spacing)
-	bool  has_step_period;      // True once we have a valid step_period
+	float step_period;          // 2-sample averaged period (rising+falling = full magnet cycle)
+	float prev_raw_period;      // Previous raw A-edge period for 2-sample averaging
+	bool  has_prev_period;      // True once we have one raw period stored
+	bool  has_step_period;      // True once we have 2 samples averaged
 	uint8_t prev_a_level;       // Last channel A level for edge detection
 	float idle_time;
 	bool has_period;
@@ -172,6 +174,8 @@ static pas_quadrature_state_t pas_quad_state = {
 	.event_period = 0.0f,
 	.last_step_timestamp = 0.0f,
 	.step_period = 0.0f,
+	.prev_raw_period = 0.0f,
+	.has_prev_period = false,
 	.has_step_period = false,
 	.prev_a_level = 0xFF,
 	.idle_time = 0.0f,
@@ -186,6 +190,8 @@ static void pas_quadrature_reset_state(void) {
 	pas_quad_state.event_period = 0.0f;
 	pas_quad_state.last_step_timestamp = 0.0f;
 	pas_quad_state.step_period = 0.0f;
+	pas_quad_state.prev_raw_period = 0.0f;
+	pas_quad_state.has_prev_period = false;
 	pas_quad_state.has_step_period = false;
 	pas_quad_state.prev_a_level = 0xFF;
 	pas_quad_state.idle_time = 0.0f;
@@ -694,10 +700,12 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 			pas_quad_state.last_step_timestamp = now;
 			pas_quad_state.seeded_start = true;
 		} else {
-			// ---- Channel-B-only step period (rising + falling) ----
-			// Try B sensor — maybe the TSDZ8 PAS wiring is swapped and B
-			// has better magnet centering (closer to 50% duty cycle).
-			uint8_t cur_a = (new_state >> 1) & 1;  // bit 1 = channel B
+			// ---- Channel-A 2-sample averaged step period ----
+			// Each consecutive pair of A edges (rising+falling or falling+rising)
+			// spans exactly one complete magnet+gap cycle. Averaging the two
+			// raw periods cancels magnet duty cycle asymmetry perfectly.
+			// Updates on every A edge (40/rev) but period is always clean.
+			uint8_t cur_a = new_state & 1;
 			bool a_changed = (pas_quad_state.prev_a_level != 0xFF && cur_a != pas_quad_state.prev_a_level);
 			pas_quad_state.prev_a_level = cur_a;
 
@@ -711,7 +719,7 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 				pas_startup_assist_trigger();
 			}
 
-			// Only measure timing from channel A edges
+			// Measure timing from channel A edges, 2-sample average
 			if (a_changed) {
 				float raw_period = now - pas_quad_state.last_step_timestamp;
 				pas_quad_state.last_step_timestamp = now;
@@ -724,9 +732,16 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 				if (min_step_period < 1e-5f) min_step_period = 1e-5f;
 
 				if (raw_period >= min_step_period) {
-					pas_quad_state.step_period = raw_period;
-					pas_quad_state.has_step_period = true;
-					pas_quad_state.seeded_start = false;
+					if (pas_quad_state.has_prev_period) {
+						// Average this + previous = one full magnet+gap cycle
+						pas_quad_state.step_period = (raw_period + pas_quad_state.prev_raw_period) * 0.5f;
+						pas_quad_state.has_step_period = true;
+						pas_quad_state.seeded_start = false;
+					} else {
+						pas_quad_state.seeded_start = true;
+					}
+					pas_quad_state.prev_raw_period = raw_period;
+					pas_quad_state.has_prev_period = true;
 				} else {
 					pas_quad_state.seeded_start = true;
 				}
