@@ -153,17 +153,12 @@ static float haz_throttle_filtered = 0.0f;
 
 typedef struct {
 	float target_erpm_smooth;  // Ramp-limited output ERPM for speed PID
-	float target_erpm_filtered; // Interpolated cadence base ERPM
+	float target_erpm_filtered; // LP-filtered cadence base ERPM
 	float rotation_progress;
 	float idle_time;
 	bool engaged;
 	uint32_t last_step_count;  // For step-rate idle detection
 	float step_rate_smooth;    // LP-filtered PAS step rate (steps/sec)
-	// Proportional interpolation state
-	uint32_t last_transition_count;
-	float interp_from;         // ERPM at last transition
-	float interp_to;           // ERPM target for next transition
-	float interp_rate;         // ERPM/s ramp rate between transitions
 } haz_pas_follow_ctx_t;
 
 static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
@@ -173,11 +168,7 @@ static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
 	.idle_time = 0.0f,
 	.engaged = false,
 	.last_step_count = 0,
-	.step_rate_smooth = 0.0f,
-	.last_transition_count = 0,
-	.interp_from = 0.0f,
-	.interp_to = 0.0f,
-	.interp_rate = 0.0f
+	.step_rate_smooth = 0.0f
 };
 
 // =============================================================================
@@ -1120,10 +1111,7 @@ static void haz_pas_follow_reset(void) {
 	haz_pas_follow_ctx.idle_time = 0.0f;
 	haz_pas_follow_ctx.engaged = false;
 	haz_pas_follow_ctx.step_rate_smooth = 0.0f;
-	haz_pas_follow_ctx.interp_from = 0.0f;
-	haz_pas_follow_ctx.interp_to = 0.0f;
-	haz_pas_follow_ctx.interp_rate = 0.0f;
-	// Note: don't reset last_step_count or last_transition_count — cumulative
+	// Note: don't reset last_step_count — cumulative
 }
 
 // Returns:
@@ -1276,58 +1264,19 @@ static float haz_pas_follow_process(float dt_s) {
 		torque_ramp_erpm = shaped * strength * erpm_ramp_rate;
 	}
 
-	// ========== CADENCE BASE: proportional interpolation ==========
-	// On each PAS transition (80/rev with quadrature), compute the delta
-	// between old and new target ERPM, then ramp linearly over the expected
-	// step period. Result: continuous smooth motion between discrete PAS
-	// updates. Big cadence change = fast ramp. Tiny jitter = micro-ramp.
-	// No staircase, no pulsing, perfectly proportional.
+	// ========== CADENCE BASE: direct LP filter ==========
+	// Channel-A-only PAS gives clean 40/rev updates with no asymmetry.
+	// No interpolation/prediction needed — just LP-filter the raw ERPM
+	// and let the speed PID handle the rest.
 	float base_erpm_raw = pedal_rpm * gear_ratio * pole_pairs * target_lead;
 
-	uint32_t tc = app_pas_get_transition_count();
-	if (tc != haz_pas_follow_ctx.last_transition_count) {
-		// New PAS transition arrived — set up interpolation
-		haz_pas_follow_ctx.last_transition_count = tc;
-		haz_pas_follow_ctx.interp_from = haz_pas_follow_ctx.target_erpm_filtered;
-		haz_pas_follow_ctx.interp_to = base_erpm_raw;
-
-		float step_period = app_pas_get_step_period();
-		if (step_period > 1e-4f) {
-			// Ramp rate = delta / time until next expected step
-			float delta = base_erpm_raw - haz_pas_follow_ctx.target_erpm_filtered;
-			haz_pas_follow_ctx.interp_rate = delta / step_period;
-		} else {
-			// No valid period yet — snap
-			haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
-			haz_pas_follow_ctx.interp_rate = 0.0f;
-		}
-	}
-
-	// Between transitions: ramp at computed rate toward target
-	if (haz_pas_follow_ctx.interp_rate > 0.01f) {
-		// Ramping up
-		haz_pas_follow_ctx.target_erpm_filtered += haz_pas_follow_ctx.interp_rate * dt_s;
-		if (haz_pas_follow_ctx.target_erpm_filtered > haz_pas_follow_ctx.interp_to)
-			haz_pas_follow_ctx.target_erpm_filtered = haz_pas_follow_ctx.interp_to;
-	} else if (haz_pas_follow_ctx.interp_rate < -0.01f) {
-		// Ramping down
-		haz_pas_follow_ctx.target_erpm_filtered += haz_pas_follow_ctx.interp_rate * dt_s;
-		if (haz_pas_follow_ctx.target_erpm_filtered < haz_pas_follow_ctx.interp_to)
-			haz_pas_follow_ctx.target_erpm_filtered = haz_pas_follow_ctx.interp_to;
-	}
-	// else: rate ~0 = holding steady
-
-	// ========== TRACKING SMOOTHNESS: LP on interpolated output ==========
-	// Absorbs natural cadence wobble without creating staircase artifacts
-	// (input is continuous from interpolation, so LP works cleanly).
-	// cadence_filter: 0 = no smoothing (raw interpolated), 1 = maximum smooth
+	// Tracking Smoothness: 0 = instant tracking, 1 = max smooth
 	// Maps to LP factor: 0→1.0 (pass-through), 1→0.005 (very heavy)
-	static float cadence_base_smooth = 0.0f;
 	if (cadence_filter < 0.01f) {
-		cadence_base_smooth = haz_pas_follow_ctx.target_erpm_filtered;
+		haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
 	} else {
-		float lp_factor = 1.0f - cadence_filter * 0.995f;  // 0→1.0, 1→0.005
-		UTILS_LP_FAST(cadence_base_smooth, haz_pas_follow_ctx.target_erpm_filtered, lp_factor);
+		float lp_factor = 1.0f - cadence_filter * 0.995f;
+		UTILS_LP_FAST(haz_pas_follow_ctx.target_erpm_filtered, base_erpm_raw, lp_factor);
 	}
 
 	float max_erpm = fabsf(mcconf->l_max_erpm);
@@ -1348,8 +1297,8 @@ static float haz_pas_follow_process(float dt_s) {
 	float max_boost = erpm_ramp_rate * 1.0f;
 	if (torque_erpm_extra > max_boost) torque_erpm_extra = max_boost;
 
-	// Final target: cadence base (smoothed) + torque boost
-	float target_erpm = cadence_base_smooth + torque_erpm_extra;
+	// Final target: cadence base (filtered) + torque boost
+	float target_erpm = haz_pas_follow_ctx.target_erpm_filtered + torque_erpm_extra;
 	if (target_erpm > max_erpm) target_erpm = max_erpm;
 	if (target_erpm < 0.0f) target_erpm = 0.0f;
 
