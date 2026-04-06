@@ -1267,22 +1267,19 @@ static float haz_pas_follow_process(float dt_s) {
 	// ========== CADENCE BASE: snap-up, hold-down ==========
 	// Cadence sets the floor for torque boost. We want:
 	//   UP: snap instantly to higher cadence (responsive engagement)
-	//   DOWN: hold current level, decay very slowly (no pulsing)
-	// PAS step period jitter (uneven magnet spacing) causes RPM oscillation.
-	// Chasing it down creates the "bobobobobo" pulsing. Hold fixes that.
-	// Actual stop is caught by idle timeout, not by cadence decay.
+	//   DOWN: LP filter toward lower cadence (rejects jitter, tracks real slowdown)
+	// Jitter alternates high-low so LP averages it out. Genuine slowdown is
+	// sustained so LP tracks it within a few hundred ms.
+	// cadence_filter controls the LP factor for downward tracking.
 	float base_erpm_raw = pedal_rpm * gear_ratio * pole_pairs * target_lead;
 
 	if (base_erpm_raw > haz_pas_follow_ctx.target_erpm_filtered) {
 		// Cadence increasing — snap up instantly
 		haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
 	} else {
-		// Cadence same or lower — hold, very slow decay (50 ERPM/s)
-		// Just enough to track genuine slowdown over ~1-2 seconds
-		float decay_rate = 50.0f;
-		haz_pas_follow_ctx.target_erpm_filtered -= decay_rate * dt_s;
-		if (haz_pas_follow_ctx.target_erpm_filtered < base_erpm_raw)
-			haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
+		// Cadence same or lower — LP filter down (jitter rejected, real drops tracked)
+		// cadence_filter 0.01 = very slow tracking, 1.0 = instant
+		UTILS_LP_FAST(haz_pas_follow_ctx.target_erpm_filtered, base_erpm_raw, cadence_filter);
 	}
 
 	float max_erpm = fabsf(mcconf->l_max_erpm);
