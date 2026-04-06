@@ -1264,25 +1264,23 @@ static float haz_pas_follow_process(float dt_s) {
 		torque_ramp_erpm = shaped * strength * erpm_ramp_rate;
 	}
 
-	// ========== CADENCE BASE: smoothed ramp tracking ==========
-	// Raw cadence → target ERPM, then rate-limit the ramp for smooth output.
-	// cadence_filter controls max ERPM change rate:
-	//   1.0 = instant tracking (no smoothing)
-	//   0.01 = very smooth (slow ramp, ~100 ERPM/s change rate)
-	// Maps to ramp rate: factor × base_erpm_range per second
+	// ========== CADENCE BASE: snap-up, hold-down ==========
+	// Cadence sets the floor for torque boost. We want:
+	//   UP: snap instantly to higher cadence (responsive engagement)
+	//   DOWN: hold current level, decay very slowly (no pulsing)
+	// PAS step period jitter (uneven magnet spacing) causes RPM oscillation.
+	// Chasing it down creates the "bobobobobo" pulsing. Hold fixes that.
+	// Actual stop is caught by idle timeout, not by cadence decay.
 	float base_erpm_raw = pedal_rpm * gear_ratio * pole_pairs * target_lead;
 
-	// Rate-limited ramp: smooth tracking instead of staircase LP
-	// cadence_filter 0.01→1.0 maps to ramp speed 200→20000 ERPM/s
-	float ramp_speed = cadence_filter * 20000.0f;
-	if (ramp_speed < 200.0f) ramp_speed = 200.0f;
-
 	if (base_erpm_raw > haz_pas_follow_ctx.target_erpm_filtered) {
-		haz_pas_follow_ctx.target_erpm_filtered += ramp_speed * dt_s;
-		if (haz_pas_follow_ctx.target_erpm_filtered > base_erpm_raw)
-			haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
+		// Cadence increasing — snap up instantly
+		haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
 	} else {
-		haz_pas_follow_ctx.target_erpm_filtered -= ramp_speed * dt_s;
+		// Cadence same or lower — hold, very slow decay (50 ERPM/s)
+		// Just enough to track genuine slowdown over ~1-2 seconds
+		float decay_rate = 50.0f;
+		haz_pas_follow_ctx.target_erpm_filtered -= decay_rate * dt_s;
 		if (haz_pas_follow_ctx.target_erpm_filtered < base_erpm_raw)
 			haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
 	}
