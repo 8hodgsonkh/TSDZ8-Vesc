@@ -55,6 +55,7 @@
 #define PAS_STEP_WINDOW_MULT		1.5f
 #define PAS_STARTUP_DETECT_RPM_DEFAULT	20.0f
 #define PAS_STOP_TIMEOUT		0.5f
+#define PAS_TIMER_HZ			1.4e7f  // TIM5 frequency (14 MHz) — matches timer.c
 
 // Local-only PAS -> ERPM tracking knobs (not exposed via appconf)
 #define PAS_ERPM_PER_RPM		100.0f
@@ -83,7 +84,7 @@ __attribute__((section(".ram4"))) static THD_WORKING_AREA(pas_thread_wa, 512);
 static void pas_sensor_update(float loop_dt);
 static void pas_sensor_update_quadrature(float loop_dt);
 static void pas_sensor_update_single(float loop_dt);
-static void pas_single_exti_enable(bool enable);
+static void pas_exti_enable(bool enable);
 static float pas_get_idle_timeout_limit(void);
 static void pas_speed_state_reset(bool instant_zero);
 static void pas_speed_target_update(float loop_dt, bool force_idle_now);
@@ -151,52 +152,47 @@ static float pas_boost_compute_scale(float cadence_rpm, float loop_dt, bool enab
 static volatile float pas_target_erpm = 0.0f;
 static float pas_step_window_config = PAS_REAL_STEP_WINDOW;
 
+// ISR-driven quadrature state. EXTI fires on channel-A (PB6) both edges.
+// Channel-B (PA6) read in ISR for direction via QEM table.
+// 2-sample ring buffer: avg of rise-to-fall + fall-to-rise = 1 full magnet+gap.
 typedef struct {
-	uint8_t last_state;
-	uint8_t ref_state;
-	float last_ref_timestamp;
-	float event_period;
-	float last_step_timestamp;  // Timestamp of last valid forward step (any transition)
-	float step_period;          // 4-sample averaged period (1 full quad cycle = magnet+gap, clean)
-	float step_buf[4];          // Ring buffer of last 4 raw transition periods
-	int   step_buf_idx;         // Current write index
-	int   step_buf_count;       // How many filled (0-4)
-	bool  has_step_period;      // True once 4 samples filled
-	float idle_time;
-	bool has_period;
-	bool seeded_start;
-} pas_quadrature_state_t;
+	// ---- Written by ISR, read by thread (volatile) ----
+	volatile uint32_t avg_period_ticks;  // 2-sample averaged period in TIM5 ticks
+	volatile bool     has_period;        // True once 2 samples filled
+	volatile uint32_t last_edge_ticks;   // TIM5->CNT at last valid edge (for timeout)
+	volatile bool     seeded_start;      // First edge seen, waiting for 2nd
+	volatile bool     backward_detected; // ISR saw backward step
+	volatile bool     exti_enabled;      // EXTI active
+	// ---- ISR-internal (not read by thread during normal operation) ----
+	uint8_t  last_state;          // QEM state (ISR only)
+	uint8_t  ref_state;           // Reference state for step counting
+	uint32_t prev_raw_ticks;      // Previous raw edge period for 2-sample avg
+	bool     has_prev;            // Whether prev_raw_ticks is valid
+} pas_exti_quad_state_t;
 
-static pas_quadrature_state_t pas_quad_state = {
+static volatile pas_exti_quad_state_t pas_exti_quad = {
+	.avg_period_ticks = 0,
+	.has_period = false,
+	.last_edge_ticks = 0,
+	.seeded_start = false,
+	.backward_detected = false,
+	.exti_enabled = false,
 	.last_state = 0xFF,
 	.ref_state = 0xFF,
-	.last_ref_timestamp = 0.0f,
-	.event_period = 0.0f,
-	.last_step_timestamp = 0.0f,
-	.step_period = 0.0f,
-	.step_buf = {0},
-	.step_buf_idx = 0,
-	.step_buf_count = 0,
-	.has_step_period = false,
-	.idle_time = 0.0f,
-	.has_period = false,
-	.seeded_start = false
+	.prev_raw_ticks = 0,
+	.has_prev = false,
 };
 
-static void pas_quadrature_reset_state(void) {
-	pas_quad_state.last_state = 0xFF;
-	pas_quad_state.ref_state = 0xFF;
-	pas_quad_state.last_ref_timestamp = 0.0f;
-	pas_quad_state.event_period = 0.0f;
-	pas_quad_state.last_step_timestamp = 0.0f;
-	pas_quad_state.step_period = 0.0f;
-	for (int i = 0; i < 4; i++) pas_quad_state.step_buf[i] = 0.0f;
-	pas_quad_state.step_buf_idx = 0;
-	pas_quad_state.step_buf_count = 0;
-	pas_quad_state.has_step_period = false;
-	pas_quad_state.idle_time = 0.0f;
-	pas_quad_state.has_period = false;
-	pas_quad_state.seeded_start = false;
+static void pas_exti_quad_reset(void) {
+	pas_exti_quad.avg_period_ticks = 0;
+	pas_exti_quad.has_period = false;
+	pas_exti_quad.last_edge_ticks = 0;
+	pas_exti_quad.seeded_start = false;
+	pas_exti_quad.backward_detected = false;
+	pas_exti_quad.last_state = 0xFF;
+	pas_exti_quad.ref_state = 0xFF;
+	pas_exti_quad.prev_raw_ticks = 0;
+	pas_exti_quad.has_prev = false;
 }
 
 static float pas_get_idle_timeout_limit(void) {
@@ -390,43 +386,55 @@ static void pas_speed_target_update(float loop_dt, bool force_idle_now) {
 	pas_target_erpm = pas_erpm_target_filtered;
 }
 
-static void pas_single_exti_enable(bool enable) {
+static void pas_exti_enable(bool enable) {
 #if defined(HW_PAS_PPM_EXTI_LINE)
 	if (enable) {
-		if (ppm_pas_state.exti_enabled) {
-			return;
-		}
+		bool is_quad = (config.sensor_type == PAS_SENSOR_TYPE_QUADRATURE);
+
+		if (is_quad && pas_exti_quad.exti_enabled) return;
+		if (!is_quad && ppm_pas_state.exti_enabled) return;
 
 		RCC_APB2PeriphClockCmd(RCC_APB2Periph_SYSCFG, ENABLE);
 		palSetPadMode(HW_ICU_GPIO, HW_ICU_PIN, PAL_MODE_INPUT_PULLUP);
+#if defined(HW_PAS2_PORT) && defined(HW_PAS2_PIN)
+		palSetPadMode(HW_PAS2_PORT, HW_PAS2_PIN, PAL_MODE_INPUT_PULLUP);
+#endif
 		SYSCFG_EXTILineConfig(HW_PAS_PPM_EXTI_PORTSRC, HW_PAS_PPM_EXTI_PINSRC);
 
 		EXTI_InitTypeDef EXTI_InitStructure;
 		EXTI_StructInit(&EXTI_InitStructure);
 		EXTI_InitStructure.EXTI_Line = HW_PAS_PPM_EXTI_LINE;
 		EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
-		EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Rising;
+		// Quadrature: both edges on channel A. Single: rising only.
+		EXTI_InitStructure.EXTI_Trigger = is_quad ?
+			EXTI_Trigger_Rising_Falling : EXTI_Trigger_Rising;
 		EXTI_InitStructure.EXTI_LineCmd = ENABLE;
 		EXTI_Init(&EXTI_InitStructure);
 		EXTI_ClearITPendingBit(HW_PAS_PPM_EXTI_LINE);
 
 		nvicEnableVector(HW_PAS_PPM_EXTI_CH, 7);
-		ppm_pas_state.last_edge_time = timer_time_now();
-		ppm_pas_state.revolution_period = 0.0f;
-		ppm_pas_state.period_valid = false;
-		ppm_pas_state.exti_enabled = true;
-	} else {
-		if (!ppm_pas_state.exti_enabled) {
-			return;
-		}
 
+		if (is_quad) {
+			pas_exti_quad_reset();
+			pas_exti_quad.last_edge_ticks = timer_time_now();
+			pas_exti_quad.exti_enabled = true;
+		} else {
+			ppm_pas_state.last_edge_time = timer_time_now();
+			ppm_pas_state.revolution_period = 0.0f;
+			ppm_pas_state.period_valid = false;
+			ppm_pas_state.exti_enabled = true;
+		}
+	} else {
 		EXTI_InitTypeDef EXTI_InitStructure;
 		EXTI_StructInit(&EXTI_InitStructure);
 		EXTI_InitStructure.EXTI_Line = HW_PAS_PPM_EXTI_LINE;
 		EXTI_InitStructure.EXTI_LineCmd = DISABLE;
 		EXTI_Init(&EXTI_InitStructure);
+
 		ppm_pas_state.exti_enabled = false;
 		ppm_pas_state.period_valid = false;
+		pas_exti_quad.exti_enabled = false;
+		pas_exti_quad.has_period = false;
 	}
 #else
 	(void)enable;
@@ -435,6 +443,84 @@ static void pas_single_exti_enable(bool enable) {
 
 void app_pas_pas_irq_handler(void) {
 #if defined(HW_PAS_PPM_EXTI_LINE)
+	// ---- Quadrature EXTI mode ----
+	// EXTI fires on channel-A (PB6) both edges.
+	// Read channel-B (PA6) for QEM direction detection.
+	// 2-sample ring buffer: avg of rise-to-fall + fall-to-rise = 1 magnet+gap.
+	if (pas_exti_quad.exti_enabled &&
+		config.sensor_type == PAS_SENSOR_TYPE_QUADRATURE) {
+		static const int8_t QEM[] = {0,-1,1,2,1,0,2,-1,-1,2,0,1,2,1,-1,0};
+
+		uint32_t now = TIM5->CNT;  // Direct register read — fastest, 14 MHz
+
+		// Read both pins
+		uint8_t pas1 = palReadPad(HW_PAS1_PORT, HW_PAS1_PIN) ? 1 : 0;
+		uint8_t pas2 = palReadPad(HW_PAS2_PORT, HW_PAS2_PIN) ? 1 : 0;
+		pas_dbg_a_level = pas1;
+		pas_dbg_b_level = pas2;
+		uint8_t new_state = (pas2 << 1) | pas1;
+
+		if (pas_exti_quad.last_state == 0xFF) {
+			// First edge ever — seed state, don't compute period
+			pas_exti_quad.last_state = new_state;
+			pas_exti_quad.last_edge_ticks = now;
+			pas_exti_quad.seeded_start = true;
+			return;
+		}
+
+		if (new_state == pas_exti_quad.last_state) {
+			return;  // No state change (shouldn't happen but guard)
+		}
+
+		int idx = (pas_exti_quad.last_state * 4) + new_state;
+		int8_t step = QEM[idx];
+		pas_exti_quad.last_state = new_state;
+
+		if (step == 2 || step == -2) {
+			return;  // Invalid transition (skipped state)
+		}
+
+		// Direction check (direction_conf is +1 or -1)
+		int8_t direction = (direction_conf > 0.0f) ? step : -step;
+		if (direction < 0) {
+			pas_exti_quad.backward_detected = true;
+			return;
+		}
+		if (direction == 0) {
+			return;
+		}
+
+		// Valid forward step on channel A
+		uint32_t elapsed = now - pas_exti_quad.last_edge_ticks;
+		pas_exti_quad.last_edge_ticks = now;
+		pas_exti_quad.backward_detected = false;
+
+		// 2-sample ring buffer: average consecutive A-edge periods
+		// rise-to-fall + fall-to-rise = 1 full magnet+gap cycle
+		if (pas_exti_quad.has_prev) {
+			pas_exti_quad.avg_period_ticks =
+				(pas_exti_quad.prev_raw_ticks + elapsed) / 2;
+			pas_exti_quad.has_period = true;
+			pas_exti_quad.seeded_start = false;
+		} else {
+			pas_exti_quad.seeded_start = true;
+		}
+		pas_exti_quad.prev_raw_ticks = elapsed;
+		pas_exti_quad.has_prev = true;
+
+		// Step/transition counters (atomic 32-bit writes on Cortex-M4)
+		pas_transition_count++;
+
+		// Ref-state tracking for step_count
+		if (pas_exti_quad.ref_state == 0xFF) {
+			pas_exti_quad.ref_state = new_state;
+		} else if (new_state == pas_exti_quad.ref_state) {
+			pas_step_count++;
+		}
+		return;
+	}
+
+	// ---- Single-pin PPM EXTI mode ----
 	if (!ppm_pas_state.exti_enabled) {
 		return;
 	}
@@ -534,7 +620,7 @@ void app_pas_configure(pas_config *conf) {
 	pas_transition_count = 0;
 	pas_time_last_real_step = 0.0f;
 	pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
-	pas_quadrature_reset_state();
+	pas_exti_quad_reset();
 	pas_speed_state_reset(true);
 	pas_force_idle = true;
 	pas_boost_state = 0.0f;
@@ -554,9 +640,8 @@ void app_pas_start(bool is_primary_output) {
 	stop_now = false;
 	chThdCreateStatic(pas_thread_wa, sizeof(pas_thread_wa), NORMALPRIO, pas_thread, NULL);
 
-	if (config.sensor_type == PAS_SENSOR_TYPE_SINGLE_PIN_PPM) {
-		pas_single_exti_enable(true);
-	}
+	// Enable EXTI for both single-pin and quadrature modes
+	pas_exti_enable(true);
 
 	primary_output = is_primary_output;
 }
@@ -571,9 +656,7 @@ void app_pas_stop(void) {
 		chThdSleepMilliseconds(1);
 	}
 
-	if (config.sensor_type == PAS_SENSOR_TYPE_SINGLE_PIN_PPM) {
-		pas_single_exti_enable(false);
-	}
+	pas_exti_enable(false);
 
 	if (primary_output == true) {
 		mc_interface_set_current_rel(0.0);
@@ -581,7 +664,7 @@ void app_pas_stop(void) {
 	else {
 		output_current_rel = 0.0;
 	}
-	pas_quadrature_reset_state();
+	pas_exti_quad_reset();
 	pedal_rpm = 0.0f;
 	pas_speed_state_reset(true);
 	pas_force_idle = true;
@@ -631,7 +714,11 @@ uint32_t app_pas_get_transition_count(void) {
 }
 
 float app_pas_get_step_period(void) {
-	return pas_quad_state.step_period;
+	// Convert ISR tick period to seconds
+	if (pas_exti_quad.has_period && pas_exti_quad.avg_period_ticks > 0) {
+		return (float)pas_exti_quad.avg_period_ticks * (1.0f / PAS_TIMER_HZ);
+	}
+	return 0.0f;
 }
 
 float app_pas_get_time_since_real_step(void) {
@@ -639,7 +726,11 @@ float app_pas_get_time_since_real_step(void) {
 }
 
 float app_pas_get_event_period(void) {
-	return pas_quad_state.event_period;
+	// Use 2x the avg period (2 A-edges per magnet) for event period
+	if (pas_exti_quad.has_period && pas_exti_quad.avg_period_ticks > 0) {
+		return (float)(pas_exti_quad.avg_period_ticks * 2) * (1.0f / PAS_TIMER_HZ);
+	}
+	return 0.0f;
 }
 
 bool app_pas_is_forced_idle(void) {
@@ -647,139 +738,82 @@ bool app_pas_is_forced_idle(void) {
 }
 
 static void pas_sensor_update_quadrature(float loop_dt) {
-#if defined(HW_PAS1_PORT) && defined(HW_PAS2_PORT)
-	const int8_t QEM[] = {0,-1,1,2,1,0,2,-1,-1,2,0,1,2,1,-1,0};
+#if defined(HW_PAS1_PORT) && defined(HW_PAS2_PORT) && defined(HW_PAS_PPM_EXTI_LINE)
+	// ---- EXTI-driven quadrature: thread just reads ISR results ----
+	// ISR handles: QEM decode, direction, timestamps, 2-sample averaging
+	// Thread handles: RPM calculation, timeout, idle/startup logic
+
 	const float startup_rpm = 7.0f;
 	const float stop_factor = 1.5f;
-	static float rpm_filtered = 0.0f;
+	(void)loop_dt;
 
-	pas_quad_state.idle_time += loop_dt;
-	pas_time_since_last_real_step = pas_quad_state.idle_time;
-
-	uint8_t pas1 = palReadPad(HW_PAS1_PORT, HW_PAS1_PIN) ? 1 : 0;
-	uint8_t pas2 = palReadPad(HW_PAS2_PORT, HW_PAS2_PIN) ? 1 : 0;
-	pas_dbg_a_level = pas1;
-	pas_dbg_b_level = pas2;
-	uint8_t new_state = (pas2 << 1) | pas1;
-
-	if (pas_quad_state.last_state == 0xFF && new_state <= 3) {
-		pas_quad_state.last_state = new_state;
+	if (!pas_exti_quad.exti_enabled) {
+		pedal_rpm = 0.0f;
+		pas_speed_state_reset(true);
+		return;
 	}
 
-	if (new_state <= 3 && pas_quad_state.last_state <= 3 && new_state != pas_quad_state.last_state) {
-		int idx = (pas_quad_state.last_state * 4) + new_state;
-		int8_t step = QEM[idx];
-		pas_quad_state.last_state = new_state;
+	// Idle time from ISR timestamp
+	float idle_time = timer_seconds_elapsed_since(pas_exti_quad.last_edge_ticks);
+	pas_time_since_last_real_step = idle_time;
 
-		if (step == 2 || step == -2) {
-			return;
-		}
-
-		int8_t direction = (int8_t)(direction_conf * (float)step);
-		if (direction < 0) {
-			pas_quadrature_reset_state();
-			pedal_rpm = 0.0f;
-			pas_force_idle = true;
-			pas_boost_state = 0.0f;
-			pas_boost_initialized = false;
-			pas_startup_assist_timer = 0.0f;
-			pas_time_last_real_step = 0.0f;
-			pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
-			pas_speed_state_reset(true);
-			return;
-		} else if (direction == 0) {
-			return;
-		}
-
-		pas_quad_state.idle_time = 0.0f;
-		float now = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
-		if (pas_quad_state.ref_state == 0xFF) {
-			// First valid forward step — seed both ref and step tracking
-			pas_quad_state.ref_state = new_state;
-			pas_quad_state.last_ref_timestamp = now;
-			pas_quad_state.last_step_timestamp = now;
-			pas_quad_state.seeded_start = true;
-		} else {
-			// ---- All transitions, 4-sample ring buffer ----
-			// All 4 quadrature edges (80/rev). Raw periods go into a 4-slot
-			// ring buffer. Average of 4 = exactly 1 full quad cycle =
-			// 1 magnet+gap. Cancels both sensor asymmetry AND magnet duty
-			// cycle asymmetry. Updates every edge, always clean.
-			float raw_period = now - pas_quad_state.last_step_timestamp;
-			pas_quad_state.last_step_timestamp = now;
-
-			float magnets = fmaxf(1.0f, (float)config.magnets);
-			float min_step_period = min_pedal_period;
-			if (magnets > 1.0f && min_step_period > 0.0f) {
-				min_step_period /= (magnets * 4.0f);
-			}
-			if (min_step_period < 1e-5f) min_step_period = 1e-5f;
-
-			if (raw_period >= min_step_period) {
-				pas_quad_state.step_buf[pas_quad_state.step_buf_idx] = raw_period;
-				pas_quad_state.step_buf_idx = (pas_quad_state.step_buf_idx + 1) % 4;
-				if (pas_quad_state.step_buf_count < 4) pas_quad_state.step_buf_count++;
-
-				if (pas_quad_state.step_buf_count >= 4) {
-					pas_quad_state.step_period = (pas_quad_state.step_buf[0] +
-						pas_quad_state.step_buf[1] + pas_quad_state.step_buf[2] +
-						pas_quad_state.step_buf[3]) * 0.25f;
-					pas_quad_state.has_step_period = true;
-					pas_quad_state.seeded_start = false;
-				} else {
-					pas_quad_state.seeded_start = true;
-				}
-			} else {
-				pas_quad_state.seeded_start = true;
-			}
-
-			pas_transition_count++;
-			pas_time_last_real_step = now;
-			pas_time_since_last_real_step = 0.0f;
-			bool was_idle = pas_force_idle;
-			pas_force_idle = false;
-			if (was_idle) {
-				pas_startup_assist_trigger();
-			}
-
-			// ---- Ref-state match: step_count + event_period for downstream compat ----
-			if (new_state == pas_quad_state.ref_state) {
-				float event_period = now - pas_quad_state.last_ref_timestamp;
-				pas_quad_state.last_ref_timestamp = now;
-				if (event_period > 1e-4f) {
-					if (!pas_quad_state.has_period) {
-						pas_quad_state.event_period = event_period;
-					} else {
-						UTILS_LP_FAST(pas_quad_state.event_period, event_period, 0.3f);
-					}
-					pas_quad_state.has_period = true;
-				}
-				pas_step_count++;
-			}
-		}
+	// Handle backward detection from ISR
+	if (pas_exti_quad.backward_detected) {
+		pas_exti_quad_reset();
+		pas_exti_quad.exti_enabled = true;  // Keep EXTI running
+		pas_exti_quad.last_edge_ticks = timer_time_now();
+		pedal_rpm = 0.0f;
+		pas_force_idle = true;
+		pas_boost_state = 0.0f;
+		pas_boost_initialized = false;
+		pas_startup_assist_timer = 0.0f;
+		pas_time_last_real_step = 0.0f;
+		pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
+		pas_speed_state_reset(true);
+		return;
 	}
 
-	// ---- RPM from 4-sample averaged period (no LP — tracking LP handles it) ----
+	// Calculate RPM from ISR-computed averaged period
 	float rpm = pedal_rpm;
-	if (pas_quad_state.has_step_period && pas_quad_state.step_period > 1e-5f) {
+	if (pas_exti_quad.has_period && pas_exti_quad.avg_period_ticks > 0) {
+		// avg_period_ticks = avg of 2 consecutive A-edge periods (in TIM5 ticks)
+		// 2 A-edges per magnet = 1 full magnet+gap cycle
+		// So avg_period is the time for half a magnet cycle (1 A-edge spacing)
+		// Full magnet period = avg_period * 2
+		// magnets per rev = config.magnets
+		// revolution period = avg_period * 2 * magnets
+		float avg_period_s = (float)pas_exti_quad.avg_period_ticks * (1.0f / PAS_TIMER_HZ);
 		float magnets = fmaxf(1.0f, (float)config.magnets);
-		// 4 transitions per magnet pair per revolution
-		float rev_per_s = 1.0f / (pas_quad_state.step_period * magnets * 4.0f);
-		rpm = rev_per_s * 60.0f;
-	} else if (pas_quad_state.seeded_start) {
+		float rev_period = avg_period_s * 2.0f * magnets;
+		if (rev_period > 1e-5f) {
+			rpm = 60.0f / rev_period;
+		}
+
+		// Update last-step tracking (thread-side)
+		float now = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
+		pas_time_last_real_step = now;
+		bool was_idle = pas_force_idle;
+		pas_force_idle = false;
+		if (was_idle) {
+			pas_startup_assist_trigger();
+		}
+	} else if (pas_exti_quad.seeded_start) {
 		rpm = fmaxf(rpm, startup_rpm);
 	}
-	(void)rpm_filtered;
 
+	// Timeout detection
 	float timeout = max_pulse_period;
-	if (pas_quad_state.has_step_period) {
+	if (pas_exti_quad.has_period && pas_exti_quad.avg_period_ticks > 0) {
+		float avg_period_s = (float)pas_exti_quad.avg_period_ticks * (1.0f / PAS_TIMER_HZ);
 		float magnets = fmaxf(1.0f, (float)config.magnets);
-		float extended = pas_quad_state.step_period * magnets * 4.0f * stop_factor;
+		float extended = avg_period_s * 2.0f * magnets * stop_factor;
 		timeout = fmaxf(timeout, extended);
 	}
 
-	if (pas_quad_state.idle_time > timeout) {
-		pas_quadrature_reset_state();
+	if (idle_time > timeout) {
+		pas_exti_quad_reset();
+		pas_exti_quad.exti_enabled = true;  // Keep EXTI running
+		pas_exti_quad.last_edge_ticks = timer_time_now();
 		rpm = 0.0f;
 		pas_force_idle = true;
 		pas_boost_state = 0.0f;

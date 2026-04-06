@@ -1265,9 +1265,9 @@ static float haz_pas_follow_process(float dt_s) {
 	}
 
 	// ========== CADENCE BASE: direct LP filter ==========
-	// Channel-A-only PAS gives clean 40/rev updates with no asymmetry.
-	// No interpolation/prediction needed — just LP-filter the raw ERPM
-	// and let the speed PID handle the rest.
+	// EXTI interrupt on channel-A (PB6) both edges gives exact timestamps.
+	// 2-sample averaged period cancels magnet duty cycle asymmetry.
+	// No polling jitter — clean RPM, LP optional for taste.
 	float base_erpm_raw = pedal_rpm * gear_ratio * pole_pairs * target_lead;
 
 	// Tracking Smoothness: 0 = instant tracking, 1 = max smooth
