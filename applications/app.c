@@ -198,7 +198,12 @@ void app_set_configuration(app_configuration *conf) {
 	app_adc_configure(&appconf.app_adc_conf);
 	app_pas_configure(&appconf.app_pas_conf);
 	app_uartcomm_configure(appconf.app_uart_baudrate, true, UART_PORT_COMM_HEADER);
+#if HAZ_TORQUE_UART_DIRECT
+	// UART4/SD4 is used by torque sensor — don't let permanent UART comm grab it
+	app_uartcomm_configure(0, false, UART_PORT_BUILTIN);
+#else
 	app_uartcomm_configure(0, appconf.permanent_uart_enabled, UART_PORT_BUILTIN);
+#endif
 	app_nunchuk_configure(&appconf.app_chuk_conf);
 
 #ifdef APP_CUSTOM_TO_USE
