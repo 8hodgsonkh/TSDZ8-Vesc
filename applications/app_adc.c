@@ -1142,7 +1142,7 @@ static float haz_pas_follow_process(float dt_s) {
 	const float idle_timeout_s   = fmaxf(pc->pas_follow_idle_timeout_s, 0.05f);
 	const float target_lead      = fmaxf(pc->pas_follow_target_lead, 0.5f);
 	const float erpm_ramp_rate   = fmaxf(pc->pas_follow_erpm_ramp_rate, 100.0f);
-	const float cadence_filter   = fminf(fmaxf(pc->pas_follow_cadence_filter, 0.01f), 1.0f);
+	const float cadence_filter   = fminf(fmaxf(pc->pas_follow_cadence_filter, 0.0f), 1.0f);
 	const float ramp_down_rate   = fmaxf(pc->pas_follow_ramp_down_mult, 500.0f); // ERPM/s
 
 	// ========== SPEED LIMIT CHECK (STREET MODE ONLY) ==========
@@ -1317,6 +1317,19 @@ static float haz_pas_follow_process(float dt_s) {
 	}
 	// else: rate ~0 = holding steady
 
+	// ========== TRACKING SMOOTHNESS: LP on interpolated output ==========
+	// Absorbs natural cadence wobble without creating staircase artifacts
+	// (input is continuous from interpolation, so LP works cleanly).
+	// cadence_filter: 0 = no smoothing (raw interpolated), 1 = maximum smooth
+	// Maps to LP factor: 0→1.0 (pass-through), 1→0.005 (very heavy)
+	static float cadence_base_smooth = 0.0f;
+	if (cadence_filter < 0.01f) {
+		cadence_base_smooth = haz_pas_follow_ctx.target_erpm_filtered;
+	} else {
+		float lp_factor = 1.0f - cadence_filter * 0.995f;  // 0→1.0, 1→0.005
+		UTILS_LP_FAST(cadence_base_smooth, haz_pas_follow_ctx.target_erpm_filtered, lp_factor);
+	}
+
 	float max_erpm = fabsf(mcconf->l_max_erpm);
 	if (max_erpm < 100.0f) max_erpm = 100000.0f;
 
@@ -1335,8 +1348,8 @@ static float haz_pas_follow_process(float dt_s) {
 	float max_boost = erpm_ramp_rate * 1.0f;
 	if (torque_erpm_extra > max_boost) torque_erpm_extra = max_boost;
 
-	// Final target: cadence base + torque boost
-	float target_erpm = haz_pas_follow_ctx.target_erpm_filtered + torque_erpm_extra;
+	// Final target: cadence base (smoothed) + torque boost
+	float target_erpm = cadence_base_smooth + torque_erpm_extra;
 	if (target_erpm > max_erpm) target_erpm = max_erpm;
 	if (target_erpm < 0.0f) target_erpm = 0.0f;
 
