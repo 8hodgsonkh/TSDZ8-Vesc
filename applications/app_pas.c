@@ -157,8 +157,11 @@ typedef struct {
 	float last_ref_timestamp;
 	float event_period;
 	float last_step_timestamp;  // Timestamp of last valid forward step (any transition)
-	float step_period;          // LP-filtered period between consecutive transitions
-	bool  has_step_period;      // True once first step_period is computed
+	float step_buf[4];          // Ring buffer of last 4 raw step periods
+	int   step_buf_idx;         // Current index into step_buf
+	int   step_buf_filled;      // How many valid entries (0-4)
+	float step_period;          // Average of step_buf (4-sample = 1 pair cycle, cancels A/B asymmetry)
+	bool  has_step_period;      // True once all 4 slots filled
 	float idle_time;
 	bool has_period;
 	bool seeded_start;
@@ -170,6 +173,9 @@ static pas_quadrature_state_t pas_quad_state = {
 	.last_ref_timestamp = 0.0f,
 	.event_period = 0.0f,
 	.last_step_timestamp = 0.0f,
+	.step_buf = {0},
+	.step_buf_idx = 0,
+	.step_buf_filled = 0,
 	.step_period = 0.0f,
 	.has_step_period = false,
 	.idle_time = 0.0f,
@@ -183,6 +189,9 @@ static void pas_quadrature_reset_state(void) {
 	pas_quad_state.last_ref_timestamp = 0.0f;
 	pas_quad_state.event_period = 0.0f;
 	pas_quad_state.last_step_timestamp = 0.0f;
+	for (int i = 0; i < 4; i++) pas_quad_state.step_buf[i] = 0.0f;
+	pas_quad_state.step_buf_idx = 0;
+	pas_quad_state.step_buf_filled = 0;
 	pas_quad_state.step_period = 0.0f;
 	pas_quad_state.has_step_period = false;
 	pas_quad_state.idle_time = 0.0f;
@@ -708,14 +717,21 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 			}
 
 			if (step_period >= min_step_period) {
-				// LP filter the step period — always filter for smooth output
-				if (!pas_quad_state.has_step_period) {
-					pas_quad_state.step_period = step_period;
-				} else {
-					UTILS_LP_FAST(pas_quad_state.step_period, step_period, 0.3f);
+				// 4-sample ring buffer: averages 1 full quadrature cycle (4 steps = 1 pair)
+				// Cancels A/B channel asymmetry (uneven magnet spacing) perfectly.
+				// Updates every step (80/rev) but signal is clean (no oscillation).
+				pas_quad_state.step_buf[pas_quad_state.step_buf_idx] = step_period;
+				pas_quad_state.step_buf_idx = (pas_quad_state.step_buf_idx + 1) % 4;
+				if (pas_quad_state.step_buf_filled < 4) pas_quad_state.step_buf_filled++;
+
+				// Average all filled slots
+				float sum = 0.0f;
+				for (int i = 0; i < pas_quad_state.step_buf_filled; i++) {
+					sum += pas_quad_state.step_buf[i];
 				}
-				pas_quad_state.has_step_period = true;
-				pas_quad_state.seeded_start = false;
+				pas_quad_state.step_period = sum / (float)pas_quad_state.step_buf_filled;
+				pas_quad_state.has_step_period = (pas_quad_state.step_buf_filled >= 4);
+				pas_quad_state.seeded_start = (pas_quad_state.step_buf_filled < 4);
 
 				pas_transition_count++;
 				pas_time_last_real_step = now;
@@ -744,7 +760,7 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 		}
 	}
 
-	// ---- RPM from per-step period (4x more responsive than per-pair) ----
+	// ---- RPM from 4-sample averaged step period (clean, no A/B oscillation) ----
 	float rpm = pedal_rpm;
 	if (pas_quad_state.has_step_period && pas_quad_state.step_period > 1e-5f) {
 		float magnets = fmaxf(1.0f, (float)config.magnets);
@@ -755,8 +771,8 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 		rpm = fmaxf(rpm, startup_rpm);
 	}
 
-	// Always LP filter output RPM — more frequent steps = noisier raw, filter smooths it
-	UTILS_LP_FAST(rpm_filtered, rpm, 0.3f);
+	// Light LP on output — just for inter-pair smoothness, averaging does the heavy lifting
+	UTILS_LP_FAST(rpm_filtered, rpm, 0.5f);
 	rpm = rpm_filtered;
 
 	float timeout = max_pulse_period;
