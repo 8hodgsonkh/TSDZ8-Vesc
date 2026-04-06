@@ -95,6 +95,8 @@ float app_pas_get_target_erpm_boost(void);
 int app_pas_get_pas1_level(void);
 int app_pas_get_pas2_level(void);
 uint32_t app_pas_get_step_count(void);
+uint32_t app_pas_get_transition_count(void);
+float app_pas_get_step_period(void);
 float app_pas_get_time_since_real_step(void);
 float app_pas_get_event_period(void);
 bool app_pas_is_forced_idle(void);

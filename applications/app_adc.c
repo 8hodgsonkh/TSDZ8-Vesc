@@ -153,12 +153,17 @@ static float haz_throttle_filtered = 0.0f;
 
 typedef struct {
 	float target_erpm_smooth;  // Ramp-limited output ERPM for speed PID
-	float target_erpm_filtered; // LP-filtered target ERPM (smooth tracking)
+	float target_erpm_filtered; // Interpolated cadence base ERPM
 	float rotation_progress;
 	float idle_time;
 	bool engaged;
 	uint32_t last_step_count;  // For step-rate idle detection
 	float step_rate_smooth;    // LP-filtered PAS step rate (steps/sec)
+	// Proportional interpolation state
+	uint32_t last_transition_count;
+	float interp_from;         // ERPM at last transition
+	float interp_to;           // ERPM target for next transition
+	float interp_rate;         // ERPM/s ramp rate between transitions
 } haz_pas_follow_ctx_t;
 
 static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
@@ -168,7 +173,11 @@ static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
 	.idle_time = 0.0f,
 	.engaged = false,
 	.last_step_count = 0,
-	.step_rate_smooth = 0.0f
+	.step_rate_smooth = 0.0f,
+	.last_transition_count = 0,
+	.interp_from = 0.0f,
+	.interp_to = 0.0f,
+	.interp_rate = 0.0f
 };
 
 // =============================================================================
@@ -1111,7 +1120,10 @@ static void haz_pas_follow_reset(void) {
 	haz_pas_follow_ctx.idle_time = 0.0f;
 	haz_pas_follow_ctx.engaged = false;
 	haz_pas_follow_ctx.step_rate_smooth = 0.0f;
-	// Note: don't reset last_step_count — it's cumulative
+	haz_pas_follow_ctx.interp_from = 0.0f;
+	haz_pas_follow_ctx.interp_to = 0.0f;
+	haz_pas_follow_ctx.interp_rate = 0.0f;
+	// Note: don't reset last_step_count or last_transition_count — cumulative
 }
 
 // Returns:
@@ -1264,23 +1276,46 @@ static float haz_pas_follow_process(float dt_s) {
 		torque_ramp_erpm = shaped * strength * erpm_ramp_rate;
 	}
 
-	// ========== CADENCE BASE: snap-up, hold-down ==========
-	// Cadence sets the floor for torque boost. We want:
-	//   UP: snap instantly to higher cadence (responsive engagement)
-	//   DOWN: LP filter toward lower cadence (rejects jitter, tracks real slowdown)
-	// Jitter alternates high-low so LP averages it out. Genuine slowdown is
-	// sustained so LP tracks it within a few hundred ms.
-	// cadence_filter controls the LP factor for downward tracking.
+	// ========== CADENCE BASE: proportional interpolation ==========
+	// On each PAS transition (80/rev with quadrature), compute the delta
+	// between old and new target ERPM, then ramp linearly over the expected
+	// step period. Result: continuous smooth motion between discrete PAS
+	// updates. Big cadence change = fast ramp. Tiny jitter = micro-ramp.
+	// No staircase, no pulsing, perfectly proportional.
 	float base_erpm_raw = pedal_rpm * gear_ratio * pole_pairs * target_lead;
 
-	if (base_erpm_raw > haz_pas_follow_ctx.target_erpm_filtered) {
-		// Cadence increasing — snap up instantly
-		haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
-	} else {
-		// Cadence same or lower — LP filter down (jitter rejected, real drops tracked)
-		// cadence_filter 0.01 = very slow tracking, 1.0 = instant
-		UTILS_LP_FAST(haz_pas_follow_ctx.target_erpm_filtered, base_erpm_raw, cadence_filter);
+	uint32_t tc = app_pas_get_transition_count();
+	if (tc != haz_pas_follow_ctx.last_transition_count) {
+		// New PAS transition arrived — set up interpolation
+		haz_pas_follow_ctx.last_transition_count = tc;
+		haz_pas_follow_ctx.interp_from = haz_pas_follow_ctx.target_erpm_filtered;
+		haz_pas_follow_ctx.interp_to = base_erpm_raw;
+
+		float step_period = app_pas_get_step_period();
+		if (step_period > 1e-4f) {
+			// Ramp rate = delta / time until next expected step
+			float delta = base_erpm_raw - haz_pas_follow_ctx.target_erpm_filtered;
+			haz_pas_follow_ctx.interp_rate = delta / step_period;
+		} else {
+			// No valid period yet — snap
+			haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
+			haz_pas_follow_ctx.interp_rate = 0.0f;
+		}
 	}
+
+	// Between transitions: ramp at computed rate toward target
+	if (haz_pas_follow_ctx.interp_rate > 0.01f) {
+		// Ramping up
+		haz_pas_follow_ctx.target_erpm_filtered += haz_pas_follow_ctx.interp_rate * dt_s;
+		if (haz_pas_follow_ctx.target_erpm_filtered > haz_pas_follow_ctx.interp_to)
+			haz_pas_follow_ctx.target_erpm_filtered = haz_pas_follow_ctx.interp_to;
+	} else if (haz_pas_follow_ctx.interp_rate < -0.01f) {
+		// Ramping down
+		haz_pas_follow_ctx.target_erpm_filtered += haz_pas_follow_ctx.interp_rate * dt_s;
+		if (haz_pas_follow_ctx.target_erpm_filtered < haz_pas_follow_ctx.interp_to)
+			haz_pas_follow_ctx.target_erpm_filtered = haz_pas_follow_ctx.interp_to;
+	}
+	// else: rate ~0 = holding steady
 
 	float max_erpm = fabsf(mcconf->l_max_erpm);
 	if (max_erpm < 100.0f) max_erpm = 100000.0f;

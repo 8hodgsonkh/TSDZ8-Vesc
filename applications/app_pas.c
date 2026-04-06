@@ -128,6 +128,7 @@ static float pas_boost_state = 0.0f;
 static bool pas_boost_initialized = false;
 static volatile bool pas_force_idle = true;
 static volatile uint32_t pas_step_count = 0;
+static volatile uint32_t pas_transition_count = 0;  // Increments on every valid forward quadrature transition
 static volatile float pas_time_last_real_step = 0.0f;
 static volatile float pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
 #if defined(HW_PAS_PPM_EXTI_LINE)
@@ -521,6 +522,7 @@ void app_pas_configure(pas_config *conf) {
 	ppm_pas_state.last_edge_time = timer_time_now();
 #endif
 	pas_step_count = 0;
+	pas_transition_count = 0;
 	pas_time_last_real_step = 0.0f;
 	pas_time_since_last_real_step = PAS_STOP_TIMEOUT;
 	pas_quadrature_reset_state();
@@ -615,6 +617,14 @@ uint32_t app_pas_get_step_count(void) {
 	return pas_step_count;
 }
 
+uint32_t app_pas_get_transition_count(void) {
+	return pas_transition_count;
+}
+
+float app_pas_get_step_period(void) {
+	return pas_quad_state.step_period;
+}
+
 float app_pas_get_time_since_real_step(void) {
 	return pas_time_since_last_real_step;
 }
@@ -707,6 +717,7 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 				pas_quad_state.has_step_period = true;
 				pas_quad_state.seeded_start = false;
 
+				pas_transition_count++;
 				pas_time_last_real_step = now;
 				pas_time_since_last_real_step = 0.0f;
 				bool was_idle = pas_force_idle;
