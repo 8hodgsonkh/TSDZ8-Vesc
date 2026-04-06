@@ -201,10 +201,20 @@ static haz_pas_duty_ctx_t haz_pas_duty_ctx = {
 };
 
 // =============================================================================
-// EXTERNAL TORQUE SENSOR (from ESP32 via BLE)
+// EXTERNAL TORQUE SENSOR
 // =============================================================================
-// ESP32 sends processed torque (0-160 normalized) via COMM_CUSTOM_APP_DATA "HT"
-static volatile uint16_t s_ext_torque = 0;        // 0-160 from ESP32
+// Two modes:
+//   1. BLE: ESP32 sends processed torque (0-160) via COMM_CUSTOM_APP_DATA "HT"
+//   2. Direct UART: TSDZ8 torque sensor wired to HW_UART (USART3, PB10/PB11)
+//      Protocol: [0xAA][0x04][0x01][DATA_HI][DATA_LO][XOR_CHECKSUM]
+//      115200 baud, ~50Hz, 10-bit ADC (0-1023)
+// =============================================================================
+
+// Compile flag: HAZ_TORQUE_UART_DIRECT defined in hw_go_foc_s100_d100s.h
+// Uses HW_UART_P (UART4/SD4, PC10/PC11) — the unpopulated NRF52 port.
+// This keeps HW_UART (UART3/SD3, PB10/PB11) free for Flipsky BT module.
+
+static volatile uint16_t s_ext_torque = 0;        // 0-160 normalized
 static volatile systime_t s_ext_torque_ts = 0;    // Last receive timestamp
 static float s_ext_torque_smooth = 0.0f;          // LP-filtered torque
 
@@ -217,6 +227,114 @@ void app_adc_set_ext_torque(uint16_t value) {
 uint16_t app_adc_get_ext_torque(void) {
 	return s_ext_torque;
 }
+
+// =============================================================================
+// DIRECT UART TORQUE SENSOR (TSDZ8 → VESC USART3)
+// =============================================================================
+#if HAZ_TORQUE_UART_DIRECT
+
+static const SerialConfig torque_uart_cfg = {
+	115200, 0, 0, 0
+};
+static bool torque_uart_running = false;
+
+// Auto-calibration: average first N readings as resting baseline
+#define TORQUE_CAL_SAMPLES   50
+static uint16_t torque_cal_buf[TORQUE_CAL_SAMPLES];
+static int torque_cal_idx = 0;
+static bool torque_cal_done = false;
+static uint16_t torque_offset = 0;
+
+// Max ADC range above offset — typical TSDZ8 range
+// 280 ADC counts ≈ max pedal force. Tune if needed.
+#define TORQUE_ADC_MAX       280
+
+// TSDZ8 UART protocol state machine
+typedef enum {
+	TS_SYNC, TS_LEN, TS_CMD, TS_DATA_HI, TS_DATA_LO, TS_CHECKSUM
+} tsdz8_parse_state_t;
+
+static tsdz8_parse_state_t ts_state = TS_SYNC;
+static uint8_t ts_len, ts_cmd, ts_data_hi, ts_data_lo, ts_xor;
+
+static void torque_uart_process_byte(uint8_t b) {
+	switch (ts_state) {
+	case TS_SYNC:
+		if (b == 0xAA) { ts_xor = b; ts_state = TS_LEN; }
+		break;
+	case TS_LEN:
+		ts_len = b; ts_xor ^= b;
+		ts_state = (ts_len >= 3 && ts_len <= 8) ? TS_CMD : TS_SYNC;
+		break;
+	case TS_CMD:
+		ts_cmd = b; ts_xor ^= b;
+		ts_state = (ts_cmd == 0x01) ? TS_DATA_HI : TS_SYNC;
+		break;
+	case TS_DATA_HI:
+		ts_data_hi = b; ts_xor ^= b;
+		ts_state = TS_DATA_LO;
+		break;
+	case TS_DATA_LO:
+		ts_data_lo = b; ts_xor ^= b;
+		ts_state = TS_CHECKSUM;
+		break;
+	case TS_CHECKSUM:
+		if (b == ts_xor) {
+			uint16_t raw = ((uint16_t)ts_data_hi << 8) | ts_data_lo;
+
+			// Auto-calibrate offset from first N readings (must be at rest!)
+			if (!torque_cal_done) {
+				torque_cal_buf[torque_cal_idx++] = raw;
+				if (torque_cal_idx >= TORQUE_CAL_SAMPLES) {
+					uint32_t sum = 0;
+					for (int i = 0; i < TORQUE_CAL_SAMPLES; i++) sum += torque_cal_buf[i];
+					torque_offset = (uint16_t)(sum / TORQUE_CAL_SAMPLES);
+					torque_cal_done = true;
+				}
+			} else {
+				// Offset-subtract and normalize to 0-160
+				int16_t val = (int16_t)raw - (int16_t)torque_offset;
+				if (val < 0) val = 0;
+				int16_t norm = (val * 160) / TORQUE_ADC_MAX;
+				if (norm > 160) norm = 160;
+				app_adc_set_ext_torque((uint16_t)norm);
+			}
+		}
+		ts_state = TS_SYNC;
+		break;
+	}
+}
+
+static void torque_uart_start(void) {
+	if (torque_uart_running) return;
+
+	// Disable permanent UART comm on SD4 if it was started — we're taking over
+	app_uartcomm_stop(UART_PORT_BUILTIN);
+
+	palSetPadMode(HW_UART_P_TX_PORT, HW_UART_P_TX_PIN,
+		PAL_MODE_ALTERNATE(HW_UART_P_GPIO_AF) | PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_PULLUP);
+	palSetPadMode(HW_UART_P_RX_PORT, HW_UART_P_RX_PIN,
+		PAL_MODE_ALTERNATE(HW_UART_P_GPIO_AF) | PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_PULLUP);
+	sdStart(&HW_UART_P_DEV, &torque_uart_cfg);
+	torque_uart_running = true;
+}
+
+static void torque_uart_stop(void) {
+	if (!torque_uart_running) return;
+	sdStop(&HW_UART_P_DEV);
+	torque_uart_running = false;
+}
+
+// Drain available UART bytes — call from ADC thread each iteration
+static void torque_uart_poll(void) {
+	if (!torque_uart_running) return;
+	msg_t b;
+	while ((b = sdGetTimeout(&HW_UART_P_DEV, TIME_IMMEDIATE)) != MSG_TIMEOUT) {
+		torque_uart_process_byte((uint8_t)b);
+	}
+}
+
+#endif // HAZ_TORQUE_UART_DIRECT
 
 // ERPM-tracking PAS duty - motor matches cadence through drivetrain
 static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
@@ -1342,11 +1460,18 @@ void app_adc_start(bool use_rx_tx) {
 	palSetPadMode(HW_ADC_EXT2_GPIO, HW_ADC_EXT2_PIN, PAL_MODE_INPUT_ANALOG);
 #endif
 
+#if HAZ_TORQUE_UART_DIRECT
+	// UART torque sensor uses HW_UART pins — never use as buttons
+	(void)use_rx_tx;
+	use_rx_tx_as_buttons = false;
+	torque_uart_start();
+#else
 	if (buttons_detached) {
 		use_rx_tx_as_buttons = false;
 	} else {
 		use_rx_tx_as_buttons = use_rx_tx;
 	}
+#endif
 
 #ifdef HW_HAS_LUNA_SERIAL_DISPLAY
 	// Bafang display uses HW_UART TX/RX — never read them as buttons
@@ -1362,6 +1487,9 @@ void app_adc_stop(void) {
 	while (is_running) {
 		chThdSleepMilliseconds(1);
 	}
+#if HAZ_TORQUE_UART_DIRECT
+	torque_uart_stop();
+#endif
 }
 
 bool app_adc_is_running(void) {
@@ -1451,6 +1579,10 @@ static THD_FUNCTION(adc_thread, arg) {
 		// Must run BEFORE anything that calls mc_interface_get_speed()
 		app_gear_detect_update_fused_speed();
 
+#if HAZ_TORQUE_UART_DIRECT
+		// Drain TSDZ8 UART bytes — non-blocking
+		torque_uart_poll();
+#endif
 		if (stop_now) {
 			is_running = false;
 			return;

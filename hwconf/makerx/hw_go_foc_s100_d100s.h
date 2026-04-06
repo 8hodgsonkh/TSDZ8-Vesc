@@ -321,6 +321,10 @@ bool hw_sample_shutdown_button(void);
 #define HW_HAS_WHEEL_SPEED_SENSOR
 #define HW_WHEEL_SPEED_ADC_CH		ADC_IND_TEMP_MOTOR
 
+// Direct UART torque sensor (TSDZ8 on UART4/SD4, the unpopulated NRF52 port)
+// Keeps UART3/SD3 free for Flipsky BT module
+#define HAZ_TORQUE_UART_DIRECT		1
+
 // Threshold for detecting pulse edges (0-4095 ADC range)
 // Hall sensor pulls low (~0) when magnet present, 10K pulls high (~3000+) otherwise
 // Set threshold at midpoint for reliable edge detection
