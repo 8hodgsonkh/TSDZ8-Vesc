@@ -745,13 +745,8 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 #if defined(HW_PAS1_PORT) && defined(HW_PAS2_PORT) && defined(HW_PAS_PPM_EXTI_LINE)
 	// ---- EXTI-driven quadrature: thread reads ISR results ----
 	// ISR handles: direction, timestamps, 4-sample ring buffer averaging
-	// Thread handles: RPM calc, deceleration interpolation, timeout, startup
-	//
-	// Deceleration interpolation: instead of holding RPM constant between
-	// edges (staircase), if time-since-last-edge exceeds the last known
-	// period, we use that growing elapsed time as the effective period.
-	// Result: RPM fades smoothly when rider slows. Acceleration response
-	// is instant (new edge → shorter period → higher RPM immediately).
+	// Thread handles: pure staircase RPM from ISR period, timeout, startup
+	// ERPM smoothing is done downstream in app_adc.c (linear interpolation)
 
 	const float startup_rpm = 7.0f;
 	const float stop_factor = 1.5f;
@@ -772,7 +767,7 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 	// Handle backward detection from ISR
 	if (pas_exti_quad.backward_detected) {
 		pas_exti_quad_reset();
-		pas_exti_quad.exti_enabled = true;  // Keep EXTI running
+		pas_exti_quad.exti_enabled = true;
 		pas_exti_quad.last_edge_ticks = TIM5->CNT;
 		pedal_rpm = 0.0f;
 		pas_force_idle = true;
@@ -785,36 +780,23 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 		return;
 	}
 
-	// Calculate RPM with deceleration interpolation
+	// Pure staircase RPM: use ISR avg period directly, no interpolation
 	float rpm = pedal_rpm;
 	if (pas_exti_quad.has_period && pas_exti_quad.avg_period_ticks > 0) {
-		// Use the larger of ISR avg period vs time-since-last-edge.
-		// When pedaling constant: elapsed < avg → use avg → stable RPM.
-		// When decelerating: elapsed > avg → RPM tracks down smoothly.
-		// When accelerating: next ISR edge updates avg → instant step up.
-		uint32_t effective_period = pas_exti_quad.avg_period_ticks;
-		if (elapsed_ticks > effective_period) {
-			effective_period = elapsed_ticks;
-		}
-
-		float period_s = (float)effective_period * (1.0f / PAS_TIMER_HZ);
+		float avg_period_s = (float)pas_exti_quad.avg_period_ticks * (1.0f / PAS_TIMER_HZ);
 		float magnets = fmaxf(1.0f, (float)config.magnets);
-		// 2 A-edges per magnet (rising + falling)
-		float rev_period = period_s * 2.0f * magnets;
+		float rev_period = avg_period_s * 2.0f * magnets;
 		if (rev_period > 1e-5f) {
 			rpm = 60.0f / rev_period;
 		}
 
-		// Update last-step tracking (thread-side)
-		// Only when ISR has fresh data (not during decel coast)
-		if (elapsed_ticks <= pas_exti_quad.avg_period_ticks) {
-			float now = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
-			pas_time_last_real_step = now;
-			bool was_idle = pas_force_idle;
-			pas_force_idle = false;
-			if (was_idle) {
-				pas_startup_assist_trigger();
-			}
+		// Update last-step tracking
+		float now = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
+		pas_time_last_real_step = now;
+		bool was_idle = pas_force_idle;
+		pas_force_idle = false;
+		if (was_idle) {
+			pas_startup_assist_trigger();
 		}
 	} else if (pas_exti_quad.seeded_start) {
 		rpm = fmaxf(rpm, startup_rpm);
@@ -831,7 +813,7 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 
 	if (idle_time > timeout) {
 		pas_exti_quad_reset();
-		pas_exti_quad.exti_enabled = true;  // Keep EXTI running
+		pas_exti_quad.exti_enabled = true;
 		pas_exti_quad.last_edge_ticks = TIM5->CNT;
 		rpm = 0.0f;
 		pas_force_idle = true;

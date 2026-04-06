@@ -152,13 +152,19 @@ static haz_throttle_ctx_t haz_throttle_ctx = {
 static float haz_throttle_filtered = 0.0f;
 
 typedef struct {
-	float target_erpm_smooth;  // Ramp-limited output ERPM for speed PID
-	float target_erpm_filtered; // LP-filtered cadence base ERPM
+	float target_erpm_smooth;  // Final output ERPM for speed PID
+	float target_erpm_filtered; // Interpolated cadence base ERPM (replaces LP)
 	float rotation_progress;
 	float idle_time;
 	bool engaged;
 	uint32_t last_step_count;  // For step-rate idle detection
 	float step_rate_smooth;    // LP-filtered PAS step rate (steps/sec)
+	// Linear interpolation state: ramp from prev→next over edge_period
+	float interp_prev_erpm;    // ERPM at previous cadence edge
+	float interp_next_erpm;    // ERPM at current cadence edge (ramp target)
+	float interp_elapsed;      // Time elapsed since last cadence edge
+	float interp_period;       // Expected time until next edge (from ISR avg)
+	float interp_last_raw;     // Last raw ERPM seen (to detect new edge)
 } haz_pas_follow_ctx_t;
 
 static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
@@ -168,7 +174,12 @@ static haz_pas_follow_ctx_t haz_pas_follow_ctx = {
 	.idle_time = 0.0f,
 	.engaged = false,
 	.last_step_count = 0,
-	.step_rate_smooth = 0.0f
+	.step_rate_smooth = 0.0f,
+	.interp_prev_erpm = 0.0f,
+	.interp_next_erpm = 0.0f,
+	.interp_elapsed = 0.0f,
+	.interp_period = 0.0f,
+	.interp_last_raw = 0.0f,
 };
 
 // =============================================================================
@@ -1111,6 +1122,11 @@ static void haz_pas_follow_reset(void) {
 	haz_pas_follow_ctx.idle_time = 0.0f;
 	haz_pas_follow_ctx.engaged = false;
 	haz_pas_follow_ctx.step_rate_smooth = 0.0f;
+	haz_pas_follow_ctx.interp_prev_erpm = 0.0f;
+	haz_pas_follow_ctx.interp_next_erpm = 0.0f;
+	haz_pas_follow_ctx.interp_elapsed = 0.0f;
+	haz_pas_follow_ctx.interp_period = 0.0f;
+	haz_pas_follow_ctx.interp_last_raw = 0.0f;
 	// Note: don't reset last_step_count — cumulative
 }
 
@@ -1264,20 +1280,40 @@ static float haz_pas_follow_process(float dt_s) {
 		torque_ramp_erpm = shaped * strength * erpm_ramp_rate;
 	}
 
-	// ========== CADENCE BASE: direct LP filter ==========
-	// EXTI interrupt on channel-A (PB6) both edges gives exact timestamps.
-	// 2-sample averaged period cancels magnet duty cycle asymmetry.
-	// No polling jitter — clean RPM, LP optional for taste.
+	// ========== CADENCE BASE: LINEAR INTERPOLATION ==========
+	// EXTI ISR gives staircase cadence RPM (steps on each magnet edge).
+	// We linearly interpolate between the previous and current ERPM target
+	// over the edge period. No prediction, no filtering — just connecting
+	// two known points with a straight line.
+	//
+	// On accel: new edge arrives with higher ERPM → start new ramp from
+	//           wherever we are, instant direction change.
+	// On decel: new edge arrives with lower ERPM → ramp down smoothly.
+	// Constant: ramp completes, holds at target until next edge.
 	float base_erpm_raw = pedal_rpm * gear_ratio * pole_pairs * target_lead;
 
-	// Tracking Smoothness: 0 = instant tracking, 1 = max smooth
-	// Maps to LP factor: 0→1.0 (pass-through), 1→0.005 (very heavy)
-	if (cadence_filter < 0.01f) {
-		haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
-	} else {
-		float lp_factor = 1.0f - cadence_filter * 0.995f;
-		UTILS_LP_FAST(haz_pas_follow_ctx.target_erpm_filtered, base_erpm_raw, lp_factor);
+	// Get edge period from ISR (time between A-edges, seconds)
+	float edge_period = app_pas_get_step_period();
+
+	// Detect new cadence edge: raw ERPM changed
+	if (fabsf(base_erpm_raw - haz_pas_follow_ctx.interp_last_raw) > 1.0f) {
+		// New edge arrived — start interpolation from current position to new target
+		haz_pas_follow_ctx.interp_prev_erpm = haz_pas_follow_ctx.target_erpm_filtered;
+		haz_pas_follow_ctx.interp_next_erpm = base_erpm_raw;
+		haz_pas_follow_ctx.interp_elapsed = 0.0f;
+		haz_pas_follow_ctx.interp_period = fmaxf(edge_period, 0.005f); // min 5ms
+		haz_pas_follow_ctx.interp_last_raw = base_erpm_raw;
 	}
+
+	// Advance interpolation
+	haz_pas_follow_ctx.interp_elapsed += dt_s;
+	float t = haz_pas_follow_ctx.interp_elapsed / haz_pas_follow_ctx.interp_period;
+	if (t > 1.0f) t = 1.0f;
+	if (!isfinite(t)) t = 1.0f;
+
+	haz_pas_follow_ctx.target_erpm_filtered =
+		haz_pas_follow_ctx.interp_prev_erpm +
+		(haz_pas_follow_ctx.interp_next_erpm - haz_pas_follow_ctx.interp_prev_erpm) * t;
 
 	float max_erpm = fabsf(mcconf->l_max_erpm);
 	if (max_erpm < 100.0f) max_erpm = 100000.0f;
