@@ -694,10 +694,10 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 			pas_quad_state.last_step_timestamp = now;
 			pas_quad_state.seeded_start = true;
 		} else {
-			// ---- Channel-A-only step period (rising + falling) ----
-			// Both edges from the same physical sensor → evenly spaced.
-			// 2 edges per magnet pair = 40/rev. No asymmetry.
-			uint8_t cur_a = new_state & 1;
+			// ---- Channel-B-only step period (rising + falling) ----
+			// Try B sensor — maybe the TSDZ8 PAS wiring is swapped and B
+			// has better magnet centering (closer to 50% duty cycle).
+			uint8_t cur_a = (new_state >> 1) & 1;  // bit 1 = channel B
 			bool a_changed = (pas_quad_state.prev_a_level != 0xFF && cur_a != pas_quad_state.prev_a_level);
 			pas_quad_state.prev_a_level = cur_a;
 
