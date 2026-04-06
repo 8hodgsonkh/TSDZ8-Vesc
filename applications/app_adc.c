@@ -248,8 +248,8 @@ static bool torque_cal_done = false;
 static uint16_t torque_offset = 0;
 
 // Max ADC range above offset — typical TSDZ8 range
-// 280 ADC counts ≈ max pedal force. Tune if needed.
-#define TORQUE_ADC_MAX       280
+// 280 ADC counts ≈ max pedal force. Can be overridden by ESP32 calibration.
+static volatile uint16_t torque_adc_max_val = 280;
 
 // Debug counters
 static volatile uint32_t torque_dbg_bytes       = 0;  // Total bytes received
@@ -308,7 +308,8 @@ static void torque_uart_process_byte(uint8_t b) {
 				// Offset-subtract and normalize to 0-160
 				int16_t val = (int16_t)raw - (int16_t)torque_offset;
 				if (val < 0) val = 0;
-				int16_t norm = (val * 160) / TORQUE_ADC_MAX;
+				uint16_t adc_max = torque_adc_max_val > 0 ? torque_adc_max_val : 280;
+				int16_t norm = (val * 160) / adc_max;
 				if (norm > 160) norm = 160;
 				app_adc_set_ext_torque((uint16_t)norm);
 			}
@@ -378,6 +379,21 @@ static void torque_uart_poll(void) {
 		torque_uart_process_byte((uint8_t)b);
 	}
 }
+
+uint16_t app_adc_get_torque_raw(void) {
+	return torque_dbg_last_raw;
+}
+
+void app_adc_set_torque_cal(uint16_t offset, uint16_t adc_max) {
+	torque_offset = offset;
+	torque_cal_done = true;  // Skip auto-cal when ESP32 sets values
+	torque_adc_max_val = adc_max > 0 ? adc_max : 280;
+}
+
+#else // !HAZ_TORQUE_UART_DIRECT
+
+uint16_t app_adc_get_torque_raw(void) { return 0; }
+void app_adc_set_torque_cal(uint16_t offset, uint16_t adc_max) { (void)offset; (void)adc_max; }
 
 #endif // HAZ_TORQUE_UART_DIRECT
 

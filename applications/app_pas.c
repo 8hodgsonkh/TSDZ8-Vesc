@@ -155,6 +155,9 @@ typedef struct {
 	uint8_t ref_state;
 	float last_ref_timestamp;
 	float event_period;
+	float last_step_timestamp;  // Timestamp of last valid forward step (any transition)
+	float step_period;          // LP-filtered period between consecutive transitions
+	bool  has_step_period;      // True once first step_period is computed
 	float idle_time;
 	bool has_period;
 	bool seeded_start;
@@ -165,6 +168,9 @@ static pas_quadrature_state_t pas_quad_state = {
 	.ref_state = 0xFF,
 	.last_ref_timestamp = 0.0f,
 	.event_period = 0.0f,
+	.last_step_timestamp = 0.0f,
+	.step_period = 0.0f,
+	.has_step_period = false,
 	.idle_time = 0.0f,
 	.has_period = false,
 	.seeded_start = false
@@ -175,6 +181,9 @@ static void pas_quadrature_reset_state(void) {
 	pas_quad_state.ref_state = 0xFF;
 	pas_quad_state.last_ref_timestamp = 0.0f;
 	pas_quad_state.event_period = 0.0f;
+	pas_quad_state.last_step_timestamp = 0.0f;
+	pas_quad_state.step_period = 0.0f;
+	pas_quad_state.has_step_period = false;
 	pas_quad_state.idle_time = 0.0f;
 	pas_quad_state.has_period = false;
 	pas_quad_state.seeded_start = false;
@@ -666,61 +675,84 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 		pas_quad_state.idle_time = 0.0f;
 		float now = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
 		if (pas_quad_state.ref_state == 0xFF) {
+			// First valid forward step — seed both ref and step tracking
 			pas_quad_state.ref_state = new_state;
 			pas_quad_state.last_ref_timestamp = now;
+			pas_quad_state.last_step_timestamp = now;
 			pas_quad_state.seeded_start = true;
-		} else if (new_state == pas_quad_state.ref_state) {
-			float event_period = now - pas_quad_state.last_ref_timestamp;
-			pas_quad_state.last_ref_timestamp = now;
+		} else {
+			// ---- Per-step period: compute on EVERY valid forward transition ----
+			// This gives 4x more frequent RPM updates than per-pair (ref_state match).
+			// With 20 magnet pairs: 80 transitions/rev instead of 20.
+			float step_period = now - pas_quad_state.last_step_timestamp;
+			pas_quad_state.last_step_timestamp = now;
 
 			float magnets = fmaxf(1.0f, (float)config.magnets);
-			float min_event_period = min_pedal_period;
-			if (magnets > 1.0f && min_event_period > 0.0f) {
-				min_event_period /= magnets;
+			// Min period scaled for per-step (4 steps per magnet pair)
+			float min_step_period = min_pedal_period;
+			if (magnets > 1.0f && min_step_period > 0.0f) {
+				min_step_period /= (magnets * 4.0f);
 			}
-			if (min_event_period < 1e-4f) {
-				min_event_period = 1e-4f;
+			if (min_step_period < 1e-5f) {
+				min_step_period = 1e-5f;
 			}
 
-			if (event_period >= min_event_period) {
-				if (!pas_quad_state.has_period || !config.use_filter) {
-					pas_quad_state.event_period = event_period;
+			if (step_period >= min_step_period) {
+				// LP filter the step period — always filter for smooth output
+				if (!pas_quad_state.has_step_period) {
+					pas_quad_state.step_period = step_period;
 				} else {
-					UTILS_LP_FAST(pas_quad_state.event_period, event_period, 0.3f);
+					UTILS_LP_FAST(pas_quad_state.step_period, step_period, 0.3f);
 				}
-				pas_quad_state.has_period = true;
+				pas_quad_state.has_step_period = true;
 				pas_quad_state.seeded_start = false;
 
 				pas_time_last_real_step = now;
 				pas_time_since_last_real_step = 0.0f;
-				pas_step_count++;
 				bool was_idle = pas_force_idle;
 				pas_force_idle = false;
 				if (was_idle) {
 					pas_startup_assist_trigger();
 				}
 			}
+
+			// ---- Ref-state match: step_count + event_period for downstream compat ----
+			if (new_state == pas_quad_state.ref_state) {
+				float event_period = now - pas_quad_state.last_ref_timestamp;
+				pas_quad_state.last_ref_timestamp = now;
+				if (event_period > 1e-4f) {
+					if (!pas_quad_state.has_period) {
+						pas_quad_state.event_period = event_period;
+					} else {
+						UTILS_LP_FAST(pas_quad_state.event_period, event_period, 0.3f);
+					}
+					pas_quad_state.has_period = true;
+				}
+				pas_step_count++;
+			}
 		}
 	}
 
+	// ---- RPM from per-step period (4x more responsive than per-pair) ----
 	float rpm = pedal_rpm;
-	if (pas_quad_state.has_period && pas_quad_state.event_period > 1e-4f) {
+	if (pas_quad_state.has_step_period && pas_quad_state.step_period > 1e-5f) {
 		float magnets = fmaxf(1.0f, (float)config.magnets);
-		float rev_per_s = 1.0f / (pas_quad_state.event_period * magnets);
+		// 4 quadrature transitions per magnet pair per revolution
+		float rev_per_s = 1.0f / (pas_quad_state.step_period * magnets * 4.0f);
 		rpm = rev_per_s * 60.0f;
 	} else if (pas_quad_state.seeded_start) {
 		rpm = fmaxf(rpm, startup_rpm);
 	}
 
-	if (config.use_filter) {
-		UTILS_LP_FAST(rpm_filtered, rpm, 0.2f);
-		rpm = rpm_filtered;
-	}
+	// Always LP filter output RPM — more frequent steps = noisier raw, filter smooths it
+	UTILS_LP_FAST(rpm_filtered, rpm, 0.3f);
+	rpm = rpm_filtered;
 
 	float timeout = max_pulse_period;
-	if (pas_quad_state.has_period) {
+	if (pas_quad_state.has_step_period) {
 		float magnets = fmaxf(1.0f, (float)config.magnets);
-		float extended = pas_quad_state.event_period * magnets * stop_factor;
+		// Timeout based on per-step period, scaled to full revolution
+		float extended = pas_quad_state.step_period * magnets * 4.0f * stop_factor;
 		timeout = fmaxf(timeout, extended);
 	}
 

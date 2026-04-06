@@ -743,6 +743,11 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		if (mask & ((uint32_t)1 << 23)) {
 			buffer_append_uint32(send_buffer, mc_interface_get_perf_metrics(), &ind);
 		}
+		if (mask & ((uint32_t)1 << 24)) {
+			// Torque sensor: raw ADC (uint16) + normalized 0-160 (uint16)
+			buffer_append_uint16(send_buffer, app_adc_get_torque_raw(), &ind);
+			buffer_append_uint16(send_buffer, app_adc_get_ext_torque(), &ind);
+		}
 
 		reply_func(send_buffer, ind);
 		mempools_free_packet_buffer(send_buffer);
@@ -1095,6 +1100,13 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 			uint16_t torque = ((uint16_t)data[2] << 8) | data[3];
 			app_adc_set_ext_torque(torque);
 		}
+		// Hazza torque calibration from ESP32
+		// Format: [0x48] [0x43] [offset_hi] [offset_lo] [max_hi] [max_lo] = "HC" + offset + adc_max
+		if (len >= 6 && data[0] == 0x48 && data[1] == 0x43) {
+			uint16_t offset = ((uint16_t)data[2] << 8) | data[3];
+			uint16_t adc_max = ((uint16_t)data[4] << 8) | data[5];
+			app_adc_set_torque_cal(offset, adc_max);
+		}
 		// Hazza position tracking test command
 		// Format: [0x48] [0x50] [cmd] [data...] = "HP" + command
 		// cmd=0x01: Start test - [current_f16] [max_erpm_f16] [num_steps_u8]
@@ -1244,6 +1256,11 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		}
 		if (mask & ((uint32_t)1 << 23)) {
 			buffer_append_uint32(send_buffer, mc_interface_get_perf_metrics(), &ind);
+		}
+		if (mask & ((uint32_t)1 << 24)) {
+			// Torque sensor: raw ADC (uint16) + normalized 0-160 (uint16)
+			buffer_append_uint16(send_buffer, app_adc_get_torque_raw(), &ind);
+			buffer_append_uint16(send_buffer, app_adc_get_ext_torque(), &ind);
 		}
 
 		reply_func(send_buffer, ind);

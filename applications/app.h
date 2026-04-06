@@ -57,6 +57,8 @@ uint8_t app_adc_get_assist_level(void);
 void app_adc_set_assist_level(uint8_t level);
 void app_adc_set_ext_torque(uint16_t value);
 uint16_t app_adc_get_ext_torque(void);
+uint16_t app_adc_get_torque_raw(void);
+void app_adc_set_torque_cal(uint16_t offset, uint16_t adc_max);
 
 typedef enum {
 	UART_PORT_COMM_HEADER = 0,
