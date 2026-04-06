@@ -1264,11 +1264,28 @@ static float haz_pas_follow_process(float dt_s) {
 		torque_ramp_erpm = shaped * strength * erpm_ramp_rate;
 	}
 
-	// ========== CADENCE BASE: instant tracking ==========
-	// LP filter to smooth cadence staircase, then set PID target directly.
-	// PID responds at FOC rate (20-40kHz) — effectively instant.
-	float base_erpm = pedal_rpm * gear_ratio * pole_pairs * target_lead;
-	UTILS_LP_FAST(haz_pas_follow_ctx.target_erpm_filtered, base_erpm, cadence_filter);
+	// ========== CADENCE BASE: smoothed ramp tracking ==========
+	// Raw cadence → target ERPM, then rate-limit the ramp for smooth output.
+	// cadence_filter controls max ERPM change rate:
+	//   1.0 = instant tracking (no smoothing)
+	//   0.01 = very smooth (slow ramp, ~100 ERPM/s change rate)
+	// Maps to ramp rate: factor × base_erpm_range per second
+	float base_erpm_raw = pedal_rpm * gear_ratio * pole_pairs * target_lead;
+
+	// Rate-limited ramp: smooth tracking instead of staircase LP
+	// cadence_filter 0.01→1.0 maps to ramp speed 200→20000 ERPM/s
+	float ramp_speed = cadence_filter * 20000.0f;
+	if (ramp_speed < 200.0f) ramp_speed = 200.0f;
+
+	if (base_erpm_raw > haz_pas_follow_ctx.target_erpm_filtered) {
+		haz_pas_follow_ctx.target_erpm_filtered += ramp_speed * dt_s;
+		if (haz_pas_follow_ctx.target_erpm_filtered > base_erpm_raw)
+			haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
+	} else {
+		haz_pas_follow_ctx.target_erpm_filtered -= ramp_speed * dt_s;
+		if (haz_pas_follow_ctx.target_erpm_filtered < base_erpm_raw)
+			haz_pas_follow_ctx.target_erpm_filtered = base_erpm_raw;
+	}
 
 	float max_erpm = fabsf(mcconf->l_max_erpm);
 	if (max_erpm < 100.0f) max_erpm = 100000.0f;
