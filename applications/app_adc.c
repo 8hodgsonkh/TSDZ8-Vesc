@@ -32,6 +32,8 @@
 #include "comm_can.h"
 #include "hw.h"
 #include "app_gear_detect.h"
+#include "terminal.h"
+#include "commands.h"
 #include <math.h>
 
 // Settings
@@ -249,6 +251,13 @@ static uint16_t torque_offset = 0;
 // 280 ADC counts ≈ max pedal force. Tune if needed.
 #define TORQUE_ADC_MAX       280
 
+// Debug counters
+static volatile uint32_t torque_dbg_bytes       = 0;  // Total bytes received
+static volatile uint32_t torque_dbg_frames      = 0;  // Valid parsed frames
+static volatile uint32_t torque_dbg_xor_err     = 0;  // Checksum failures
+static volatile uint32_t torque_dbg_sync_loss   = 0;  // Unexpected bytes while syncing
+static volatile uint16_t torque_dbg_last_raw    = 0;  // Last raw ADC before calibration
+
 // TSDZ8 UART protocol state machine
 typedef enum {
 	TS_SYNC, TS_LEN, TS_CMD, TS_DATA_HI, TS_DATA_LO, TS_CHECKSUM
@@ -258,9 +267,11 @@ static tsdz8_parse_state_t ts_state = TS_SYNC;
 static uint8_t ts_len, ts_cmd, ts_data_hi, ts_data_lo, ts_xor;
 
 static void torque_uart_process_byte(uint8_t b) {
+	torque_dbg_bytes++;
 	switch (ts_state) {
 	case TS_SYNC:
 		if (b == 0xAA) { ts_xor = b; ts_state = TS_LEN; }
+		else { torque_dbg_sync_loss++; }
 		break;
 	case TS_LEN:
 		ts_len = b; ts_xor ^= b;
@@ -281,6 +292,8 @@ static void torque_uart_process_byte(uint8_t b) {
 	case TS_CHECKSUM:
 		if (b == ts_xor) {
 			uint16_t raw = ((uint16_t)ts_data_hi << 8) | ts_data_lo;
+			torque_dbg_frames++;
+			torque_dbg_last_raw = raw;
 
 			// Auto-calibrate offset from first N readings (must be at rest!)
 			if (!torque_cal_done) {
@@ -299,10 +312,33 @@ static void torque_uart_process_byte(uint8_t b) {
 				if (norm > 160) norm = 160;
 				app_adc_set_ext_torque((uint16_t)norm);
 			}
+		} else {
+			torque_dbg_xor_err++;
 		}
 		ts_state = TS_SYNC;
 		break;
 	}
+}
+
+// Terminal command: "torque_dbg" — dump torque sensor debug info
+static void torque_dbg_cmd(int argc, const char **argv) {
+	(void)argc; (void)argv;
+	commands_printf("=== Torque UART Debug ===");
+	commands_printf("UART running:    %s", torque_uart_running ? "YES" : "NO");
+	commands_printf("Bytes received:  %u", (unsigned)torque_dbg_bytes);
+	commands_printf("Valid frames:    %u", (unsigned)torque_dbg_frames);
+	commands_printf("XOR errors:      %u", (unsigned)torque_dbg_xor_err);
+	commands_printf("Sync losses:     %u", (unsigned)torque_dbg_sync_loss);
+	commands_printf("Last raw ADC:    %u", (unsigned)torque_dbg_last_raw);
+	commands_printf("Cal done:        %s  (offset=%u, idx=%d)",
+		torque_cal_done ? "YES" : "NO", (unsigned)torque_offset, torque_cal_idx);
+	commands_printf("Torque (norm):   %u / 160", (unsigned)s_ext_torque);
+	commands_printf("Torque (smooth): %.2f", (double)s_ext_torque_smooth);
+	
+	systime_t age = chVTTimeElapsedSinceX(s_ext_torque_ts);
+	float age_s = (float)age / (float)CH_CFG_ST_FREQUENCY;
+	commands_printf("Last update:     %.3f s ago", (double)age_s);
+	commands_printf(" ");
 }
 
 static void torque_uart_start(void) {
@@ -317,6 +353,15 @@ static void torque_uart_start(void) {
 		PAL_MODE_ALTERNATE(HW_UART_P_GPIO_AF) | PAL_STM32_OSPEED_HIGHEST | PAL_STM32_PUDR_PULLUP);
 	sdStart(&HW_UART_P_DEV, &torque_uart_cfg);
 	torque_uart_running = true;
+
+	// Register terminal debug command
+	terminal_register_command_callback(
+		"torque_dbg",
+		"Print torque sensor UART debug info",
+		0,
+		torque_dbg_cmd);
+
+	commands_printf("Torque UART started on SD4 (PC10/PC11) @ 115200\n");
 }
 
 static void torque_uart_stop(void) {
