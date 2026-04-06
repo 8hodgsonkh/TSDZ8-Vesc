@@ -166,6 +166,19 @@ bool mcpwm_foc_stall_is_active(void);             // Check if stall is active
 uint8_t mcpwm_foc_stall_get_reason(void);         // Get stall reason code
 void mcpwm_foc_stall_clear(void);                 // Clear stall (restart motor)
 
+// HAZZA: Position tracking test
+// Sweeps motor from 0 to max_erpm in openloop, records observer/hall errors at each speed
+// Returns: 0 = success, FAULT_CODE on failure
+int mcpwm_foc_position_test(float test_current, float max_erpm, int num_erpm_steps);
+// Get pointer to correction table (for reading results)
+const foc_position_correction_t *mcpwm_foc_get_position_correction(void);
+// Enable/disable runtime correction from test results
+void mcpwm_foc_set_position_correction_enabled(bool enabled);
+// Clear the correction table
+void mcpwm_foc_clear_position_correction(void);
+// Load full correction table (from EEPROM restore)
+void mcpwm_foc_set_position_correction(const foc_position_correction_t *corr);
+
 // Functions where the motor can be selected
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor);
 float mcpwm_foc_get_tot_current_filtered_motor(bool is_second_motor);

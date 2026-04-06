@@ -382,31 +382,22 @@ void terminal_process_string(char *str) {
 		commands_printf("Current 2 sample: %u\n", current2_samp);
 #ifdef HW_HAS_WHEEL_SPEED_SENSOR
 	} else if (strcmp(argv[0], "wheel_speed") == 0) {
-		bool watch_mode = (argc >= 2 && (strcmp(argv[1], "watch") == 0 || strcmp(argv[1], "live") == 0));
+		bool watch_mode = (argc >= 2 && strcmp(argv[1], "watch") == 0);
 		
 		if (watch_mode) {
-			commands_printf("Wheel speed sensor watch mode (Ctrl+C to stop)...\n");
-			for (int i = 0; i < 200; i++) {  // 20 seconds max
-				commands_printf("ADC: %4u | Pulses: %6u | Speed: %.2f RPS (%.1f RPM)",
+			for (int i = 0; i < 200; i++) {
+				commands_printf("R:%u P:%u S:%.2f",
 					(unsigned int)hw_wheel_speed_get_adc_raw(),
 					(unsigned int)hw_wheel_speed_get_pulses(),
-					(double)hw_get_speed(),
-					(double)(hw_get_speed() * 60.0f));
+					(double)hw_get_speed());
 				chThdSleepMilliseconds(100);
 			}
-			commands_printf("\nWatch mode ended.\n");
 		} else {
-			commands_printf("Wheel Speed Sensor Status:");
-			commands_printf("  ADC raw value: %u (threshold low:%u high:%u)",
-				(unsigned int)hw_wheel_speed_get_adc_raw(),
-				HW_WHEEL_SPEED_THRESH_LOW,
-				HW_WHEEL_SPEED_THRESH_HIGH);
-			commands_printf("  Total pulses:  %u", (unsigned int)hw_wheel_speed_get_pulses());
-			commands_printf("  Wheel speed:   %.3f RPS (%.1f RPM)",
+			commands_printf("Pulses:%u Speed:%.3f m/s Mag:%d Raw:%u",
+				(unsigned int)hw_wheel_speed_get_pulses(),
 				(double)hw_get_speed(),
-				(double)(hw_get_speed() * 60.0f));
-			commands_printf("  Magnets/rev:   %d", HW_WHEEL_SPEED_MAGNETS);
-			commands_printf("\nUse 'wheel_speed watch' for live updates.\n");
+				HW_WHEEL_SPEED_MAGNETS,
+				(unsigned int)hw_wheel_speed_get_adc_raw());
 		}
 #endif
 	} else if (strcmp(argv[0], "mtpv") == 0) {

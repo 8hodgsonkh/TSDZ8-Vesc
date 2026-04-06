@@ -714,6 +714,46 @@ float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall
 	// Map output angle between hall angle and observer angle in transition region to make
 	// a smooth transition.
 	if (angle_old != angle) {
+		// HAZZA: 2D bilinear observer correction (ERPM × motor current)
+		if (motor->m_pos_correction.valid && motor->m_pos_correction.apply_correction &&
+				motor->m_pos_correction.erpm_per_bin > 0.0f) {
+			float epb = motor->m_pos_correction.erpm_per_bin;
+			float apb = motor->m_pos_correction.amps_per_bin;
+
+			// ERPM fractional index
+			float ef = rpm_abs / epb - 0.5f;
+			int e0 = (int)ef;
+			if (e0 < 0) e0 = 0;
+			int e1 = e0 + 1;
+			if (e1 >= POS_CORR_ERPM_BINS) e1 = POS_CORR_ERPM_BINS - 1;
+			if (e0 >= POS_CORR_ERPM_BINS) e0 = POS_CORR_ERPM_BINS - 1;
+			float fe = ef - (float)e0;
+			if (fe < 0.0f) fe = 0.0f;
+			if (fe > 1.0f) fe = 1.0f;
+
+			// Current fractional index (use filtered |Iq|)
+			float iq_abs = fabsf(motor->m_motor_state.iq_filter);
+			float cf = iq_abs / apb - 0.5f;
+			int c0 = (int)cf;
+			if (c0 < 0) c0 = 0;
+			int c1 = c0 + 1;
+			if (c1 >= POS_CORR_CURRENT_BINS) c1 = POS_CORR_CURRENT_BINS - 1;
+			if (c0 >= POS_CORR_CURRENT_BINS) c0 = POS_CORR_CURRENT_BINS - 1;
+			float fc = cf - (float)c0;
+			if (fc < 0.0f) fc = 0.0f;
+			if (fc > 1.0f) fc = 1.0f;
+
+			// Bilinear interpolation
+			const float (*tbl)[POS_CORR_CURRENT_BINS] = motor->m_pos_correction.observer_offset;
+			float correction = tbl[e0][c0] * (1.0f - fe) * (1.0f - fc)
+							 + tbl[e1][c0] * fe * (1.0f - fc)
+							 + tbl[e0][c1] * (1.0f - fe) * fc
+							 + tbl[e1][c1] * fe * fc;
+
+			angle_old -= correction;
+			utils_norm_angle_rad(&angle_old);
+		}
+
 		float weight_hall = utils_map(rpm_abs, conf_now->foc_sl_erpm_start, conf_now->foc_sl_erpm, 1.0, 0.0);
 		utils_truncate_number(&weight_hall, 0.0, 1.0);
 		angle = utils_interpolate_angles_rad(angle, angle_old, weight_hall);

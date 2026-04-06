@@ -21,6 +21,12 @@
 #include "mc_interface.h"
 #include "app.h"
 #include <math.h>
+#include <stdbool.h>
+
+// Fused speed state
+static float s_fused_speed_ms = 0.0f;     // Current fused wheel speed in m/s
+static bool s_fused_active = false;        // True when ERPM-derived speed is being used
+static float s_magnet_speed_ms = 0.0f;     // Last raw magnet sensor speed for validation
 
 // Hysteresis state
 static int s_last_gear = 0;
@@ -155,13 +161,19 @@ int app_gear_detect_get(float speed_kph, int32_t erpm, float duty_cycle, float m
 /**
  * @brief Get gear from current VESC state (convenience function)
  * 
- * Pulls speed, ERPM, duty and current from mc_interface automatically.
- * Call this from your telemetry/display code.
+ * Uses RAW magnet sensor speed (not fused) to avoid circular dependency.
+ * Gear detection must always use the magnet as ground truth.
  */
 int app_gear_detect_get_current(void) {
-    float speed_kph = mc_interface_get_speed() * 3.6f;  // m/s to km/h
+    // Use raw hardware speed, NOT mc_interface_get_speed() which returns fused value
+#ifdef HW_HAS_WHEEL_SPEED_SENSOR
+    float speed_ms = hw_get_speed();  // Raw magnet sensor m/s
+#else
+    float speed_ms = mc_interface_get_speed();  // Fallback: ERPM-based
+#endif
+    float speed_kph = speed_ms * 3.6f;
     int32_t erpm = (int32_t)mc_interface_get_rpm();
-    float duty = fabsf(mc_interface_get_duty_cycle_now()) * 100.0f;  // 0-1 to %
+    float duty = fabsf(mc_interface_get_duty_cycle_now()) * 100.0f;
     float motor_amps = fabsf(mc_interface_get_tot_current_filtered());
     
     return app_gear_detect_get(speed_kph, erpm, duty, motor_amps);
@@ -211,4 +223,157 @@ float app_gear_detect_target_erpm(float speed_kph, int gear) {
  */
 int app_gear_detect_get_last_gear(void) {
     return s_last_gear;
+}
+
+/**
+ * @brief Calculate wheel speed from motor ERPM and known gear
+ * 
+ * Inverse of app_gear_detect_target_erpm: given ERPM and gear, compute wheel speed.
+ * 
+ * @param erpm     Motor electrical RPM
+ * @param gear     Gear number (1-indexed)
+ * @return         Wheel speed in m/s, or 0 if invalid
+ */
+static float erpm_to_wheel_speed_ms(float erpm, int gear) {
+    const app_configuration *appconf = app_get_configuration();
+    const gear_detection_config *conf = &appconf->gear_detect_conf;
+    
+    if (!conf->enabled || gear < 1 || gear > conf->num_gears || gear > GEAR_MAX_GEARS) {
+        return 0.0f;
+    }
+    
+    uint8_t cassette_teeth = get_cassette_teeth(conf, gear - 1);
+    if (cassette_teeth == 0) return 0.0f;
+    
+    // Reverse the chain: ERPM → motor RPM → crank RPM → wheel RPM → m/s
+    float pole_pairs = (float)conf->motor_poles / 2.0f;
+    float motor_rpm = fabsf(erpm) / pole_pairs;
+    // motor_rpm / internal_ratio = crank_rpm
+    // crank_rpm * chainring / cassette = wheel_rpm
+    float wheel_rpm = motor_rpm / conf->internal_ratio * (float)conf->chainring_teeth / (float)cassette_teeth;
+    // wheel_rpm → m/s
+    float wheel_circumference_m = (float)conf->wheel_diameter_mm * 3.14159f / 1000.0f;
+    float speed_ms = (wheel_rpm / 60.0f) * wheel_circumference_m;
+    
+    return speed_ms;
+}
+
+/**
+ * @brief Update fused wheel speed — call every app_adc cycle
+ * 
+ * Blends magnet sensor (low-res, always-accurate) with ERPM-derived speed
+ * (high-res, only valid when chain is engaged). Like hall+observer fusion:
+ *   - Magnet sensor = ground truth, anchors gear detection
+ *   - ERPM + gear = high-frequency interpolation between magnet pulses
+ *   - Current threshold determines chain engagement (trust ERPM)
+ *   - On each magnet pulse, validate the ERPM-derived speed is sane
+ * 
+ * Result is injected via mc_interface_override_wheel_speed() so all
+ * downstream code (telemetry, speed limits, freewheel catch) benefits.
+ */
+void app_gear_detect_update_fused_speed(void) {
+    const app_configuration *appconf = app_get_configuration();
+    
+    if (!appconf->gear_detect_conf.enabled) {
+        // Gear detection disabled — don't override, use raw sensor
+        if (s_fused_active) {
+            mc_interface_override_wheel_speed(false, 0.0f);
+            s_fused_active = false;
+        }
+        return;
+    }
+    
+    // Get raw magnet sensor speed (always truth)
+#if !defined(HW_HAS_WHEEL_SPEED_SENSOR) || defined(HW_WHEEL_SPEED_USE_GPIO)
+    // No hardware sensor, or GPIO-based sensor — use hw_get_speed() directly,
+    // no ERPM fusion needed (fusion is for ADC-based sensors with gear detect)
+    return;
+#else
+    float magnet_speed_ms = hw_get_speed();  // m/s from magnet sensor
+    uint32_t pulse_age_ms = hw_wheel_speed_get_pulse_age_ms();
+    
+    s_magnet_speed_ms = magnet_speed_ms;
+    
+    float motor_current = fabsf(mc_interface_get_tot_current_filtered());
+    float erpm = fabsf(mc_interface_get_rpm());
+    int gear = s_last_gear;  // Use internal state directly, no circular call
+    
+    // Thresholds for chain engagement detection
+    const float current_engage_threshold = 3.0f;   // Above 3A = chain definitely engaged
+    const float current_disengage_threshold = 1.5f; // Below 1.5A = chain may be slack (hysteresis)
+    const float min_erpm_for_fusion = 300.0f;       // Need some ERPM for meaningful calculation
+    const float max_pulse_age_for_trust = 1500;     // If magnet pulse >1.5s old, speed is stale
+    
+    // Determine if chain is engaged (with hysteresis)
+    static bool chain_engaged = false;
+    if (motor_current > current_engage_threshold && erpm > min_erpm_for_fusion) {
+        chain_engaged = true;
+    } else if (motor_current < current_disengage_threshold || erpm < min_erpm_for_fusion * 0.5f) {
+        chain_engaged = false;
+    }
+    
+    if (chain_engaged && gear > 0) {
+        // Chain is engaged and we know the gear — use ERPM-derived speed
+        float erpm_speed_ms = erpm_to_wheel_speed_ms(erpm, gear);
+        
+        if (erpm_speed_ms > 0.1f) {
+            // Sanity check against magnet sensor when pulse is fresh
+            // If ERPM-derived speed is wildly different from magnet speed,
+            // the gear might be wrong — fall back to magnet
+            bool erpm_sane = true;
+            if (magnet_speed_ms > 0.5f && pulse_age_ms < max_pulse_age_for_trust) {
+                float ratio = erpm_speed_ms / magnet_speed_ms;
+                if (ratio < 0.7f || ratio > 1.4f) {
+                    // >30% disagreement — gear is probably wrong or shifting
+                    erpm_sane = false;
+                }
+            }
+            
+            if (erpm_sane) {
+                // Smooth transition: LP filter the fused speed toward ERPM-derived
+                // Fast filter (0.3) so ERPM speed is responsive but not jumpy
+                float alpha = 0.3f;
+                if (!s_fused_active) {
+                    // First engagement — snap to ERPM speed (avoid lag)
+                    s_fused_speed_ms = erpm_speed_ms;
+                } else {
+                    s_fused_speed_ms += alpha * (erpm_speed_ms - s_fused_speed_ms);
+                }
+                s_fused_active = true;
+                mc_interface_override_wheel_speed(true, s_fused_speed_ms);
+                return;
+            }
+        }
+    }
+    
+    // Not fusing — use raw magnet sensor (default path)
+    // Smooth transition back: don't snap, blend toward magnet speed
+    if (s_fused_active) {
+        if (magnet_speed_ms > 0.1f) {
+            // Blend back toward magnet speed over a few cycles
+            float alpha = 0.1f;
+            s_fused_speed_ms += alpha * (magnet_speed_ms - s_fused_speed_ms);
+            
+            // Close enough — release override
+            if (fabsf(s_fused_speed_ms - magnet_speed_ms) < 0.2f) {
+                mc_interface_override_wheel_speed(false, 0.0f);
+                s_fused_active = false;
+            } else {
+                mc_interface_override_wheel_speed(true, s_fused_speed_ms);
+            }
+        } else {
+            // Stopped — release immediately
+            mc_interface_override_wheel_speed(false, 0.0f);
+            s_fused_active = false;
+            s_fused_speed_ms = 0.0f;
+        }
+    }
+#endif /* HW_HAS_WHEEL_SPEED_SENSOR */
+}
+
+/**
+ * @brief Check if fused speed is currently active (ERPM-derived)
+ */
+bool app_gear_detect_fused_speed_active(void) {
+    return s_fused_active;
 }

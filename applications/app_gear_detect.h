@@ -21,6 +21,7 @@
 #define APP_GEAR_DETECT_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 /**
  * @brief Reset gear detection state
@@ -67,5 +68,17 @@ float app_gear_detect_target_erpm(float speed_kph, int gear);
  * @return             Last detected gear (1-N), 0 if unknown
  */
 int app_gear_detect_get_last_gear(void);
+
+/**
+ * @brief Update fused wheel speed — call every app_adc cycle.
+ * Blends magnet sensor (1 pulse/rev) with ERPM-derived speed when
+ * chain is engaged, injecting high-res speed via mc_interface override.
+ */
+void app_gear_detect_update_fused_speed(void);
+
+/**
+ * @brief Check if fused speed is currently active (ERPM-derived)
+ */
+bool app_gear_detect_fused_speed_active(void);
 
 #endif /* APP_GEAR_DETECT_H_ */

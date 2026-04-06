@@ -245,23 +245,40 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	float gear_ratio = appconf->gear_detect_conf.internal_ratio;
 	if (!isfinite(gear_ratio) || gear_ratio <= 0.0f) gear_ratio = 38.0f;
 
-	// Config params (clean names matching VESC Tool labels):
-	// smoothing          → LP filter: 0.0 (raw) to 1.0 (max smooth)
-	// lead_pct           → Lead %: 0-2 range, each 0.10 = 1% lead → 2.0 = 20% lead
-	// accel_gain         → Cadence accel boost strength
-	// load_gain          → Load/current boost strength
-	// median_filter      → Median Filter: 0=off, 1=latest, 3-11=median samples
-	// ramp_up/down       → duty/s slew rate limits
-	// idle_timeout       → seconds before power ramp-down after pedaling stops
+	// Config params — dual-purpose fields depending on torque mode:
+	//
+	// TORQUE MODE ON (haz_torque_enabled):
+	//   ramp_up      → Max duty ramp rate at full torque (duty/s)
+	//   ramp_down    → Ramp down rate when torque released (duty/s)
+	//   accel_gain   → (unused in torque mode)
+	//   load_gain    → (unused in torque mode)
+	//   lead_pct     → Cadence lead: 0=0.50×, 1.0=1.0×, 2.0=1.50× cadence
+	//   Cadence base tracks instantly (no ramp). Torque controls how fast
+	//   duty ramps above cadence base. strength scales the ramp rate.
+	//
+	// TORQUE MODE OFF (cadence inference):
+	//   ramp_up/down → duty/s slew rate limits
+	//   accel_gain   → Cadence accel boost strength
+	//   load_gain    → Load/current boost strength
+	//   lead_pct     → Lead %: 0-2 → 1.0-1.20 lead factor
 	const float ramp_up = fmaxf(conf->haz_pas_duty_ramp_up, 0.05f);
 	const float ramp_down = fmaxf(conf->haz_pas_duty_ramp_down, 0.05f);
 	const float accel_gain = fmaxf(conf->haz_pas_duty_accel_gain, 0.0f);
 	const float load_gain = fmaxf(conf->haz_pas_duty_load_gain, 0.0f);
-	// Map 0-2 range to 1.0-1.20 lead factor (0=exact match, 0.5=5% ahead, 2.0=20% ahead)
+
+	// Lead factor: different mapping depending on torque mode
 	float lead_raw = conf->haz_pas_duty_lead_pct;
 	if (lead_raw < 0.0f) lead_raw = 0.0f;
 	if (lead_raw > 2.0f) lead_raw = 2.0f;
-	const float lead_factor = 1.0f + lead_raw * 0.10f;
+	float lead_factor;
+	if (conf->haz_torque_enabled) {
+		// Torque mode: 0→0.50, 1→1.00, 2→1.50
+		// Full range: motor can lag at half cadence or lead at 150%
+		lead_factor = 0.50f + lead_raw * 0.50f;
+	} else {
+		// Cadence mode: 0→1.00, 2→1.20 (original behavior)
+		lead_factor = 1.0f + lead_raw * 0.10f;
+	}
 	const float idle_timeout = fmaxf(conf->haz_pas_duty_idle_timeout, 0.1f);
 
 	// ERPM→duty conversion factor from motor physics:
@@ -381,86 +398,99 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	// LP filter on top (tunable)
 	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, pedal_rpm, lp_factor);
 
-	// ========== ERPM-TRACKING + SMOOTH DYNAMIC ASSIST ==========
-	// Base: convert cadence → motor ERPM → duty via back-EMF physics.
+	// ========== ERPM-TRACKING + TORQUE-CONTROLLED RAMP ==========
 	//
-	// Two modes for dynamic assist determination:
+	// TORQUE MODE (haz_torque_enabled):
+	//   Cadence sets base duty (instant tracking, no ramp).
+	//   Torque controls ramp rate above cadence base:
+	//     ramp_rate = shaped_torque × strength × ramp_up (duty/s)
+	//   While stomping: duty ramps up at that rate.
+	//   On release: duty ramps down at ramp_down back to cadence base.
+	//   Never below cadence base, never above max_duty.
 	//
-	// A) TORQUE SENSOR MODE (haz_torque_enabled):
-	//    External torque sensor (0-160 normalized) from ESP32 via BLE.
-	//    Torque value directly modulates lead — harder push = more motor lead.
-	//    Replaces cadence accel + load accel entirely. Pure rider intent.
+	// CADENCE INFERENCE MODE (no torque sensor):
+	//   Original behavior — accel/load signals modulate lead factor.
 	//
-	// B) CADENCE INFERENCE MODE (original, no torque sensor):
-	//    Uses cadence acceleration + motor current as effort proxies.
-	//    Two signal sources feed into assist_extra multiplier.
-	//
-	// Result: effective_lead = lead_factor × (1.0 + assist_extra)
-	static float smooth_accel_mult = 0.0f;   // Smoothed accel contribution (0..0.30)
-	static float smooth_load_mult = 0.0f;    // Smoothed load contribution (0..0.20)
-	static float prev_event_period = 0.0f;   // For period-based accel detection
-	static uint32_t prev_step_count = 0;     // Edge counter for new-edge detection
-	static float accel_rate_smooth = 0.0f;   // LP-filtered RPM/s
+	static float smooth_accel_mult = 0.0f;
+	static float smooth_load_mult = 0.0f;
+	static float prev_event_period = 0.0f;
+	static uint32_t prev_step_count = 0;
+	static float accel_rate_smooth = 0.0f;
 	float target_duty = 0.0f;
-	static float torque_duty_boost = 0.0f;  // Smoothed torque duty addition
 	if (!is_idle && haz_pas_duty_ctx.cadence_smooth > 3.0f) {
-
-		float assist_extra = 0.0f;
 
 		if (conf->haz_torque_enabled) {
 			// ========== TORQUE SENSOR MODE ==========
-			// Torque sensor adds a direct duty boost on top of cadence-derived
-			// base duty. Harder pedaling → more duty. Normal hybrid ramps
-			// handle all smoothing — no separate ramp overrides.
-			//
-			// torque_duty_boost is computed here but added AFTER the cadence
-			// inference path computes the base target_duty.
-
+			// Read torque sensor
 			systime_t torque_age = chVTTimeElapsedSinceX(s_ext_torque_ts);
 			float torque_age_s = (float)torque_age / (float)CH_CFG_ST_FREQUENCY;
 			float torque_timeout = fmaxf(conf->haz_torque_idle_timeout, 0.1f);
 
-			float torque_raw = 0.0f;
+			float torque_frac = 0.0f;  // 0-1 normalized torque
 			if (torque_age_s < torque_timeout && s_ext_torque > 0) {
-				torque_raw = (float)s_ext_torque / 160.0f;
+				torque_frac = (float)s_ext_torque / 160.0f;
 			}
 
 			float start_thresh = conf->haz_torque_start_threshold / 160.0f;
-			if (torque_raw < start_thresh) torque_raw = 0.0f;
+			if (torque_frac < start_thresh) torque_frac = 0.0f;
 
+			// LP filter (haz_torque_smoothing)
 			float t_smooth = fmaxf(conf->haz_torque_smoothing, 0.0f);
 			if (t_smooth > 0.99f) t_smooth = 0.99f;
 			float t_lp = (t_smooth < 0.01f) ? 1.0f : (1.0f - t_smooth * 0.99f);
-			UTILS_LP_FAST(s_ext_torque_smooth, torque_raw, t_lp);
+			UTILS_LP_FAST(s_ext_torque_smooth, torque_frac, t_lp);
 
+			// Expo shaping (responsiveness curve)
 			float resp = fmaxf(conf->haz_torque_responsiveness, 0.0f);
 			if (resp > 2.0f) resp = 2.0f;
+			float x = fmaxf(s_ext_torque_smooth, 0.0f);
+			if (x > 1.0f) x = 1.0f;
 			float shaped;
 			if (resp < 0.5f) {
-				shaped = s_ext_torque_smooth * s_ext_torque_smooth;
+				shaped = x * x;
 			} else if (resp > 1.5f) {
-				shaped = sqrtf(s_ext_torque_smooth);
+				shaped = sqrtf(x);
 			} else {
-				float t = s_ext_torque_smooth;
 				float blend = (resp - 0.5f);
-				shaped = (t * t) * (1.0f - blend) + sqrtf(fmaxf(t, 0.0f)) * blend;
+				shaped = (x * x) * (1.0f - blend)
+				       + sqrtf(fmaxf(x, 0.0f)) * blend;
 			}
 
-			// strength scales the duty boost:
-			// strength=1.0 at full torque → +0.30 duty
-			// strength=2.0 at full torque → +0.60 duty
-			// strength=0.5 at full torque → +0.15 duty
+			// Torque → ramp rate (duty/s)
+			// Full stomp (shaped=1) at strength=1: ramp at ramp_up duty/s
+			// Light touch (shaped=0.3) at strength=2: ramp at 0.6 × ramp_up duty/s
 			float strength = fmaxf(conf->haz_torque_strength, 0.1f);
 			if (strength > 5.0f) strength = 5.0f;
-			torque_duty_boost = shaped * strength * 0.30f;
-		} else {
-			torque_duty_boost = 0.0f;
-		}
+			float torque_ramp = shaped * strength * ramp_up;
 
-		// Cadence inference always runs (provides base assist_extra even in
-		// torque mode for the small cadence-accel/load signals; torque boost
-		// is additive on top via duty, not via lead)
-		{
+			// Cadence base duty (instant — no ramp)
+			float base_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * lead_factor;
+			float cadence_duty = base_erpm * erpm_to_duty;
+			cadence_duty *= speed_power_scale;
+			if (cadence_duty > max_duty) cadence_duty = max_duty;
+			if (cadence_duty < 0.0f) cadence_duty = 0.0f;
+
+			// Ramp: torque active → climb, released → fall back to cadence
+			if (torque_ramp > 0.001f) {
+				haz_pas_duty_ctx.duty_cmd += torque_ramp * dt_s;
+			} else {
+				haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
+			}
+
+			// Clamp: never below cadence base, never above max
+			if (haz_pas_duty_ctx.duty_cmd < cadence_duty) {
+				haz_pas_duty_ctx.duty_cmd = cadence_duty;
+			}
+			if (haz_pas_duty_ctx.duty_cmd > max_duty) {
+				haz_pas_duty_ctx.duty_cmd = max_duty;
+			}
+
+			target_duty = haz_pas_duty_ctx.duty_cmd;
+
+		} else {
+			// ========== CADENCE INFERENCE MODE (no torque sensor) ==========
+			float assist_extra = 0.0f;
+			{
 
 		// === CADENCE ACCEL SIGNAL (period-based, LP-filtered) ===
 		float event_period = app_pas_get_event_period();
@@ -539,28 +569,29 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		// Convert ERPM to duty using physics (voltage-independent)
 		target_duty = target_erpm * erpm_to_duty;
 
-		// Add torque duty boost on top of cadence-derived base
-		target_duty += torque_duty_boost;
-
 		// Apply speed limit (street mode)
 		target_duty *= speed_power_scale;
 
 		if (target_duty > max_duty) target_duty = max_duty;
 		if (target_duty < 0.0f) target_duty = 0.0f;
+
+		// Cadence inference mode: use standard ramp
+		if (target_duty > haz_pas_duty_ctx.duty_cmd) {
+			haz_pas_duty_ctx.duty_cmd += ramp_up * dt_s;
+			if (haz_pas_duty_ctx.duty_cmd > target_duty)
+				haz_pas_duty_ctx.duty_cmd = target_duty;
+		} else {
+			haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
+			if (haz_pas_duty_ctx.duty_cmd < target_duty)
+				haz_pas_duty_ctx.duty_cmd = target_duty;
+		}
+		target_duty = haz_pas_duty_ctx.duty_cmd;
+
+		} // end cadence inference mode
 	}
 
-	// Ramp to target — normal hybrid PAS ramps, no torque overrides
-	if (target_duty > haz_pas_duty_ctx.duty_cmd) {
-		haz_pas_duty_ctx.duty_cmd += ramp_up * dt_s;
-		if (haz_pas_duty_ctx.duty_cmd > target_duty) {
-			haz_pas_duty_ctx.duty_cmd = target_duty;
-		}
-	} else {
-		haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
-		if (haz_pas_duty_ctx.duty_cmd < target_duty) {
-			haz_pas_duty_ctx.duty_cmd = target_duty;
-		}
-	}
+	// Final output
+	haz_pas_duty_ctx.duty_cmd = target_duty;
 
 	// Clamp
 	if (haz_pas_duty_ctx.duty_cmd < 0.0f) haz_pas_duty_ctx.duty_cmd = 0.0f;
@@ -1001,116 +1032,89 @@ static float haz_pas_follow_process(float dt_s) {
 	float gear_ratio = appconf->gear_detect_conf.internal_ratio;
 	if (!isfinite(gear_ratio) || gear_ratio <= 0.0f) gear_ratio = 38.0f;
 
-	float torque_lead_mult = 1.0f;  // 1.0 = no torque boost, >1 = torque-boosted target
-
-	// ========== TORQUE SENSOR: boost target speed ==========
+	// ========== TORQUE SENSOR: controls ERPM ramp rate ==========
+	// Cadence base tracks instantly via PID. Torque controls how fast
+	// ERPM ramps above cadence base. More stomp = faster climb.
+	// Release = ramp down at ramp_down_rate back to cadence.
+	// Uses speed PID's own config fields, not duty tab fields.
+	float torque_ramp_erpm = 0.0f;  // ERPM/s from torque
 	if (appconf->app_adc_conf.haz_torque_enable_current_pas) {
 		systime_t torque_age = chVTTimeElapsedSinceX(s_ext_torque_ts);
 		float torque_age_s = (float)torque_age / (float)CH_CFG_ST_FREQUENCY;
 		float torque_timeout = fmaxf(appconf->app_adc_conf.haz_torque_idle_timeout, 0.1f);
 
-		float torque_raw = 0.0f;
+		float torque_frac = 0.0f;
 		if (torque_age_s < torque_timeout && s_ext_torque > 0) {
-			torque_raw = (float)s_ext_torque / 160.0f;
+			torque_frac = (float)s_ext_torque / 160.0f;
 		}
 
 		float start_thresh = appconf->app_adc_conf.haz_torque_start_threshold / 160.0f;
-		if (torque_raw < start_thresh) torque_raw = 0.0f;
+		if (torque_frac < start_thresh) torque_frac = 0.0f;
 
 		// LP filter
 		float t_smooth = fmaxf(appconf->app_adc_conf.haz_torque_smoothing, 0.0f);
 		if (t_smooth > 0.99f) t_smooth = 0.99f;
 		float t_lp = (t_smooth < 0.01f) ? 1.0f : (1.0f - t_smooth * 0.99f);
-		UTILS_LP_FAST(s_ext_torque_smooth, torque_raw, t_lp);
+		UTILS_LP_FAST(s_ext_torque_smooth, torque_frac, t_lp);
 
-		// Responsiveness shaping
+		// Expo shaping
 		float resp = fmaxf(appconf->app_adc_conf.haz_torque_responsiveness, 0.0f);
 		if (resp > 2.0f) resp = 2.0f;
+		float x = fmaxf(s_ext_torque_smooth, 0.0f);
+		if (x > 1.0f) x = 1.0f;
 		float shaped;
 		if (resp < 0.5f) {
-			shaped = s_ext_torque_smooth * s_ext_torque_smooth;
+			shaped = x * x;
 		} else if (resp > 1.5f) {
-			shaped = sqrtf(s_ext_torque_smooth);
+			shaped = sqrtf(x);
 		} else {
-			float t = s_ext_torque_smooth;
 			float blend = (resp - 0.5f);
-			shaped = (t * t) * (1.0f - blend) + sqrtf(fmaxf(t, 0.0f)) * blend;
+			shaped = (x * x) * (1.0f - blend) + sqrtf(fmaxf(x, 0.0f)) * blend;
 		}
 
+		// Torque → ERPM ramp rate (ERPM/s)
+		// Full stomp (shaped=1) at strength=1: ramp at erpm_ramp_rate
 		float strength = fmaxf(appconf->app_adc_conf.haz_torque_strength, 0.1f);
 		if (strength > 5.0f) strength = 5.0f;
-
-		// Dynamic lead boost: torque multiplies effective_lead proportionally
-		// Light pressure (shaped≈0.1, strength=1): lead × 1.1 (barely noticeable)
-		// Medium push  (shaped≈0.5, strength=1): lead × 1.5 (solid assist)
-		// Full stomp   (shaped≈1.0, strength=2): lead × 3.0 (max beans)
-		// The 'shaped' variable already has the responsiveness curve applied:
-		//   resp<0.5 → x² curve (calm start, explosive end)
-		//   resp>1.5 → √x curve (responsive early, settles at top)
-		torque_lead_mult = 1.0f + shaped * strength;
+		torque_ramp_erpm = shaped * strength * erpm_ramp_rate;
 	}
 
-	// ========== LP FILTER base ERPM (anti-alias cadence staircase) ==========
-	// Filter the cadence-derived base ERPM BEFORE applying torque boost.
-	// This smooths the cadence staircase without double-filtering the torque signal.
-	// Torque response is governed solely by its own LP filter (haz_torque_smoothing).
+	// ========== CADENCE BASE: instant tracking ==========
+	// LP filter to smooth cadence staircase, then set PID target directly.
+	// PID responds at FOC rate (20-40kHz) — effectively instant.
 	float base_erpm = pedal_rpm * gear_ratio * pole_pairs * target_lead;
 	UTILS_LP_FAST(haz_pas_follow_ctx.target_erpm_filtered, base_erpm, cadence_filter);
 
-	// Apply torque boost AFTER cadence filter — fast torque, smooth cadence
-	float target_erpm_raw = haz_pas_follow_ctx.target_erpm_filtered * torque_lead_mult;
-
-	// Clamp to configured max ERPM
 	float max_erpm = fabsf(mcconf->l_max_erpm);
 	if (max_erpm < 100.0f) max_erpm = 100000.0f;
-	if (target_erpm_raw > max_erpm) target_erpm_raw = max_erpm;
 
-	float target_erpm = target_erpm_raw;
-
-	// ========== PROPORTIONAL TRACKING with max rate clamp ==========
-	// Step size proportional to gap: small cadence jitter → tiny steps (inaudible).
-	// Big gap (acceleration/stomp) → capped to erpm_ramp_rate (responsive).
-	// K=8 Hz: 100 ERPM gap → 800 ERPM/s (smooth), 5000+ gap → clamped to max.
-	//
-	// Torque sensor dynamically scales the ramp rate:
-	//   No torque (shaped=0): base ramp rate (smooth cruising)
-	//   Full stomp (shaped=1, strength=2): up to 4× ramp rate (explosive response)
-	//   Uses shaped² for the ramp multiplier — shallow increase at light pressure,
-	//   steep ramp boost only when really stomping. Prevents twitchiness at cruise.
-	float torque_ramp_mult = 1.0f;
-	if (appconf->app_adc_conf.haz_torque_enable_current_pas) {
-		float shaped_sq = s_ext_torque_smooth * s_ext_torque_smooth;  // always x² for ramp
-		float ramp_strength = fmaxf(appconf->app_adc_conf.haz_torque_strength, 0.1f);
-		if (ramp_strength > 5.0f) ramp_strength = 5.0f;
-		torque_ramp_mult = 1.0f + shaped_sq * ramp_strength;
+	// ========== TORQUE BOOST: ramp ERPM above cadence ==========
+	// While torque applied: ERPM climbs at torque_ramp_erpm (ERPM/s)
+	// When released: falls back at ramp_down_rate to cadence base
+	static float torque_erpm_extra = 0.0f;
+	if (torque_ramp_erpm > 0.01f) {
+		torque_erpm_extra += torque_ramp_erpm * dt_s;
+	} else {
+		torque_erpm_extra -= ramp_down_rate * dt_s;
 	}
+	if (torque_erpm_extra < 0.0f) torque_erpm_extra = 0.0f;
 
-	float gap = target_erpm - haz_pas_follow_ctx.target_erpm_smooth;
-	float prop_step = gap * 8.0f * dt_s;
+	// Clamp: don't let boost exceed max headroom (1s of ramp)
+	float max_boost = erpm_ramp_rate * 1.0f;
+	if (torque_erpm_extra > max_boost) torque_erpm_extra = max_boost;
 
-	float max_step_up = erpm_ramp_rate * torque_ramp_mult * dt_s;
-	float max_step_down = ramp_down_rate * dt_s;
-	if (prop_step > max_step_up) prop_step = max_step_up;
-	if (prop_step < -max_step_down) prop_step = -max_step_down;
+	// Final target: cadence base + torque boost
+	float target_erpm = haz_pas_follow_ctx.target_erpm_filtered + torque_erpm_extra;
+	if (target_erpm > max_erpm) target_erpm = max_erpm;
+	if (target_erpm < 0.0f) target_erpm = 0.0f;
 
-	haz_pas_follow_ctx.target_erpm_smooth += prop_step;
-	if (haz_pas_follow_ctx.target_erpm_smooth < 0.0f) {
-		haz_pas_follow_ctx.target_erpm_smooth = 0.0f;
-	}
-
-	// ========== ANTI-OVERSHOOT: clamp to reality ==========
-	// Prevent target_erpm_smooth from running far ahead of actual motor RPM.
-	// Without this, torque boost pushes target to e.g. 40000 while motor maxes
-	// at 15000 (current/voltage limited). When torque drops, target_erpm_smooth
-	// has to ramp DOWN from 40000→15000 — the rider feels a full second of
-	// sustained max current after releasing pressure.
-	// Clamp to actual RPM + 1 second of ramp headroom so the PID has room
-	// to push but can't accumulate massive unreachable overshoot.
+	// Anti-overshoot: don't run too far ahead of actual motor RPM
 	float actual_rpm = fabsf(mc_interface_get_rpm());
-	float max_lead_erpm = erpm_ramp_rate * 1.0f;  // 1s of ramp headroom
-	if (haz_pas_follow_ctx.target_erpm_smooth > actual_rpm + max_lead_erpm) {
-		haz_pas_follow_ctx.target_erpm_smooth = actual_rpm + max_lead_erpm;
+	if (target_erpm > actual_rpm + max_boost) {
+		target_erpm = actual_rpm + max_boost;
 	}
+
+	haz_pas_follow_ctx.target_erpm_smooth = target_erpm;
 
 	// ========== COMMAND SPEED PID ==========
 	mc_interface_set_pid_speed(haz_pas_follow_ctx.target_erpm_smooth);
@@ -1442,6 +1446,10 @@ static THD_FUNCTION(adc_thread, arg) {
 			last_offroad_mode = current_offroad;
 			apply_assist_current_limit();
 		}
+
+		// Update fused wheel speed: blends magnet sensor with ERPM-derived speed
+		// Must run BEFORE anything that calls mc_interface_get_speed()
+		app_gear_detect_update_fused_speed();
 
 		if (stop_now) {
 			is_running = false;

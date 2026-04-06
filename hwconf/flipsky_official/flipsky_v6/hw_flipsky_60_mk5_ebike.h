@@ -20,40 +20,33 @@
 
 #include "hw_flipsky_60_core.h"
 
-// ── Default to APP_ADC on fresh flash ──
+// ── Default to APP_ADC on fresh flash (core.h defaults to APP_NONE) ──
 #undef APPCONF_APP_TO_USE
 #define APPCONF_APP_TO_USE		APP_ADC
 
-// ── Power button: tap = street, hold 5s = offroad ──
-// Same logic as GO-FOC S100 (HW_SAMPLE_SHUTDOWN defined in core.h).
-// HW_EBIKE_DEFAULT_OFFROAD is fallback for boards without a power button.
+// ── No power button — boot straight into offroad (full power) mode ──
 #define HW_EBIKE_DEFAULT_OFFROAD
 
-// ── Shutdown mode = toggle (same as GO-FOC S100) ──
-// Without this, shutdown thread may auto-off the board unexpectedly.
-#undef HAZZA_SHUTDOWN_TOGGLE_GUARD
-#define HAZZA_SHUTDOWN_TOGGLE_GUARD	1
-#ifndef APPCONF_SHUTDOWN_MODE
-#define APPCONF_SHUTDOWN_MODE		SHUTDOWN_MODE_TOGGLE_BUTTON_ONLY
-#endif
-
 // ── Bafang display on USART3 (HW_UART_DEV = SD3, GPIOB 10/11) ──
-// 1200 baud, Bafang S-LCD protocol. U-D-U-D-U-D combo toggles offroad/street.
+// Uses Luna serial display protocol: 1200 baud, Bafang S-LCD compatible
+// PAS levels 0-9, battery SOC, speed, current all reported to display
+// Triple-tap walk mode button = toggle offroad/street mode
 #define HW_HAS_LUNA_SERIAL_DISPLAY
 
-// ── PAS sensor pins (quadrature, polled by app_pas.c / app_adc.c) ──
-// NRF52 SWD pads — unused at runtime, free for PAS
+// ── PAS sensor pins (quadrature, polled by app_pas.c) ──
+// Reuses NRF5x SWD pads — NRF programmer not active at runtime
 #define HW_PAS1_PORT		GPIOB
-#define HW_PAS1_PIN			12		// NRF52 SWDIO pad
+#define HW_PAS1_PIN			12		// SW DIO header
 #define HW_PAS2_PORT		GPIOA
-#define HW_PAS2_PIN			4		// NRF52 SWCLK pad
+#define HW_PAS2_PIN			4		// SW CLK header
 
-// ── Wheel speed sensor on ADC_EXT2 / PA6 (COMM header) ──
-// Hall sensor with 10K pullup, reads via ADC with hysteresis
+// ── Wheel speed sensor on PPM pin (digital GPIO polling) ──
+// Hall-type sensor output wired to PPM/ICU input (GPIOB 6, TIM4_CH1)
+// PPM app not used, so this pin is free for GPIO polling
 #define HW_HAS_WHEEL_SPEED_SENSOR
-#define HW_WHEEL_SPEED_ADC_CH		7		// ADC_IND_EXT2 = 7 (IN6, PA6)
-#define HW_WHEEL_SPEED_THRESH_HIGH	2000
-#define HW_WHEEL_SPEED_THRESH_LOW	1000
+#define HW_WHEEL_SPEED_USE_GPIO
+#define HW_WHEEL_SPEED_GPIO_PORT	GPIOB
+#define HW_WHEEL_SPEED_GPIO_PIN		6
 #define HW_WHEEL_SPEED_MAGNETS		1
 
 #endif /* HW_FLIPSKY_60_MK5_EBIKE_H_ */

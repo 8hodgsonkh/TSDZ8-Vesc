@@ -102,6 +102,18 @@ typedef struct {
 	float i_beta_last;
 } observer_state;
 
+// HAZZA: 2D observer correction table (ERPM × motor current)
+#define POS_CORR_ERPM_BINS		8
+#define POS_CORR_CURRENT_BINS	4
+
+typedef struct {
+	float observer_offset[POS_CORR_ERPM_BINS][POS_CORR_CURRENT_BINS]; // Observer bias (radians)
+	float erpm_per_bin;          // ERPM width per bin (1250)
+	float amps_per_bin;          // Current width per bin (20)
+	bool valid;                  // Table populated
+	bool apply_correction;       // Runtime correction enabled
+} foc_position_correction_t;
+
 #define MC_AUDIO_CHANNELS	4
 
 typedef enum {
@@ -267,6 +279,9 @@ typedef struct {
 	float m_stall_current_prev;       // Previous current for variance calc
 	float m_stall_tracking_osc;       // Tracking quality oscillation detector
 	float m_stall_tracking_prev;      // Previous tracking quality for oscillation
+
+	// HAZZA: Position tracking correction table (from position test)
+	foc_position_correction_t m_pos_correction;
 
 	// Pre-calculated values
 	float p_lq;

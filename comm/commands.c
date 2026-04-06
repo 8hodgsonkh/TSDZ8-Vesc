@@ -57,11 +57,13 @@
 #include "main.h"
 #include "conf_custom.h"
 #include "comm_usb.h"
+#include "conf_general.h"
 
 #include <math.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 // Settings
 #define PRINT_BUFFER_SIZE	400
@@ -70,6 +72,13 @@
 static THD_FUNCTION(blocking_thread, arg);
 static THD_WORKING_AREA(blocking_thread_wa, 3000);
 static thread_t *blocking_tp;
+
+// HAZZA: Position test (runs in blocking thread)
+static volatile float pos_test_current = 0.0f;
+static volatile float pos_test_max_erpm = 0.0f;
+static volatile int pos_test_steps = 0;
+static volatile bool pos_test_requested = false;
+static volatile bool pos_test_running = false;
 
 // Private variables
 static char print_buffer[PRINT_BUFFER_SIZE];
@@ -91,10 +100,259 @@ static volatile int fw_version_sent_cnt = 0;
 static bool is_initialized = false;
 static int nrf_flags = 0;
 
+// HAZZA: Terminal command callbacks for position test
+static void terminal_pos_test(int argc, const char **argv) {
+	if (pos_test_running) {
+		commands_printf("Position test already running");
+		return;
+	}
+
+	float current = 3.0f;
+	float max_erpm = 10000.0f;
+	int steps = POS_CORR_ERPM_BINS;
+
+	if (argc >= 2) current = strtof(argv[1], NULL);
+	if (argc >= 3) max_erpm = strtof(argv[2], NULL);
+	if (argc >= 4) steps = strtol(argv[3], NULL, 10);
+
+	if (steps < 2) steps = 2;
+	if (steps > POS_CORR_ERPM_BINS) steps = POS_CORR_ERPM_BINS;
+
+	pos_test_current = current;
+	pos_test_max_erpm = max_erpm;
+	pos_test_steps = steps;
+	pos_test_requested = true;
+	is_blocking = true;
+	chEvtSignal(blocking_tp, (eventmask_t)1);
+	commands_printf("Position test started: %.1fA, %.0f max ERPM, %d steps", (double)current, (double)max_erpm, steps);
+}
+
+static void terminal_pos_results(int argc, const char **argv) {
+	(void)argc; (void)argv;
+	const foc_position_correction_t *corr = mcpwm_foc_get_position_correction();
+	if (!corr->valid) {
+		commands_printf("No position test results available");
+		return;
+	}
+	commands_printf("2D Observer Correction Table (erpm_bin=%.0f, amps_bin=%.0f):",
+		(double)corr->erpm_per_bin, (double)corr->amps_per_bin);
+	commands_printf("ERPM     |  %4.0fA  |  %4.0fA  |  %4.0fA  |  %4.0fA",
+		(double)(corr->amps_per_bin * 0.5f),
+		(double)(corr->amps_per_bin * 1.5f),
+		(double)(corr->amps_per_bin * 2.5f),
+		(double)(corr->amps_per_bin * 3.5f));
+	for (int e = 0; e < POS_CORR_ERPM_BINS; e++) {
+		float erpm_center = corr->erpm_per_bin * ((float)e + 0.5f);
+		commands_printf("%7.0f  | %5.1f   | %5.1f   | %5.1f   | %5.1f",
+			(double)erpm_center,
+			(double)RAD2DEG_f(corr->observer_offset[e][0]),
+			(double)RAD2DEG_f(corr->observer_offset[e][1]),
+			(double)RAD2DEG_f(corr->observer_offset[e][2]),
+			(double)RAD2DEG_f(corr->observer_offset[e][3]));
+	}
+	commands_printf("Correction %s", corr->apply_correction ? "ENABLED" : "DISABLED");
+}
+
+static void terminal_pos_enable(int argc, const char **argv) {
+	(void)argc; (void)argv;
+	const foc_position_correction_t *corr = mcpwm_foc_get_position_correction();
+	if (!corr->valid) {
+		commands_printf("No results to enable. Run pos_test first.");
+		return;
+	}
+	mcpwm_foc_set_position_correction_enabled(true);
+	commands_printf("Position correction ENABLED");
+}
+
+static void terminal_pos_disable(int argc, const char **argv) {
+	(void)argc; (void)argv;
+	mcpwm_foc_set_position_correction_enabled(false);
+	commands_printf("Position correction DISABLED");
+}
+
+static void terminal_pos_clear(int argc, const char **argv) {
+	(void)argc; (void)argv;
+	mcpwm_foc_clear_position_correction();
+	commands_printf("Position correction table cleared");
+}
+
+// HAZZA: Position correction EEPROM persistence
+// 2D table: 8 ERPM bins x 4 current bins = 32 entries
+// Custom EEPROM layout: addr 0=magic, 1=erpm_per_bin, 2=amps_per_bin, 3=flags, 4-11=offsets
+#define POS_EEPROM_MAGIC    0x504F5332  // "POS2" (new magic for 2D format)
+#define POS_EEPROM_ADDR     0           // Starting custom EEPROM address
+
+static void pos_correction_save(void) {
+	const foc_position_correction_t *corr = mcpwm_foc_get_position_correction();
+	if (!corr->valid) {
+		commands_printf("No valid correction to save");
+		return;
+	}
+
+	eeprom_var v;
+	int addr = POS_EEPROM_ADDR;
+
+	// Magic marker
+	v.as_u32 = POS_EEPROM_MAGIC;
+	conf_general_store_eeprom_var_custom(&v, addr++);
+
+	// erpm_per_bin
+	v.as_float = corr->erpm_per_bin;
+	conf_general_store_eeprom_var_custom(&v, addr++);
+
+	// amps_per_bin
+	v.as_float = corr->amps_per_bin;
+	conf_general_store_eeprom_var_custom(&v, addr++);
+
+	// Flags: valid | apply_correction
+	v.as_u32 = (corr->valid ? 1 : 0) | (corr->apply_correction ? 2 : 0);
+	conf_general_store_eeprom_var_custom(&v, addr++);
+
+	// 32 offsets packed 4 int8_t degrees per eeprom_var (8 vars)
+	// Row-major: [erpm0][cur0,1,2,3], [erpm1][cur0,1,2,3], ...
+	for (int i = 0; i < 8; i++) {
+		uint8_t packed[4];
+		for (int j = 0; j < 4; j++) {
+			int e = (i * 4 + j) / POS_CORR_CURRENT_BINS;
+			int c = (i * 4 + j) % POS_CORR_CURRENT_BINS;
+			float deg = RAD2DEG_f(corr->observer_offset[e][c]);
+			int8_t q = (int8_t)fmaxf(-127.0f, fminf(127.0f, deg));
+			packed[j] = (uint8_t)q;
+		}
+		v.as_u32 = ((uint32_t)packed[0]) | ((uint32_t)packed[1] << 8) |
+		           ((uint32_t)packed[2] << 16) | ((uint32_t)packed[3] << 24);
+		conf_general_store_eeprom_var_custom(&v, addr++);
+	}
+
+	commands_printf("Position correction saved to EEPROM (%d vars)", addr);
+}
+
+void pos_correction_load(void) {
+	eeprom_var v;
+
+	// Check magic
+	if (!conf_general_read_eeprom_var_custom(&v, POS_EEPROM_ADDR) ||
+			v.as_u32 != POS_EEPROM_MAGIC) {
+		return;  // No saved 2D data
+	}
+
+	foc_position_correction_t corr;
+	memset(&corr, 0, sizeof(corr));
+	int addr = POS_EEPROM_ADDR + 1;
+
+	// erpm_per_bin
+	if (!conf_general_read_eeprom_var_custom(&v, addr++)) return;
+	corr.erpm_per_bin = v.as_float;
+
+	// amps_per_bin
+	if (!conf_general_read_eeprom_var_custom(&v, addr++)) return;
+	corr.amps_per_bin = v.as_float;
+
+	// Flags
+	if (!conf_general_read_eeprom_var_custom(&v, addr++)) return;
+	corr.valid = (v.as_u32 & 1) != 0;
+	corr.apply_correction = (v.as_u32 & 2) != 0;
+
+	// 32 offsets row-major
+	for (int i = 0; i < 8; i++) {
+		if (!conf_general_read_eeprom_var_custom(&v, addr++)) return;
+		uint8_t *packed = (uint8_t *)&v.as_u32;
+		for (int j = 0; j < 4; j++) {
+			int e = (i * 4 + j) / POS_CORR_CURRENT_BINS;
+			int c = (i * 4 + j) % POS_CORR_CURRENT_BINS;
+			int8_t q = (int8_t)packed[j];
+			corr.observer_offset[e][c] = DEG2RAD_f((float)q);
+		}
+	}
+
+	mcpwm_foc_set_position_correction(&corr);
+}
+
+static void pos_correction_erase(void) {
+	eeprom_var v;
+	v.as_u32 = 0;
+	conf_general_store_eeprom_var_custom(&v, POS_EEPROM_ADDR);  // Clear magic
+	commands_printf("Position correction erased from EEPROM");
+}
+
+static void terminal_pos_save(int argc, const char **argv) {
+	(void)argc; (void)argv;
+	pos_correction_save();
+}
+
+static void terminal_pos_erase(int argc, const char **argv) {
+	(void)argc; (void)argv;
+	pos_correction_erase();
+	mcpwm_foc_clear_position_correction();
+}
+
+// HAZZA: Load pre-computed 2D correction table from test data and save to EEPROM
+// Data from openloop tests at 5A/25A/35A/45A/55A/65A, averaged into 8x4 grid
+// erpm_per_bin=1250, amps_per_bin=20
+// ERPM centers: 625, 1875, 3125, 4375, 5625, 6875, 8125, 9375
+// Current centers: 10A, 30A, 50A, 70A
+static void terminal_pos_preset(int argc, const char **argv) {
+	(void)argc; (void)argv;
+
+	// Observer offset in degrees [ERPM_bin][current_bin]
+	// Negative = observer lags halls
+	static const int8_t preset_deg[8][4] = {
+		{-12, -50, -67, -70},  // 625 ERPM
+		{ -6, -19, -37, -40},  // 1875
+		{  0, -13, -25, -28},  // 3125
+		{  2, -10, -22, -22},  // 4375
+		{  3,  -7, -17, -18},  // 5625
+		{  4,  -4, -14, -17},  // 6875
+		{  4,  -3, -12, -12},  // 8125
+		{  4,  -1, -12,  -9},  // 9375
+	};
+
+	foc_position_correction_t corr;
+	memset(&corr, 0, sizeof(corr));
+	corr.erpm_per_bin = 1250.0f;
+	corr.amps_per_bin = 20.0f;
+	corr.valid = true;
+	corr.apply_correction = true;
+
+	for (int e = 0; e < 8; e++) {
+		for (int c = 0; c < 4; c++) {
+			corr.observer_offset[e][c] = DEG2RAD_f((float)preset_deg[e][c]);
+		}
+	}
+
+	mcpwm_foc_set_position_correction(&corr);
+	pos_correction_save();
+	commands_printf("2D correction table loaded and saved to EEPROM");
+	commands_printf("Correction ENABLED. Type pos_results to view.");
+}
+
 void commands_init(void) {
 	chMtxObjectInit(&print_mutex);
 	chMtxObjectInit(&terminal_mutex);
 	chThdCreateStatic(blocking_thread_wa, sizeof(blocking_thread_wa), NORMALPRIO, blocking_thread, NULL);
+
+	// HAZZA: Position test terminal commands
+	terminal_register_command_callback("pos_test",
+		"Run position tracking test",
+		"[current_A] [max_erpm] [steps]", terminal_pos_test);
+	terminal_register_command_callback("pos_results",
+		"Show position test results", NULL, terminal_pos_results);
+	terminal_register_command_callback("pos_enable",
+		"Enable position correction", NULL, terminal_pos_enable);
+	terminal_register_command_callback("pos_disable",
+		"Disable position correction", NULL, terminal_pos_disable);
+	terminal_register_command_callback("pos_clear",
+		"Clear position correction table", NULL, terminal_pos_clear);
+	terminal_register_command_callback("pos_save",
+		"Save position correction to EEPROM", NULL, terminal_pos_save);
+	terminal_register_command_callback("pos_erase",
+		"Erase position correction from EEPROM", NULL, terminal_pos_erase);
+	terminal_register_command_callback("pos_preset",
+		"Load pre-computed 2D correction table from test data", NULL, terminal_pos_preset);
+
+	// Load saved position correction from EEPROM
+	pos_correction_load();
+
 	is_initialized = true;
 }
 
@@ -775,10 +1033,6 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 	} break;
 
 	case COMM_CUSTOM_APP_DATA: {
-		// DEBUG: Log ALL custom app data arrivals
-		commands_printf("CUSTOM_APP_DATA len=%d data=[%02X %02X %02X]",
-			len, len >= 1 ? data[0] : 0, len >= 2 ? data[1] : 0, len >= 3 ? data[2] : 0);
-
 		// HAZZA display lock state - prevents HA/HB from overriding when locked
 		static volatile bool display_locked = false;
 		static volatile int pre_lock_boost = 0;
@@ -840,6 +1094,35 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		if (len >= 4 && data[0] == 0x48 && data[1] == 0x54) {
 			uint16_t torque = ((uint16_t)data[2] << 8) | data[3];
 			app_adc_set_ext_torque(torque);
+		}
+		// Hazza position tracking test command
+		// Format: [0x48] [0x50] [cmd] [data...] = "HP" + command
+		// cmd=0x01: Start test - [current_f16] [max_erpm_f16] [num_steps_u8]
+		// cmd=0x02: Enable correction
+		// cmd=0x03: Disable correction
+		// cmd=0x04: Clear correction table
+		if (len >= 3 && data[0] == 0x48 && data[1] == 0x50) {
+			uint8_t cmd = data[2];
+			if (cmd == 0x01 && len >= 8) {
+				// Start position test (dispatched to blocking thread)
+				if (!pos_test_running && !is_blocking) {
+					int32_t ind = 3;
+					pos_test_current = buffer_get_float16(data, 1e1, &ind);
+					pos_test_max_erpm = buffer_get_float16(data, 1.0f, &ind);
+					pos_test_steps = data[ind++];
+					if (pos_test_steps < 2) pos_test_steps = 2;
+					if (pos_test_steps > POS_CORR_ERPM_BINS) pos_test_steps = POS_CORR_ERPM_BINS;
+					pos_test_requested = true;
+					is_blocking = true;
+					chEvtSignal(blocking_tp, (eventmask_t)1);
+				}
+			} else if (cmd == 0x02) {
+				mcpwm_foc_set_position_correction_enabled(true);
+			} else if (cmd == 0x03) {
+				mcpwm_foc_set_position_correction_enabled(false);
+			} else if (cmd == 0x04) {
+				mcpwm_foc_clear_position_correction();
+			}
 		}
 		if (appdata_func) {
 			appdata_func(data, len);
@@ -2135,6 +2418,25 @@ static THD_FUNCTION(blocking_thread, arg) {
 		is_blocking = false;
 
 		chEvtWaitAny((eventmask_t) 1);
+
+		// HAZZA: Position test runs in blocking thread
+		if (pos_test_requested) {
+			pos_test_requested = false;
+			pos_test_running = true;
+			is_blocking = true;
+
+			int result = mcpwm_foc_position_test(pos_test_current, pos_test_max_erpm, pos_test_steps);
+
+			// Send completion "HR" type 0x00
+			uint8_t done_buf[4];
+			done_buf[0] = 0x48; done_buf[1] = 0x52;
+			done_buf[2] = 0x00;
+			done_buf[3] = (uint8_t)(result == 0 ? 1 : 0);
+			commands_send_app_data(done_buf, 4);
+
+			pos_test_running = false;
+			continue;
+		}
 
 		mc_interface_select_motor_thread(blocking_thread_motor);
 

@@ -2623,6 +2623,146 @@ int mcpwm_foc_hall_detect(float current, uint8_t *hall_table, bool *result) {
 	return fault;
 }
 
+// =============================================================================
+// HAZZA: Position Tracking Test
+// Sweeps motor from 0 to max_erpm in openloop mode while the observer and
+// hall sensor run in the background. Records the observer and hall phase errors
+// vs the openloop reference at each speed step. Builds a correction table and
+// determines optimal hall->observer transition ERPMs.
+//
+// The motor MUST be unloaded (chain off or wheel in air) for accurate results.
+// Returns: FAULT_CODE_NONE on success, fault code on failure
+// =============================================================================
+int mcpwm_foc_position_test(float test_current, float max_erpm, int num_erpm_steps) {
+	volatile motor_all_state_t *motor = get_motor_now();
+	int fault = FAULT_CODE_NONE;
+
+	// Fixed table geometry
+	const float erpm_per_bin = 1250.0f;
+	const float amps_per_bin = 20.0f;
+
+	if (num_erpm_steps < 2) num_erpm_steps = 2;
+	if (num_erpm_steps > POS_CORR_ERPM_BINS) num_erpm_steps = POS_CORR_ERPM_BINS;
+
+	// Determine which current column to fill
+	int cur_bin = (int)(test_current / amps_per_bin);
+	if (cur_bin < 0) cur_bin = 0;
+	if (cur_bin >= POS_CORR_CURRENT_BINS) cur_bin = POS_CORR_CURRENT_BINS - 1;
+
+	// Only clear the column being tested (preserve other columns)
+	for (int e = 0; e < POS_CORR_ERPM_BINS; e++) {
+		motor->m_pos_correction.observer_offset[e][cur_bin] = 0.0f;
+	}
+	motor->m_pos_correction.erpm_per_bin = erpm_per_bin;
+	motor->m_pos_correction.amps_per_bin = amps_per_bin;
+
+	mc_interface_lock();
+
+	MTPA_MODE mtpa_old = motor->m_conf->foc_mtpa_mode;
+	motor->m_conf->foc_mtpa_mode = MTPA_MODE_OFF;
+
+	systime_t tout = timeout_get_timeout_msec();
+	float tout_c = timeout_get_brake_current();
+	KILL_SW_MODE tout_ksw = timeout_get_kill_sw_mode();
+	timeout_reset();
+	timeout_configure(300000, 0.0, KILL_SW_MODE_DISABLED);
+
+	bool stall_was_enabled = m_stall_enabled;
+	m_stall_enabled = false;
+
+	// Warmup: spin at low speed openloop
+	mcpwm_foc_set_openloop_current(test_current, 50.0f);
+	chThdSleepMilliseconds(1000);
+
+	fault = mc_interface_get_fault();
+	if (fault != FAULT_CODE_NONE) goto exit_pos_test;
+
+	// Sweep ERPM bins — openloop with real current
+	for (int step = 0; step < num_erpm_steps; step++) {
+		float target_erpm = erpm_per_bin * ((float)step + 0.5f); // bin center
+		if (target_erpm > max_erpm) break;
+		float target_rpm = target_erpm / (float)motor->m_conf->si_motor_poles * 2.0f;
+
+		mcpwm_foc_set_openloop_current(test_current, target_rpm);
+
+		// Settle: 1200ms first 3 steps, 600ms after
+		chThdSleepMilliseconds((step < 3) ? 1200 : 600);
+
+		fault = mc_interface_get_fault();
+		if (fault != FAULT_CODE_NONE) goto exit_pos_test;
+
+		// Sample observer vs hall — 50 samples over 100ms
+		float obs_sin = 0, obs_cos = 0;
+		float erpm_accum = 0;
+		int count = 0;
+
+		for (int s = 0; s < 50; s++) {
+			float diff = utils_angle_difference_rad(
+				motor->m_phase_now_observer, motor->m_ang_hall_rate_limited);
+			float os, oc;
+			sincosf(diff, &os, &oc);
+			obs_sin += os; obs_cos += oc;
+			erpm_accum += fabsf(RADPS2RPM_f(motor->m_pll_speed));
+			count++;
+			chThdSleepMilliseconds(2);
+		}
+
+		fault = mc_interface_get_fault();
+		if (fault != FAULT_CODE_NONE) goto exit_pos_test;
+
+		if (count > 0) {
+			float mean_diff = atan2f(obs_sin, obs_cos);
+			float avg_erpm = erpm_accum / (float)count;
+
+			motor->m_pos_correction.observer_offset[step][cur_bin] = mean_diff;
+
+			commands_printf("POS_TEST: bin=%d cur_bin=%d target=%.0f actual=%.0f obs-hall=%.1f",
+				step, cur_bin, (double)target_erpm, (double)avg_erpm,
+				(double)RAD2DEG_f(mean_diff));
+		}
+	}
+
+	motor->m_pos_correction.valid = true;
+	commands_printf("POS_TEST: Done. Current column %d (%.0fA) filled.", cur_bin, (double)test_current);
+
+	exit_pos_test:
+	motor->m_iq_set = 0.0;
+	motor->m_id_set = 0.0;
+	motor->m_control_mode = CONTROL_MODE_NONE;
+	motor->m_state = MC_STATE_OFF;
+	stop_pwm_hw((motor_all_state_t*)motor);
+	motor->m_conf->foc_mtpa_mode = mtpa_old;
+	timeout_configure(tout, tout_c, tout_ksw);
+	m_stall_enabled = stall_was_enabled;
+	mc_interface_unlock();
+	return fault;
+}
+
+const foc_position_correction_t *mcpwm_foc_get_position_correction(void) {
+	return (const foc_position_correction_t *)&get_motor_now()->m_pos_correction;
+}
+
+void mcpwm_foc_set_position_correction_enabled(bool enabled) {
+	volatile motor_all_state_t *motor = get_motor_now();
+	if (motor->m_pos_correction.valid) {
+		motor->m_pos_correction.apply_correction = enabled;
+		commands_printf("POS_CORRECTION: %s", enabled ? "enabled" : "disabled");
+	} else {
+		commands_printf("POS_CORRECTION: No valid correction table.");
+	}
+}
+
+void mcpwm_foc_set_position_correction(const foc_position_correction_t *corr) {
+	volatile motor_all_state_t *motor = get_motor_now();
+	memcpy((void*)&motor->m_pos_correction, corr, sizeof(foc_position_correction_t));
+}
+
+void mcpwm_foc_clear_position_correction(void) {
+	volatile motor_all_state_t *motor = get_motor_now();
+	memset((void*)&motor->m_pos_correction, 0, sizeof(foc_position_correction_t));
+	commands_printf("POS_CORRECTION: Table cleared");
+}
+
 /**
  * Calibrate voltage and current offsets. For the observer to work at low modulation it
  * is very important to get all current and voltage offsets right. Therefore we store

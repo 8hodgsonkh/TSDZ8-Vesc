@@ -485,7 +485,6 @@ static void serial_display_byte_process(unsigned char byte) {
 					}
 				case CMD_WHEEL_RPM:
 					{
-#ifdef HW_HAS_WHEEL_SPEED_SENSOR
 					// rpm = spd [m/s] / perim [m] * 60[s/min]
 					const volatile mc_configuration *conf = mc_interface_get_configuration();
 					uint16_t wheel_rpm = (uint16_t)(mc_interface_get_speed() / (M_PI * conf->si_wheel_diameter) * 60.0);
@@ -495,8 +494,7 @@ static void serial_display_byte_process(unsigned char byte) {
 					serial_buffer.tx[2] = serial_buffer.tx[0] + serial_buffer.tx[1] + 32;
 					serial_send_packet(serial_buffer.tx, 3);
 					rd_ptr +=2;
-					serial_buffer.rd_ptr = rd_ptr;              
-#endif
+					serial_buffer.rd_ptr = rd_ptr;
 					continue;
 					}
 				case CMD_MOVING:

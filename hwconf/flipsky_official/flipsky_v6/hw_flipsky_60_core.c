@@ -367,10 +367,48 @@ static volatile wheel_speed_state_t wheel_state = WHEEL_SPEED_STATE_UNKNOWN;
 static volatile float wheel_speed_rps = 0.0f;
 
 void hw_update_speed_sensor(void) {
-	uint16_t adc_val = ADC_Value[HW_WHEEL_SPEED_ADC_CH];
 	uint32_t now_us = chVTGetSystemTimeX() * (1000000 / CH_CFG_ST_FREQUENCY);
-
 	wheel_speed_state_t new_state = wheel_state;
+
+#ifdef HW_WHEEL_SPEED_USE_GPIO
+	// Digital GPIO polling (e.g. PPM pin with hall speed sensor)
+	static bool gpio_initialized = false;
+	if (!gpio_initialized) {
+		palSetPadMode(HW_WHEEL_SPEED_GPIO_PORT, HW_WHEEL_SPEED_GPIO_PIN,
+			PAL_MODE_INPUT_PULLUP);
+		gpio_initialized = true;
+	}
+	bool pin_high = palReadPad(HW_WHEEL_SPEED_GPIO_PORT, HW_WHEEL_SPEED_GPIO_PIN);
+
+	switch (wheel_state) {
+	case WHEEL_SPEED_STATE_UNKNOWN:
+		new_state = pin_high ? WHEEL_SPEED_STATE_HIGH : WHEEL_SPEED_STATE_LOW;
+		break;
+
+	case WHEEL_SPEED_STATE_HIGH:
+		if (!pin_high) {
+			new_state = WHEEL_SPEED_STATE_LOW;
+			wheel_pulse_count++;
+			if (wheel_last_pulse_time > 0) {
+				uint32_t period = now_us - wheel_last_pulse_time;
+				if (period > 1000 && period < 10000000) {
+					wheel_pulse_period_us = period;
+					wheel_speed_rps = 1000000.0f / ((float)period * HW_WHEEL_SPEED_MAGNETS);
+				}
+			}
+			wheel_last_pulse_time = now_us;
+		}
+		break;
+
+	case WHEEL_SPEED_STATE_LOW:
+		if (pin_high) {
+			new_state = WHEEL_SPEED_STATE_HIGH;
+		}
+		break;
+	}
+#else
+	// ADC-based hall sensor with hysteresis thresholds
+	uint16_t adc_val = ADC_Value[HW_WHEEL_SPEED_ADC_CH];
 
 	switch (wheel_state) {
 	case WHEEL_SPEED_STATE_UNKNOWN:
@@ -402,6 +440,7 @@ void hw_update_speed_sensor(void) {
 		}
 		break;
 	}
+#endif
 
 	wheel_state = new_state;
 
@@ -433,7 +472,11 @@ uint32_t hw_wheel_speed_get_pulse_age_ms(void) {
 }
 
 uint16_t hw_wheel_speed_get_adc_raw(void) {
+#ifdef HW_WHEEL_SPEED_USE_GPIO
+	return palReadPad(HW_WHEEL_SPEED_GPIO_PORT, HW_WHEEL_SPEED_GPIO_PIN) ? 4095 : 0;
+#else
 	return ADC_Value[HW_WHEEL_SPEED_ADC_CH];
+#endif
 }
 
 #endif // HW_HAS_WHEEL_SPEED_SENSOR
