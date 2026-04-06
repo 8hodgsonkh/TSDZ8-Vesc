@@ -157,8 +157,9 @@ typedef struct {
 	float last_ref_timestamp;
 	float event_period;
 	float last_step_timestamp;  // Timestamp of last valid forward step (any transition)
-	float step_period;          // Period between quadrature transitions
+	float step_period;          // Period between channel-A edges (same sensor, even spacing)
 	bool  has_step_period;      // True once we have a valid step_period
+	uint8_t prev_a_level;       // Last channel A level for edge detection
 	float idle_time;
 	bool has_period;
 	bool seeded_start;
@@ -172,6 +173,7 @@ static pas_quadrature_state_t pas_quad_state = {
 	.last_step_timestamp = 0.0f,
 	.step_period = 0.0f,
 	.has_step_period = false,
+	.prev_a_level = 0xFF,
 	.idle_time = 0.0f,
 	.has_period = false,
 	.seeded_start = false
@@ -185,6 +187,7 @@ static void pas_quadrature_reset_state(void) {
 	pas_quad_state.last_step_timestamp = 0.0f;
 	pas_quad_state.step_period = 0.0f;
 	pas_quad_state.has_step_period = false;
+	pas_quad_state.prev_a_level = 0xFF;
 	pas_quad_state.idle_time = 0.0f;
 	pas_quad_state.has_period = false;
 	pas_quad_state.seeded_start = false;
@@ -691,28 +694,14 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 			pas_quad_state.last_step_timestamp = now;
 			pas_quad_state.seeded_start = true;
 		} else {
-			// ---- Per-transition step period (all 4 quadrature edges) ----
-			// 80 transitions/rev with 20 magnet pairs. Raw period used directly
-			// — no ring buffer or averaging. Tracking Smoothness LP in the
-			// follow process handles any A/B sensor asymmetry.
-			float raw_period = now - pas_quad_state.last_step_timestamp;
-			pas_quad_state.last_step_timestamp = now;
+			// ---- Channel-A-only step period (rising + falling) ----
+			// Both edges from the same physical sensor → evenly spaced.
+			// 2 edges per magnet pair = 40/rev. No asymmetry.
+			uint8_t cur_a = new_state & 1;
+			bool a_changed = (pas_quad_state.prev_a_level != 0xFF && cur_a != pas_quad_state.prev_a_level);
+			pas_quad_state.prev_a_level = cur_a;
 
-			float magnets = fmaxf(1.0f, (float)config.magnets);
-			float min_step_period = min_pedal_period;
-			if (magnets > 1.0f && min_step_period > 0.0f) {
-				min_step_period /= (magnets * 4.0f);
-			}
-			if (min_step_period < 1e-5f) min_step_period = 1e-5f;
-
-			if (raw_period >= min_step_period) {
-				pas_quad_state.step_period = raw_period;
-				pas_quad_state.has_step_period = true;
-				pas_quad_state.seeded_start = false;
-			} else {
-				pas_quad_state.seeded_start = true;
-			}
-
+			// Idle/engagement on ANY valid forward transition (both channels)
 			pas_transition_count++;
 			pas_time_last_real_step = now;
 			pas_time_since_last_real_step = 0.0f;
@@ -720,6 +709,29 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 			pas_force_idle = false;
 			if (was_idle) {
 				pas_startup_assist_trigger();
+			}
+
+			// Only measure timing from channel A edges
+			if (a_changed) {
+				float raw_period = now - pas_quad_state.last_step_timestamp;
+				pas_quad_state.last_step_timestamp = now;
+
+				float magnets = fmaxf(1.0f, (float)config.magnets);
+				float min_step_period = min_pedal_period;
+				if (magnets > 1.0f && min_step_period > 0.0f) {
+					min_step_period /= (magnets * 2.0f);
+				}
+				if (min_step_period < 1e-5f) min_step_period = 1e-5f;
+
+				if (raw_period >= min_step_period) {
+					pas_quad_state.step_period = raw_period;
+					pas_quad_state.has_step_period = true;
+					pas_quad_state.seeded_start = false;
+				} else {
+					pas_quad_state.seeded_start = true;
+				}
+			} else if (!pas_quad_state.has_step_period) {
+				pas_quad_state.seeded_start = true;
 			}
 
 			// ---- Ref-state match: step_count + event_period for downstream compat ----
@@ -739,22 +751,22 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 		}
 	}
 
-	// ---- RPM from raw step period (no LP — Tracking Smoothness handles it) ----
+	// ---- RPM from channel-A step period (no LP — tracking LP handles it) ----
 	float rpm = pedal_rpm;
 	if (pas_quad_state.has_step_period && pas_quad_state.step_period > 1e-5f) {
 		float magnets = fmaxf(1.0f, (float)config.magnets);
-		// 4 quadrature transitions per magnet pair per revolution
-		float rev_per_s = 1.0f / (pas_quad_state.step_period * magnets * 4.0f);
+		// 2 channel-A edges per magnet pair per revolution
+		float rev_per_s = 1.0f / (pas_quad_state.step_period * magnets * 2.0f);
 		rpm = rev_per_s * 60.0f;
 	} else if (pas_quad_state.seeded_start) {
 		rpm = fmaxf(rpm, startup_rpm);
 	}
-	(void)rpm_filtered; // suppress unused warning
+	(void)rpm_filtered;
 
 	float timeout = max_pulse_period;
 	if (pas_quad_state.has_step_period) {
 		float magnets = fmaxf(1.0f, (float)config.magnets);
-		float extended = pas_quad_state.step_period * magnets * 4.0f * stop_factor;
+		float extended = pas_quad_state.step_period * magnets * 2.0f * stop_factor;
 		timeout = fmaxf(timeout, extended);
 	}
 
