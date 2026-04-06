@@ -153,21 +153,24 @@ static volatile float pas_target_erpm = 0.0f;
 static float pas_step_window_config = PAS_REAL_STEP_WINDOW;
 
 // ISR-driven quadrature state. EXTI fires on channel-A (PB6) both edges.
-// Channel-B (PA6) read in ISR for direction via QEM table.
-// 2-sample ring buffer: avg of rise-to-fall + fall-to-rise = 1 full magnet+gap.
+// Channel-B (PA6) read in ISR for direction.
+// 4-sample ring buffer: averages 4 consecutive A-edge periods to smooth
+// magnet spacing asymmetry while keeping latency to ~2 magnet cycles.
+#define PAS_RING_SIZE 4
 typedef struct {
 	// ---- Written by ISR, read by thread (volatile) ----
-	volatile uint32_t avg_period_ticks;  // 2-sample averaged period in TIM5 ticks
-	volatile bool     has_period;        // True once 2 samples filled
-	volatile uint32_t last_edge_ticks;   // TIM5->CNT at last valid edge (for timeout)
-	volatile bool     seeded_start;      // First edge seen, waiting for 2nd
+	volatile uint32_t avg_period_ticks;  // Ring-averaged period in TIM5 ticks
+	volatile bool     has_period;        // True once ring is full
+	volatile uint32_t last_edge_ticks;   // TIM5->CNT at last valid edge
+	volatile bool     seeded_start;      // First edge seen, waiting for ring fill
 	volatile bool     backward_detected; // ISR saw backward step
 	volatile bool     exti_enabled;      // EXTI active
 	// ---- ISR-internal (not read by thread during normal operation) ----
-	uint8_t  last_state;          // QEM state (ISR only)
+	uint8_t  last_state;          // Pin state (ISR only)
 	uint8_t  ref_state;           // Reference state for step counting
-	uint32_t prev_raw_ticks;      // Previous raw edge period for 2-sample avg
-	bool     has_prev;            // Whether prev_raw_ticks is valid
+	uint32_t ring[PAS_RING_SIZE]; // Circular buffer of raw edge periods
+	uint8_t  ring_idx;            // Next write index
+	uint8_t  ring_count;          // Number of valid entries (0..PAS_RING_SIZE)
 } pas_exti_quad_state_t;
 
 static volatile pas_exti_quad_state_t pas_exti_quad = {
@@ -179,8 +182,9 @@ static volatile pas_exti_quad_state_t pas_exti_quad = {
 	.exti_enabled = false,
 	.last_state = 0xFF,
 	.ref_state = 0xFF,
-	.prev_raw_ticks = 0,
-	.has_prev = false,
+	.ring = {0},
+	.ring_idx = 0,
+	.ring_count = 0,
 };
 
 static void pas_exti_quad_reset(void) {
@@ -191,8 +195,9 @@ static void pas_exti_quad_reset(void) {
 	pas_exti_quad.backward_detected = false;
 	pas_exti_quad.last_state = 0xFF;
 	pas_exti_quad.ref_state = 0xFF;
-	pas_exti_quad.prev_raw_ticks = 0;
-	pas_exti_quad.has_prev = false;
+	for (int i = 0; i < PAS_RING_SIZE; i++) pas_exti_quad.ring[i] = 0;
+	pas_exti_quad.ring_idx = 0;
+	pas_exti_quad.ring_count = 0;
 }
 
 static float pas_get_idle_timeout_limit(void) {
@@ -484,18 +489,25 @@ void app_pas_pas_irq_handler(void) {
 		uint32_t elapsed = now - pas_exti_quad.last_edge_ticks;
 		pas_exti_quad.last_edge_ticks = now;
 
-		// 2-sample ring buffer: average consecutive A-edge periods
-		// rise-to-fall + fall-to-rise = 1 full magnet+gap cycle
-		if (pas_exti_quad.has_prev) {
-			pas_exti_quad.avg_period_ticks =
-				(pas_exti_quad.prev_raw_ticks + elapsed) / 2;
+		// 4-sample ring buffer: average consecutive A-edge periods
+		// Smooths magnet spacing asymmetry (rise/fall + magnet-to-magnet)
+		// while keeping latency to ~2 full magnet cycles.
+		pas_exti_quad.ring[pas_exti_quad.ring_idx] = elapsed;
+		pas_exti_quad.ring_idx = (pas_exti_quad.ring_idx + 1) % PAS_RING_SIZE;
+		if (pas_exti_quad.ring_count < PAS_RING_SIZE) {
+			pas_exti_quad.ring_count++;
+		}
+		if (pas_exti_quad.ring_count >= 2) {
+			uint32_t sum = 0;
+			for (uint8_t i = 0; i < pas_exti_quad.ring_count; i++) {
+				sum += pas_exti_quad.ring[i];
+			}
+			pas_exti_quad.avg_period_ticks = sum / pas_exti_quad.ring_count;
 			pas_exti_quad.has_period = true;
 			pas_exti_quad.seeded_start = false;
 		} else {
 			pas_exti_quad.seeded_start = true;
 		}
-		pas_exti_quad.prev_raw_ticks = elapsed;
-		pas_exti_quad.has_prev = true;
 
 		// Step/transition counters (atomic 32-bit writes on Cortex-M4)
 		pas_transition_count++;
@@ -731,9 +743,15 @@ bool app_pas_is_forced_idle(void) {
 
 static void pas_sensor_update_quadrature(float loop_dt) {
 #if defined(HW_PAS1_PORT) && defined(HW_PAS2_PORT) && defined(HW_PAS_PPM_EXTI_LINE)
-	// ---- EXTI-driven quadrature: thread just reads ISR results ----
-	// ISR handles: QEM decode, direction, timestamps, 2-sample averaging
-	// Thread handles: RPM calculation, timeout, idle/startup logic
+	// ---- EXTI-driven quadrature: thread reads ISR results ----
+	// ISR handles: direction, timestamps, 4-sample ring buffer averaging
+	// Thread handles: RPM calc, deceleration interpolation, timeout, startup
+	//
+	// Deceleration interpolation: instead of holding RPM constant between
+	// edges (staircase), if time-since-last-edge exceeds the last known
+	// period, we use that growing elapsed time as the effective period.
+	// Result: RPM fades smoothly when rider slows. Acceleration response
+	// is instant (new edge → shorter period → higher RPM immediately).
 
 	const float startup_rpm = 7.0f;
 	const float stop_factor = 1.5f;
@@ -745,15 +763,17 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 		return;
 	}
 
-	// Idle time from ISR timestamp
-	float idle_time = timer_seconds_elapsed_since(pas_exti_quad.last_edge_ticks);
+	// Elapsed time since last ISR edge (TIM5 domain, same as avg_period)
+	uint32_t last_ticks = pas_exti_quad.last_edge_ticks;
+	uint32_t elapsed_ticks = TIM5->CNT - last_ticks;
+	float idle_time = (float)elapsed_ticks * (1.0f / PAS_TIMER_HZ);
 	pas_time_since_last_real_step = idle_time;
 
 	// Handle backward detection from ISR
 	if (pas_exti_quad.backward_detected) {
 		pas_exti_quad_reset();
 		pas_exti_quad.exti_enabled = true;  // Keep EXTI running
-		pas_exti_quad.last_edge_ticks = timer_time_now();
+		pas_exti_quad.last_edge_ticks = TIM5->CNT;
 		pedal_rpm = 0.0f;
 		pas_force_idle = true;
 		pas_boost_state = 0.0f;
@@ -765,29 +785,36 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 		return;
 	}
 
-	// Calculate RPM from ISR-computed averaged period
+	// Calculate RPM with deceleration interpolation
 	float rpm = pedal_rpm;
 	if (pas_exti_quad.has_period && pas_exti_quad.avg_period_ticks > 0) {
-		// avg_period_ticks = avg of 2 consecutive A-edge periods (in TIM5 ticks)
-		// 2 A-edges per magnet = 1 full magnet+gap cycle
-		// So avg_period is the time for half a magnet cycle (1 A-edge spacing)
-		// Full magnet period = avg_period * 2
-		// magnets per rev = config.magnets
-		// revolution period = avg_period * 2 * magnets
-		float avg_period_s = (float)pas_exti_quad.avg_period_ticks * (1.0f / PAS_TIMER_HZ);
+		// Use the larger of ISR avg period vs time-since-last-edge.
+		// When pedaling constant: elapsed < avg → use avg → stable RPM.
+		// When decelerating: elapsed > avg → RPM tracks down smoothly.
+		// When accelerating: next ISR edge updates avg → instant step up.
+		uint32_t effective_period = pas_exti_quad.avg_period_ticks;
+		if (elapsed_ticks > effective_period) {
+			effective_period = elapsed_ticks;
+		}
+
+		float period_s = (float)effective_period * (1.0f / PAS_TIMER_HZ);
 		float magnets = fmaxf(1.0f, (float)config.magnets);
-		float rev_period = avg_period_s * 2.0f * magnets;
+		// 2 A-edges per magnet (rising + falling)
+		float rev_period = period_s * 2.0f * magnets;
 		if (rev_period > 1e-5f) {
 			rpm = 60.0f / rev_period;
 		}
 
 		// Update last-step tracking (thread-side)
-		float now = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
-		pas_time_last_real_step = now;
-		bool was_idle = pas_force_idle;
-		pas_force_idle = false;
-		if (was_idle) {
-			pas_startup_assist_trigger();
+		// Only when ISR has fresh data (not during decel coast)
+		if (elapsed_ticks <= pas_exti_quad.avg_period_ticks) {
+			float now = (float)chVTGetSystemTimeX() / (float)CH_CFG_ST_FREQUENCY;
+			pas_time_last_real_step = now;
+			bool was_idle = pas_force_idle;
+			pas_force_idle = false;
+			if (was_idle) {
+				pas_startup_assist_trigger();
+			}
 		}
 	} else if (pas_exti_quad.seeded_start) {
 		rpm = fmaxf(rpm, startup_rpm);
@@ -805,7 +832,7 @@ static void pas_sensor_update_quadrature(float loop_dt) {
 	if (idle_time > timeout) {
 		pas_exti_quad_reset();
 		pas_exti_quad.exti_enabled = true;  // Keep EXTI running
-		pas_exti_quad.last_edge_ticks = timer_time_now();
+		pas_exti_quad.last_edge_ticks = TIM5->CNT;
 		rpm = 0.0f;
 		pas_force_idle = true;
 		pas_boost_state = 0.0f;
