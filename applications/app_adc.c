@@ -528,12 +528,13 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	if (buf_size < 0) buf_size = 0;
 	if (buf_size > 11) buf_size = 11;
 	
-	// LP filter: 0.0 = no filtering (pass-through), 1.0 = maximum smoothing
-	// Maps to UTILS_LP_FAST factor: 0.0→1.0 (instant), 1.0→0.01 (heavy smooth)
+	// Target smoothing: 0.0 = instant tracking, 1.0 = maximum smooth
+	// Repurposed: filters the cadence DUTY TARGET (floor for torque boost)
+	// rather than the cadence RPM input. PAS already LP-filters RPM in app_pas.c.
 	float smoothing = conf->haz_pas_duty_smoothing;
 	if (smoothing < 0.0f) smoothing = 0.0f;
 	if (smoothing > 1.0f) smoothing = 1.0f;
-	float lp_factor = (smoothing < 0.01f) ? 1.0f : (1.0f - smoothing * 0.99f);
+	float target_lp_factor = (smoothing < 0.01f) ? 1.0f : (1.0f - smoothing * 0.99f);
 	
 	// Fixed 11-element ring buffer
 	static float rpm_buffer[11] = {0};
@@ -574,8 +575,8 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		pedal_rpm = sorted[samples_to_use / 2];
 	}
 	
-	// LP filter on top (tunable)
-	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, pedal_rpm, lp_factor);
+	// Cadence: use median-filtered RPM directly (app_pas.c already LP-filters)
+	haz_pas_duty_ctx.cadence_smooth = pedal_rpm;
 
 	// ========== ERPM-TRACKING + TORQUE-CONTROLLED RAMP ==========
 	//
@@ -642,12 +643,17 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 			if (strength > 5.0f) strength = 5.0f;
 			float torque_ramp = shaped * strength * ramp_up;
 
-			// Cadence base duty (instant — no ramp)
+			// Cadence base duty — compute raw, then LP-filter the TARGET
+			// This smooths what the torque sensor boosts off of.
+			// Smoothing setting controls this filter, not the cadence input.
 			float base_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * lead_factor;
-			float cadence_duty = base_erpm * erpm_to_duty;
-			cadence_duty *= speed_power_scale;
-			if (cadence_duty > max_duty) cadence_duty = max_duty;
-			if (cadence_duty < 0.0f) cadence_duty = 0.0f;
+			float cadence_duty_raw = base_erpm * erpm_to_duty;
+			cadence_duty_raw *= speed_power_scale;
+			if (cadence_duty_raw > max_duty) cadence_duty_raw = max_duty;
+			if (cadence_duty_raw < 0.0f) cadence_duty_raw = 0.0f;
+			static float cadence_duty_smooth = 0.0f;
+			UTILS_LP_FAST(cadence_duty_smooth, cadence_duty_raw, target_lp_factor);
+			float cadence_duty = cadence_duty_smooth;
 
 			// Ramp: torque active → climb, released → fall back to cadence
 			if (torque_ramp > 0.001f) {
