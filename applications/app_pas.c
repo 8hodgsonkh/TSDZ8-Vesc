@@ -445,11 +445,17 @@ void app_pas_pas_irq_handler(void) {
 #if defined(HW_PAS_PPM_EXTI_LINE)
 	// ---- Quadrature EXTI mode ----
 	// EXTI fires on channel-A (PB6) both edges.
-	// Read channel-B (PA6) for QEM direction detection.
+	// Read channel-B (PA6) for direction detection.
 	// 2-sample ring buffer: avg of rise-to-fall + fall-to-rise = 1 magnet+gap.
+	//
+	// IMPORTANT: We always compute the period from A-edge timing regardless
+	// of direction. With EXTI on A-only, ALL A-edges give the same QEM sign
+	// for a given rotation direction. Depending on wiring, forward pedaling
+	// may give all +1 or all -1. If we gate period computation on direction,
+	// 50% of wiring configs produce zero output. Instead, we track direction
+	// as a flag and let the thread decide whether to suppress motor output.
 	if (pas_exti_quad.exti_enabled &&
 		config.sensor_type == PAS_SENSOR_TYPE_QUADRATURE) {
-		static const int8_t QEM[] = {0,-1,1,2,1,0,2,-1,-1,2,0,1,2,1,-1,0};
 
 		uint32_t now = TIM5->CNT;  // Direct register read — fastest, 14 MHz
 
@@ -458,42 +464,25 @@ void app_pas_pas_irq_handler(void) {
 		uint8_t pas2 = palReadPad(HW_PAS2_PORT, HW_PAS2_PIN) ? 1 : 0;
 		pas_dbg_a_level = pas1;
 		pas_dbg_b_level = pas2;
-		uint8_t new_state = (pas2 << 1) | pas1;
 
 		if (pas_exti_quad.last_state == 0xFF) {
 			// First edge ever — seed state, don't compute period
-			pas_exti_quad.last_state = new_state;
+			pas_exti_quad.last_state = (pas2 << 1) | pas1;
 			pas_exti_quad.last_edge_ticks = now;
 			pas_exti_quad.seeded_start = true;
 			return;
 		}
 
-		if (new_state == pas_exti_quad.last_state) {
-			return;  // No state change (shouldn't happen but guard)
-		}
+		// Direction detection: at A-edge, B==A means one direction, B!=A means other.
+		// This is equivalent to QEM but simpler and independent of state encoding.
+		// direction_conf = +1 (normal) or -1 (inverted)
+		bool b_matches_a = (pas1 == pas2);
+		bool forward = (direction_conf > 0.0f) ? b_matches_a : !b_matches_a;
+		pas_exti_quad.backward_detected = !forward;
 
-		int idx = (pas_exti_quad.last_state * 4) + new_state;
-		int8_t step = QEM[idx];
-		pas_exti_quad.last_state = new_state;
-
-		if (step == 2 || step == -2) {
-			return;  // Invalid transition (skipped state)
-		}
-
-		// Direction check (direction_conf is +1 or -1)
-		int8_t direction = (direction_conf > 0.0f) ? step : -step;
-		if (direction < 0) {
-			pas_exti_quad.backward_detected = true;
-			return;
-		}
-		if (direction == 0) {
-			return;
-		}
-
-		// Valid forward step on channel A
+		// Always compute period regardless of direction
 		uint32_t elapsed = now - pas_exti_quad.last_edge_ticks;
 		pas_exti_quad.last_edge_ticks = now;
-		pas_exti_quad.backward_detected = false;
 
 		// 2-sample ring buffer: average consecutive A-edge periods
 		// rise-to-fall + fall-to-rise = 1 full magnet+gap cycle
@@ -510,6 +499,9 @@ void app_pas_pas_irq_handler(void) {
 
 		// Step/transition counters (atomic 32-bit writes on Cortex-M4)
 		pas_transition_count++;
+
+		uint8_t new_state = (pas2 << 1) | pas1;
+		pas_exti_quad.last_state = new_state;
 
 		// Ref-state tracking for step_count
 		if (pas_exti_quad.ref_state == 0xFF) {
