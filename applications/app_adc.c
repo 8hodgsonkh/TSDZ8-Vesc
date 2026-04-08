@@ -201,6 +201,12 @@ typedef struct {
 	float idle_time;             // Time since last pedal activity
 	bool engaged;                // PAS currently active
 	uint32_t last_step_count;    // For activity detection
+	// Linear interpolation: smooth cadence between PAS edges
+	float interp_prev_rpm;       // RPM at previous edge
+	float interp_next_rpm;       // RPM at current edge (ramp target)
+	float interp_elapsed;        // Time since last edge
+	float interp_period;         // Expected time until next edge
+	float interp_last_raw;       // Last raw RPM (to detect new edge)
 } haz_pas_duty_ctx_t;
 
 static haz_pas_duty_ctx_t haz_pas_duty_ctx = {
@@ -210,7 +216,12 @@ static haz_pas_duty_ctx_t haz_pas_duty_ctx = {
 	.cadence_prev = 0.0f,
 	.idle_time = 0.0f,
 	.engaged = false,
-	.last_step_count = 0
+	.last_step_count = 0,
+	.interp_prev_rpm = 0.0f,
+	.interp_next_rpm = 0.0f,
+	.interp_elapsed = 0.0f,
+	.interp_period = 0.0f,
+	.interp_last_raw = 0.0f
 };
 
 // =============================================================================
@@ -503,31 +514,10 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		}
 	}
 
-	// Track step count and calculate step rate (more robust than single-step detection)
-	uint32_t step_count = app_pas_get_step_count();
-	uint32_t steps_this_cycle = 0;
-	if (step_count >= haz_pas_duty_ctx.last_step_count) {
-		steps_this_cycle = step_count - haz_pas_duty_ctx.last_step_count;
-	}
-	haz_pas_duty_ctx.last_step_count = step_count;
-
-	// Calculate step rate (steps per second) - smooth it
-	float step_rate = (float)steps_this_cycle / dt_s;
-	static float step_rate_smooth = 0.0f;
-	UTILS_LP_FAST(step_rate_smooth, step_rate, 0.3f);
-
-	// With 40 magnets: 60 RPM = 40 steps/sec, 5 RPM = ~3.3 steps/sec
-	// Consider idle if step rate drops below ~2 steps/sec (about 3 RPM)
-	const float min_step_rate = 2.0f;
-	
-	// Track time below threshold
-	if (step_rate_smooth < min_step_rate) {
-		haz_pas_duty_ctx.idle_time += dt_s;
-	} else {
-		haz_pas_duty_ctx.idle_time = 0.0f;
-	}
-
-	bool is_idle = (haz_pas_duty_ctx.idle_time > idle_timeout);
+	// Idle detection: time since last real PAS edge from ISR timestamps.
+	// No LP filter lag — edge arrives = instant not-idle, no edge = instant idle.
+	// Uses the config idle_timeout for the dead time threshold.
+	bool is_idle = (app_pas_get_time_since_real_step() > idle_timeout);
 
 	// Get pedal RPM with optional MEDIAN FILTER (outlier rejection)
 	// Tunable via VESC Tool:
@@ -586,8 +576,30 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		pedal_rpm = sorted[samples_to_use / 2];
 	}
 	
-	// Cadence: use median-filtered RPM directly (app_pas.c already LP-filters)
-	haz_pas_duty_ctx.cadence_smooth = pedal_rpm;
+	// Cadence: linear interpolation between PAS edges
+	// Instead of holding stale RPM for 25+ cycles between edges,
+	// smoothly ramp from previous cadence to current cadence over
+	// the expected edge period. Same approach as haz_pas_follow_process().
+	float edge_period = app_pas_get_step_period();
+
+	// Detect new PAS edge: raw RPM changed
+	if (fabsf(pedal_rpm - haz_pas_duty_ctx.interp_last_raw) > 0.5f) {
+		haz_pas_duty_ctx.interp_prev_rpm = haz_pas_duty_ctx.cadence_smooth;
+		haz_pas_duty_ctx.interp_next_rpm = pedal_rpm;
+		haz_pas_duty_ctx.interp_elapsed = 0.0f;
+		haz_pas_duty_ctx.interp_period = fmaxf(edge_period, 0.005f);
+		haz_pas_duty_ctx.interp_last_raw = pedal_rpm;
+	}
+
+	// Advance interpolation
+	haz_pas_duty_ctx.interp_elapsed += dt_s;
+	float interp_t = haz_pas_duty_ctx.interp_elapsed / haz_pas_duty_ctx.interp_period;
+	if (interp_t > 1.0f) interp_t = 1.0f;
+	if (!isfinite(interp_t) || haz_pas_duty_ctx.interp_period < 0.001f) interp_t = 1.0f;
+
+	haz_pas_duty_ctx.cadence_smooth =
+		haz_pas_duty_ctx.interp_prev_rpm +
+		(haz_pas_duty_ctx.interp_next_rpm - haz_pas_duty_ctx.interp_prev_rpm) * interp_t;
 
 	// ========== ERPM-TRACKING + TORQUE-CONTROLLED RAMP ==========
 	//

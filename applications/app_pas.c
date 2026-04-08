@@ -400,7 +400,7 @@ static void pas_exti_enable(bool enable) {
 		if (!is_quad && ppm_pas_state.exti_enabled) return;
 
 		RCC_APB2PeriphClockCmd(RCC_APB2Periph_SYSCFG, ENABLE);
-		palSetPadMode(HW_ICU_GPIO, HW_ICU_PIN, PAL_MODE_INPUT_PULLUP);
+		palSetPadMode(HW_PAS1_PORT, HW_PAS1_PIN, PAL_MODE_INPUT_PULLUP);
 #if defined(HW_PAS2_PORT) && defined(HW_PAS2_PIN)
 		palSetPadMode(HW_PAS2_PORT, HW_PAS2_PIN, PAL_MODE_INPUT_PULLUP);
 #endif

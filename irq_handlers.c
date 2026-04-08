@@ -43,7 +43,7 @@ CH_IRQ_HANDLER(HW_ENC_EXTI_ISR_VEC) {
 		EXTI_ClearITPendingBit(HW_ENC_EXTI_LINE);
 	}
 
-#ifdef HW_PAS_PPM_EXTI_LINE
+#if defined(HW_PAS_PPM_EXTI_LINE) && !defined(HW_PAS_SEPARATE_EXTI)
 	if (EXTI_GetITStatus(HW_PAS_PPM_EXTI_LINE) != RESET) {
 		app_pas_pas_irq_handler();
 
@@ -51,6 +51,18 @@ CH_IRQ_HANDLER(HW_ENC_EXTI_ISR_VEC) {
 	}
 #endif
 }
+
+// Separate PAS EXTI handler — used when PAS is on a different EXTI
+// vector than the encoder (e.g. PA13/Line13 on EXTI15_10).
+#if defined(HW_PAS_PPM_EXTI_LINE) && defined(HW_PAS_SEPARATE_EXTI)
+CH_IRQ_HANDLER(HW_PAS_PPM_EXTI_ISR_VEC) {
+	if (EXTI_GetITStatus(HW_PAS_PPM_EXTI_LINE) != RESET) {
+		app_pas_pas_irq_handler();
+
+		EXTI_ClearITPendingBit(HW_PAS_PPM_EXTI_LINE);
+	}
+}
+#endif
 
 CH_IRQ_HANDLER(HW_ENC_TIM_ISR_VEC) {
 	if (TIM_GetITStatus(HW_ENC_TIM, TIM_IT_Update) != RESET) {

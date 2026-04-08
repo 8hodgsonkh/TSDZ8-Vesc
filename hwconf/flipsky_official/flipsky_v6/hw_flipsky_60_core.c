@@ -26,6 +26,10 @@
 #include "commands.h"
 #include "mc_interface.h"
 
+#ifdef HW_HAS_LUNA_SERIAL_DISPLAY
+#include "luna_display_serial.h"
+#endif
+
 // Variables
 static volatile bool i2c_running = false;
 #if (defined(HW60_IS_MK3) || defined(HW60_IS_MK4) || defined(HW60_IS_MK5) || defined(HW60_IS_MK6)) && defined(HW_SHUTDOWN_GPIO)
@@ -167,6 +171,10 @@ void hw_init_gpio(void) {
 		"Try sampling the shutdown button",
 		0,
 		terminal_button_test);
+#endif
+
+#ifdef HW_HAS_LUNA_SERIAL_DISPLAY
+	luna_display_serial_start(1); // Start with PAS level 1
 #endif
 }
 
@@ -372,6 +380,9 @@ void hw_update_speed_sensor(void) {
 
 #ifdef HW_WHEEL_SPEED_USE_GPIO
 	// Digital GPIO polling (e.g. PPM pin with hall speed sensor)
+	// Debounced: pin must read the same value for DEBOUNCE_COUNT consecutive
+	// polls before we accept a state change. Prevents noise-induced false
+	// pulses (especially when wheel is stationary and sensor output floats).
 	static bool gpio_initialized = false;
 	if (!gpio_initialized) {
 		palSetPadMode(HW_WHEEL_SPEED_GPIO_PORT, HW_WHEEL_SPEED_GPIO_PIN,
@@ -380,28 +391,49 @@ void hw_update_speed_sensor(void) {
 	}
 	bool pin_high = palReadPad(HW_WHEEL_SPEED_GPIO_PORT, HW_WHEEL_SPEED_GPIO_PIN);
 
+	// Debounce: require 3 consecutive same-value reads before changing state.
+	// At ~10kHz poll rate this is ~300us debounce — fast enough for any real
+	// wheel speed (200km/h with 1 magnet = ~3ms period) but kills noise.
+	#define WHEEL_GPIO_DEBOUNCE_COUNT 3
+	static uint8_t debounce_counter = 0;
+	static bool debounce_last_pin = true;  // matches pull-up default
+
+	if (pin_high == debounce_last_pin) {
+		if (debounce_counter < WHEEL_GPIO_DEBOUNCE_COUNT) {
+			debounce_counter++;
+		}
+	} else {
+		debounce_counter = 0;
+		debounce_last_pin = pin_high;
+	}
+
+	// Only act on debounced pin value
+	bool pin_stable = (debounce_counter >= WHEEL_GPIO_DEBOUNCE_COUNT);
+
 	switch (wheel_state) {
 	case WHEEL_SPEED_STATE_UNKNOWN:
-		new_state = pin_high ? WHEEL_SPEED_STATE_HIGH : WHEEL_SPEED_STATE_LOW;
+		if (pin_stable) {
+			new_state = pin_high ? WHEEL_SPEED_STATE_HIGH : WHEEL_SPEED_STATE_LOW;
+		}
 		break;
 
 	case WHEEL_SPEED_STATE_HIGH:
-		if (!pin_high) {
+		if (pin_stable && !pin_high) {
 			new_state = WHEEL_SPEED_STATE_LOW;
-			wheel_pulse_count++;
-			if (wheel_last_pulse_time > 0) {
-				uint32_t period = now_us - wheel_last_pulse_time;
-				if (period > 1000 && period < 10000000) {
-					wheel_pulse_period_us = period;
-					wheel_speed_rps = 1000000.0f / ((float)period * HW_WHEEL_SPEED_MAGNETS);
-				}
+			// Only count pulse if enough time has elapsed (min period = 5ms = 200Hz max)
+			// This is a hard floor: 1 magnet @ 200Hz = 200 rev/s which is absurd for a wheel
+			uint32_t elapsed = now_us - wheel_last_pulse_time;
+			if (wheel_last_pulse_time > 0 && elapsed > 5000 && elapsed < 10000000) {
+				wheel_pulse_count++;
+				wheel_pulse_period_us = elapsed;
+				wheel_speed_rps = 1000000.0f / ((float)elapsed * HW_WHEEL_SPEED_MAGNETS);
 			}
 			wheel_last_pulse_time = now_us;
 		}
 		break;
 
 	case WHEEL_SPEED_STATE_LOW:
-		if (pin_high) {
+		if (pin_stable && pin_high) {
 			new_state = WHEEL_SPEED_STATE_HIGH;
 		}
 		break;

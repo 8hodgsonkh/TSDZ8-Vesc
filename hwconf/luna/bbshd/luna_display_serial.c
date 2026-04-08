@@ -32,20 +32,14 @@
 #include "comm_can.h"
 #include "datatypes.h"
 
-// Weak default for non-BBSHD boards (BBSHD provides strong symbol in hw_luna_bbshd.c)
 __attribute__((weak)) bool hw_bbshd_has_fixed_throttle_level(void) { return false; }
 
-// ── Up-Down-Up-Down-Up-Down offroad toggle ──
-// Press UP then DOWN alternating 6 times (U-D-U-D-U-D) to toggle offroad/street.
-// Each press must come within 2 seconds of the previous one.
-// Sequence resets on timeout or wrong direction.
 #define OFFROAD_COMBO_LEN       6
 #define OFFROAD_COMBO_TIMEOUT_MS 2000
-static volatile int combo_step = 0;           // 0..5, how many correct presses so far
-static volatile systime_t combo_last_time = 0; // timestamp of last valid press
-static volatile int8_t combo_prev_level = -1;  // previous numeric PAS level (0-9)
+static volatile int combo_step = 0;
+static volatile systime_t combo_last_time = 0;
+static volatile int8_t combo_prev_level = -1;
 
-// Forward declaration — defined after LUNA_PAS_LEVEL enum
 static int8_t pas_code_to_numeric(uint8_t code);
 
 #define CMD_READ			0x11
@@ -88,7 +82,6 @@ typedef enum {
 	PAS_LEVEL_WALK = 0x06,
 } LUNA_PAS_LEVEL;
 
-// Convert Bafang PAS code to numeric 0-9 (-1 for walk/unknown)
 static int8_t pas_code_to_numeric(uint8_t code) {
 	switch (code) {
 		case PAS_LEVEL_0: return 0;
@@ -249,41 +242,31 @@ static void set_assist_level(uint8_t assist_code) {
 	float current_scale;
     volatile mc_configuration *mcconf = (volatile mc_configuration*) mc_interface_get_configuration();
 
-	// ── Up-Down-Up-Down-Up-Down offroad toggle ──
-	// Detect alternating direction changes: U-D-U-D-U-D
-	// Even steps (0,2,4) expect UP, odd steps (1,3,5) expect DOWN
 	{
 		int8_t numeric = pas_code_to_numeric(assist_code);
 		if (numeric >= 0 && combo_prev_level >= 0 && numeric != combo_prev_level) {
 			systime_t now = chVTGetSystemTimeX();
 			bool is_up = (numeric > combo_prev_level);
-			// Expected direction: even steps = UP, odd steps = DOWN
 			bool expected_up = ((combo_step & 1) == 0);
 
-			if (combo_step > 0 && ST2MS(now - combo_last_time) > OFFROAD_COMBO_TIMEOUT_MS) {
-				combo_step = 0; // Timeout — reset
-			}
+			if (combo_step > 0 && ST2MS(now - combo_last_time) > OFFROAD_COMBO_TIMEOUT_MS)
+				combo_step = 0;
 
 			if (is_up == expected_up) {
 				combo_step++;
 				combo_last_time = now;
-
 				if (combo_step >= OFFROAD_COMBO_LEN) {
 					bool new_mode = !mc_interface_is_offroad_mode();
 					mc_interface_set_offroad_mode(new_mode);
-					commands_printf("Offroad mode %s (U-D-U-D-U-D combo)",
-								   new_mode ? "ON" : "OFF");
 					combo_step = 0;
 				}
 			} else {
-				// Wrong direction — if this was an UP, it could be start of a new sequence
 				combo_step = is_up ? 1 : 0;
 				combo_last_time = now;
 			}
 		}
-		if (numeric >= 0) {
+		if (numeric >= 0)
 			combo_prev_level = numeric;
-		}
 	}
 
 	switch (assist_code) {
@@ -362,8 +345,6 @@ static void serial_display_byte_process(unsigned char byte) {
 					}
 					break;
 				case CMD_WRITE_BASIC:
-					commands_printf("CMD_WRITE_BASIC");
-
 					if ( (serial_buffer.wr_ptr - rd_ptr) < CMD_WRITE_BASIC_LENGTH ) {	//this packet needs 26 bytes
 						break;
 					}
@@ -371,8 +352,6 @@ static void serial_display_byte_process(unsigned char byte) {
 					checksum_addr = rd_ptr + CMD_WRITE_BASIC_LENGTH - 1;
 
 					if(checksum_addr <= serial_buffer.wr_ptr) {	//check the checksum has been received
-						commands_printf("checksum received,calculated: %d    %d",serial_buffer.data[checksum_addr],
-                        		checksum(serial_buffer.data + rd_ptr, CMD_WRITE_BASIC_LENGTH - 1));
 						// check sum
 						if( serial_buffer.data[checksum_addr] ==
 							checksum(serial_buffer.data + rd_ptr, CMD_WRITE_BASIC_LENGTH - 1) ) {
@@ -387,13 +366,7 @@ static void serial_display_byte_process(unsigned char byte) {
 							//write settings to flash memory as motor_0
 							conf_general_store_mc_configuration((mc_configuration*)mcconf, false);
 
-							for(int i = 0; i<=CMD_WRITE_BASIC_LENGTH;i++) {
-								commands_printf("%02x ", serial_buffer.data[rd_ptr + i]);
-							}
-                            
-							serial_buffer.rd_ptr = rd_ptr + CMD_WRITE_BASIC_LENGTH;	//mark bytes as read
 
-							serial_buffer.tx[0] = CMD_WRITE_BASIC;
 							serial_buffer.tx[1] = CMD_WRITE_BASIC_SUCCESS;
 							serial_send_packet(serial_buffer.tx, 2);
 						}
@@ -432,8 +405,6 @@ static void serial_display_byte_process(unsigned char byte) {
 					continue;
 				case CMD_READ_BASIC:
 					{
-					commands_printf("CMD_READ_BASIC");
-
 					volatile mc_configuration *mcconf = (volatile mc_configuration*) mc_interface_get_configuration();
 
 					serial_buffer.tx[0] = 0x52;
@@ -464,9 +435,6 @@ static void serial_display_byte_process(unsigned char byte) {
 					serial_buffer.tx[25] = 0x01;	//speedometer [01 = internal]
 					serial_buffer.tx[26] = checksum(serial_buffer.tx + 2, CMD_READ_BASIC_LENGTH - 3);
 
-					for(int i = 0; i<=CMD_READ_BASIC_LENGTH;i++) {
-						commands_printf("%02x ", serial_buffer.tx[i]);
-					}
 					serial_send_packet(serial_buffer.tx, CMD_READ_BASIC_LENGTH);
 					rd_ptr +=2;
 					serial_buffer.rd_ptr = rd_ptr;

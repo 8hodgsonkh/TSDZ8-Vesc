@@ -98,11 +98,12 @@ void hw_init_gpio(void) {
 	palSetPadMode(GPIOA, 2, PAL_MODE_INPUT_ANALOG);
 	palSetPadMode(GPIOA, 3, PAL_MODE_INPUT_ANALOG);
 	palSetPadMode(GPIOA, 5, PAL_MODE_INPUT_ANALOG);
-	#if defined(HW_USE_PAS2_DIGITAL_EXT2) && defined(HW_PAS2_PORT) && defined(HW_PAS2_PIN)
-		palSetPadMode(HW_PAS2_PORT, HW_PAS2_PIN, PAL_MODE_INPUT_PULLUP);
-	#else
-		palSetPadMode(GPIOA, 6, PAL_MODE_INPUT_ANALOG);
-	#endif
+	palSetPadMode(GPIOA, 6, PAL_MODE_INPUT_ANALOG); // ADC_EXT2 (PA6 freed from PAS)
+
+	// Grab PA13/PA14 (SWD pads) early — kills debug interface, enables pull-ups
+	// before PAS EXTI is configured later by app_pas. Prevents floating inputs.
+	palSetPadMode(HW_PAS1_PORT, HW_PAS1_PIN, PAL_MODE_INPUT_PULLUP); // PA13 SWDIO → PAS Ch.A
+	palSetPadMode(HW_PAS2_PORT, HW_PAS2_PIN, PAL_MODE_INPUT_PULLUP); // PA14 SWCLK → PAS Ch.B
 
 	palSetPadMode(GPIOB, 0, PAL_MODE_INPUT_ANALOG);
 	palSetPadMode(GPIOB, 1, PAL_MODE_INPUT_ANALOG);

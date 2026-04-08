@@ -96,8 +96,7 @@
 #define HW_ADC_INJ_CHANNELS		3
 #define HW_ADC_NBR_CONV			6
 
-// When defined, ADC_EXT2/PA6 is repurposed as a digital PAS input.
-#define HW_USE_PAS2_DIGITAL_EXT2
+// PAS now on PA13/PA14 (SWD pads) — PA6 is free for ADC_EXT2 again.
 
 // ADC Indexes
 #define ADC_IND_SENS1			0
@@ -108,9 +107,7 @@
 #define ADC_IND_CURR3			5
 #define ADC_IND_VIN_SENS		11
 #define ADC_IND_EXT				6
-#ifndef HW_USE_PAS2_DIGITAL_EXT2
 #define ADC_IND_EXT2			7
-#endif
 //#define ADC_IND_EXT3			10
 #define ADC_IND_TEMP_MOS		8
 #define ADC_IND_TEMP_MOS_2		15
@@ -161,11 +158,12 @@
 #define HW_ADC_EXT2_GPIO		GPIOA
 #define HW_ADC_EXT2_PIN			6
 
-// Dual-channel PAS (SPED_A/B)
-#define HW_PAS1_PORT		GPIOB
-#define HW_PAS1_PIN		6
+// Dual-channel PAS on SWD pads (PA13=SWDIO→ChA, PA14=SWCLK→ChB)
+// NOTE: This kills SWD debugging. PB6/PA6 freed for servo/ADC.
+#define HW_PAS1_PORT		GPIOA
+#define HW_PAS1_PIN		13
 #define HW_PAS2_PORT		GPIOA
-#define HW_PAS2_PIN		6
+#define HW_PAS2_PIN		14
 
 // UART Peripheral
 #define HW_UART_DEV				SD3
@@ -193,11 +191,12 @@
 #define HW_ICU_GPIO_AF			GPIO_AF_TIM4
 #define HW_ICU_GPIO				GPIOB
 #define HW_ICU_PIN				6
-#define HW_PAS_PPM_EXTI_PORTSRC	EXTI_PortSourceGPIOB
-#define HW_PAS_PPM_EXTI_PINSRC	EXTI_PinSource6
-#define HW_PAS_PPM_EXTI_LINE		EXTI_Line6
-#define HW_PAS_PPM_EXTI_CH		EXTI9_5_IRQn
-#define HW_PAS_PPM_EXTI_ISR_VEC	EXTI9_5_IRQHandler
+#define HW_PAS_PPM_EXTI_PORTSRC	EXTI_PortSourceGPIOA
+#define HW_PAS_PPM_EXTI_PINSRC	EXTI_PinSource13
+#define HW_PAS_PPM_EXTI_LINE		EXTI_Line13
+#define HW_PAS_PPM_EXTI_CH		EXTI15_10_IRQn
+#define HW_PAS_PPM_EXTI_ISR_VEC	EXTI15_10_IRQHandler
+#define HW_PAS_SEPARATE_EXTI		// PAS EXTI on different vector than encoder
 
 // I2C Peripheral
 #define HW_I2C_DEV				I2CD2

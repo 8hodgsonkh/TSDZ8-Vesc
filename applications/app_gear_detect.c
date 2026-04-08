@@ -124,9 +124,9 @@ int app_gear_detect_get(float speed_kph, int32_t erpm, float duty_cycle, float m
     
     const gear_detection_config *conf = &appconf->gear_detect_conf;
     
-    // Only calculate gear when chain is tensioned (motor current > 10A)
-    // Hardcoded to match freewheel catch chain tension detection threshold
-    bool under_load = (motor_amps > 10.0f);
+    // Only calculate gear when chain is tensioned (motor current > 5A)
+    // Lowered from 10A to catch gear changes during brief load dips mid-shift
+    bool under_load = (motor_amps > 5.0f);
     
     int raw_gear = detect_gear_raw(speed_kph, erpm, conf);
     int display_gear = s_last_gear;
@@ -135,8 +135,8 @@ int app_gear_detect_get(float speed_kph, int32_t erpm, float duty_cycle, float m
         // Under load with valid reading - apply hysteresis
         if (raw_gear == s_pending_gear) {
             s_consecutive_count++;
-            if (s_consecutive_count >= 3) {
-                // 3 consecutive same readings - update
+            if (s_consecutive_count >= 2) {
+                // 2 consecutive same readings - update (was 3, reduced for faster response)
                 display_gear = raw_gear;
                 s_last_gear = raw_gear;
             }
@@ -259,6 +259,26 @@ static float erpm_to_wheel_speed_ms(float erpm, int gear) {
 }
 
 /**
+ * @brief Re-detect gear using magnet speed as ground truth
+ * 
+ * When we have a fresh magnet pulse and ERPM, we can directly solve for the
+ * gear without needing load thresholds or hysteresis — the magnet is truth.
+ * This is called when fused speed disagrees with the magnet sensor.
+ * 
+ * @param magnet_speed_kph  Wheel speed from magnet sensor in km/h
+ * @param erpm              Motor electrical RPM (absolute)
+ * @return                  Detected gear, or 0 if can't determine
+ */
+static int redetect_gear_from_magnet(float magnet_speed_kph, float erpm) {
+    const app_configuration *appconf = app_get_configuration();
+    const gear_detection_config *conf = &appconf->gear_detect_conf;
+    
+    // Use slightly looser tolerance for magnet-based correction
+    // since magnet is 1 pulse/rev and may have some jitter
+    return detect_gear_raw(magnet_speed_kph, (int32_t)erpm, conf);
+}
+
+/**
  * @brief Update fused wheel speed — call every app_adc cycle
  * 
  * Blends magnet sensor (low-res, always-accurate) with ERPM-derived speed
@@ -267,6 +287,7 @@ static float erpm_to_wheel_speed_ms(float erpm, int gear) {
  *   - ERPM + gear = high-frequency interpolation between magnet pulses
  *   - Current threshold determines chain engagement (trust ERPM)
  *   - On each magnet pulse, validate the ERPM-derived speed is sane
+ *   - If speed disagrees, re-detect gear from magnet+ERPM immediately
  * 
  * Result is injected via mc_interface_override_wheel_speed() so all
  * downstream code (telemetry, speed limits, freewheel catch) benefits.
@@ -304,6 +325,39 @@ void app_gear_detect_update_fused_speed(void) {
     const float min_erpm_for_fusion = 300.0f;       // Need some ERPM for meaningful calculation
     const float max_pulse_age_for_trust = 1500;     // If magnet pulse >1.5s old, speed is stale
     
+    // ========================================================================
+    // MAGNET-ANCHORED GEAR CORRECTION
+    // Every fresh magnet pulse is a chance to correct the gear if it's wrong.
+    // This catches gear changes that the load-based detection misses (e.g.
+    // shifting under power where current briefly dips during the shift).
+    // ========================================================================
+    if (magnet_speed_ms > 1.0f && pulse_age_ms < max_pulse_age_for_trust && 
+        erpm > min_erpm_for_fusion && gear > 0) {
+        float erpm_speed_ms = erpm_to_wheel_speed_ms(erpm, gear);
+        float ratio = (erpm_speed_ms > 0.1f) ? (erpm_speed_ms / magnet_speed_ms) : 0.0f;
+        
+        if (ratio < 0.8f || ratio > 1.25f) {
+            // >20% disagreement — current gear is wrong. Re-detect immediately
+            // using magnet speed as ground truth (no load or hysteresis required)
+            float magnet_kph = magnet_speed_ms * 3.6f;
+            int corrected_gear = redetect_gear_from_magnet(magnet_kph, erpm);
+            
+            if (corrected_gear > 0 && corrected_gear != gear) {
+                // Validate: does the corrected gear produce a speed that matches magnet?
+                float corrected_speed = erpm_to_wheel_speed_ms(erpm, corrected_gear);
+                float corrected_ratio = corrected_speed / magnet_speed_ms;
+                
+                if (corrected_ratio > 0.85f && corrected_ratio < 1.18f) {
+                    // Good match — adopt immediately, skip hysteresis
+                    s_last_gear = corrected_gear;
+                    s_pending_gear = corrected_gear;
+                    s_consecutive_count = 3;  // Pre-saturate so normal path doesn't fight us
+                    gear = corrected_gear;    // Use corrected gear for fusion below
+                }
+            }
+        }
+    }
+    
     // Determine if chain is engaged (with hysteresis)
     static bool chain_engaged = false;
     if (motor_current > current_engage_threshold && erpm > min_erpm_for_fusion) {
@@ -318,13 +372,11 @@ void app_gear_detect_update_fused_speed(void) {
         
         if (erpm_speed_ms > 0.1f) {
             // Sanity check against magnet sensor when pulse is fresh
-            // If ERPM-derived speed is wildly different from magnet speed,
-            // the gear might be wrong — fall back to magnet
             bool erpm_sane = true;
             if (magnet_speed_ms > 0.5f && pulse_age_ms < max_pulse_age_for_trust) {
                 float ratio = erpm_speed_ms / magnet_speed_ms;
-                if (ratio < 0.7f || ratio > 1.4f) {
-                    // >30% disagreement — gear is probably wrong or shifting
+                if (ratio < 0.75f || ratio > 1.35f) {
+                    // Still disagrees even after gear correction — maybe mid-shift
                     erpm_sane = false;
                 }
             }
@@ -351,11 +403,11 @@ void app_gear_detect_update_fused_speed(void) {
     if (s_fused_active) {
         if (magnet_speed_ms > 0.1f) {
             // Blend back toward magnet speed over a few cycles
-            float alpha = 0.1f;
+            float alpha = 0.15f;
             s_fused_speed_ms += alpha * (magnet_speed_ms - s_fused_speed_ms);
             
             // Close enough — release override
-            if (fabsf(s_fused_speed_ms - magnet_speed_ms) < 0.2f) {
+            if (fabsf(s_fused_speed_ms - magnet_speed_ms) < 0.3f) {
                 mc_interface_override_wheel_speed(false, 0.0f);
                 s_fused_active = false;
             } else {
