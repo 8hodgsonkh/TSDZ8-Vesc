@@ -32,6 +32,9 @@
 // Stock mcconf is ~550 bytes, hazza adds ~110 bytes = ~660 bytes total
 #define PACKET_MAX_PL_LEN		1024
 
+// Disable Blackmagic probe — SWD pins (PA13/PA14) repurposed for PAS sensor
+#define HAS_BLACKMAGIC				0
+
 // HW properties
 #define HW_HAS_3_SHUNTS
 #define INVERTED_SHUNT_POLARITY
