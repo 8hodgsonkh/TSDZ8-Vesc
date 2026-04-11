@@ -34,6 +34,7 @@
 #include "app_gear_detect.h"
 #include "terminal.h"
 #include "commands.h"
+#include "imu.h"
 #include <math.h>
 
 // Settings
@@ -102,12 +103,222 @@ static volatile bool cc_override = false;
 static volatile bool range_ok = true;
 
 // =============================================================================
+// WHEELIE BALANCE MODE
+// IMU-gated duty cycle control for sustained wheelies.
+// PID runs here at ADC thread rate (1kHz). ESP32 sends enable/disable/config.
+// =============================================================================
+typedef struct {
+	bool     enabled;          // Wheelie mode activated from ESP32
+	bool     active;           // PID actively controlling (pitch in balance zone)
+	bool     bail_triggered;   // Over-rotation cutoff fired
+	float    target_pitch;     // Desired pitch angle (degrees)
+	float    pitch;            // Current corrected pitch
+	float    gyro_pitch;       // Pitch angular rate (deg/s)
+	float    duty_output;      // PID output → duty cycle
+
+	// PID gains
+	float    kp;
+	float    ki;
+	float    kd;
+	float    integral;         // Accumulated integral
+	float    prev_error;       // For derivative (fallback)
+
+	// Safety limits
+	float    max_duty;         // Absolute max duty output
+	float    bail_angle;       // Motor kill above this angle
+	float    min_angle;        // PID only engages above this
+	float    integral_limit;   // Anti-windup clamp
+
+	// IMU zero calibration — "set current orientation as level"
+	float    pitch_offset;     // Subtracted from raw imu_get_pitch()
+	float    roll_offset;      // Subtracted from raw imu_get_roll()
+	bool     offset_valid;     // True after calibration
+
+	// Telemetry rate limiting
+	uint32_t telem_counter;    // Counts ADC cycles for 20Hz TX
+} wheelie_ctx_t;
+
+static wheelie_ctx_t wheelie = {
+	.enabled        = false,
+	.active         = false,
+	.bail_triggered = false,
+	.target_pitch   = 40.0f,
+	.pitch          = 0.0f,
+	.gyro_pitch     = 0.0f,
+	.duty_output    = 0.0f,
+	.kp             = 0.02f,
+	.ki             = 0.001f,
+	.kd             = 0.005f,
+	.integral        = 0.0f,
+	.prev_error     = 0.0f,
+	.max_duty       = 0.5f,
+	.bail_angle     = 60.0f,
+	.min_angle      = 15.0f,
+	.integral_limit = 0.3f,
+	.pitch_offset   = 0.0f,
+	.roll_offset    = 0.0f,
+	.offset_valid   = false,
+	.telem_counter  = 0,
+};
+
+// =============================================================================
 // ASSIST LEVEL SYSTEM
 // Level 1-5: Power multiplier (20%, 40%, 60%, 80%, 100%)
 // In street mode: Also apply 250W motor power limit
 // In offroad mode: Level 5 = full power (VESC limits), 1-4 = multiplied
 // =============================================================================
 static volatile uint8_t assist_level = 5;  // Default to full power
+
+// ── Wheelie mode public API ──
+static void wheelie_reset_pid(void) {
+	wheelie.integral = 0.0f;
+	wheelie.prev_error = 0.0f;
+	wheelie.duty_output = 0.0f;
+	wheelie.active = false;
+	wheelie.bail_triggered = false;
+	wheelie.telem_counter = 0;
+}
+
+void app_adc_wheelie_enable(bool enable) {
+	wheelie_reset_pid();
+	wheelie.enabled = enable;
+}
+
+void app_adc_wheelie_set_target(float angle_deg) {
+	if (angle_deg >= 10.0f && angle_deg <= 80.0f)
+		wheelie.target_pitch = angle_deg;
+}
+
+void app_adc_wheelie_set_pid(float kp, float ki, float kd) {
+	wheelie.kp = kp;
+	wheelie.ki = ki;
+	wheelie.kd = kd;
+}
+
+void app_adc_wheelie_set_max_duty(float duty) {
+	if (duty >= 0.05f && duty <= 0.95f)
+		wheelie.max_duty = duty;
+}
+
+void app_adc_wheelie_set_bail(float angle_deg) {
+	if (angle_deg >= 20.0f && angle_deg <= 85.0f)
+		wheelie.bail_angle = angle_deg;
+}
+
+void app_adc_wheelie_calibrate_zero(void) {
+	// Sample current IMU orientation and store as zero reference
+	wheelie.pitch_offset = imu_get_pitch();
+	wheelie.roll_offset = imu_get_roll();
+	wheelie.offset_valid = true;
+}
+
+// ── Wheelie governor (called from ADC thread @ 1kHz) ──
+// Returns a duty ceiling [0..1] that limits the throttle output.
+// 1.0 = no limiting (full throttle available)
+// 0.0 = motor cut (bail safety)
+static float wheelie_get_pitch(void) {
+	float raw = imu_get_pitch();
+	if (wheelie.offset_valid) raw -= wheelie.pitch_offset;
+	return raw;
+}
+
+static void wheelie_send_telemetry(void) {
+	// Send at ~20Hz (every 50 ADC cycles at 1kHz)
+	wheelie.telem_counter++;
+	if (wheelie.telem_counter < 50) return;
+	wheelie.telem_counter = 0;
+
+	// Format: [H][W][pitch_hi][pitch_lo][gyro_hi][gyro_lo][duty_hi][duty_lo][flags]
+	uint8_t buf[9];
+	buf[0] = 0x48;  // 'H'
+	buf[1] = 0x57;  // 'W'
+	int16_t pitch_i16 = (int16_t)(wheelie.pitch * 100.0f);
+	int16_t gyro_i16  = (int16_t)(wheelie.gyro_pitch * 100.0f);
+	uint16_t duty_u16 = (uint16_t)(wheelie.duty_output * 1000.0f);
+	buf[2] = (uint8_t)(pitch_i16 >> 8);
+	buf[3] = (uint8_t)(pitch_i16 & 0xFF);
+	buf[4] = (uint8_t)(gyro_i16 >> 8);
+	buf[5] = (uint8_t)(gyro_i16 & 0xFF);
+	buf[6] = (uint8_t)(duty_u16 >> 8);
+	buf[7] = (uint8_t)(duty_u16 & 0xFF);
+	buf[8] = (wheelie.enabled ? 0x01 : 0x00)
+	       | (wheelie.active  ? 0x02 : 0x00)
+	       | (wheelie.bail_triggered ? 0x04 : 0x00)
+	       | (wheelie.offset_valid ? 0x08 : 0x00);
+	commands_send_app_data(buf, 9);
+}
+
+static void wheelie_process(float dt) {
+	if (!wheelie.enabled) return;
+
+	// Read IMU
+	wheelie.pitch = wheelie_get_pitch();
+	float gyro[3];
+	imu_get_gyro(gyro);
+	wheelie.gyro_pitch = gyro[1];  // Y-axis = pitch rate
+
+	// Send telemetry at 20Hz when wheelie mode is active
+	wheelie_send_telemetry();
+
+	// ── Compute duty ceiling (governor) ──
+	// Below min_angle: full throttle available (ceiling = max_duty)
+	// min_angle → target: throttle progressively limited
+	// target → bail: ceiling drops toward zero
+	// Above bail: instant motor cut
+	//
+	// Gyro damping: if pitch is rising fast, reduce ceiling earlier
+	// (prevents overshoot from momentum)
+
+	float ceiling;
+
+	if (wheelie.pitch > wheelie.bail_angle) {
+		// BAIL — instant motor cut
+		wheelie.bail_triggered = true;
+		wheelie.active = true;
+		ceiling = 0.0f;
+	} else if (wheelie.bail_triggered) {
+		// Stay bailed until pitch drops below target
+		if (wheelie.pitch < wheelie.target_pitch * 0.8f) {
+			wheelie.bail_triggered = false;
+		}
+		ceiling = 0.0f;
+	} else if (wheelie.pitch < wheelie.min_angle) {
+		// Below the zone — full throttle, no limiting
+		wheelie.active = false;
+		ceiling = wheelie.max_duty;
+	} else {
+		// In the wheelie zone — governor active
+		wheelie.active = true;
+
+		if (wheelie.pitch <= wheelie.target_pitch) {
+			// min_angle → target: linearly reduce ceiling from max_duty to a hold value
+			// Hold value = enough duty to sustain the wheelie (~30% of max)
+			float hold_duty = wheelie.max_duty * 0.3f;
+			float t = (wheelie.pitch - wheelie.min_angle) / (wheelie.target_pitch - wheelie.min_angle);
+			ceiling = wheelie.max_duty - t * (wheelie.max_duty - hold_duty);
+		} else {
+			// target → bail: ceiling drops from hold value toward zero
+			float hold_duty = wheelie.max_duty * 0.3f;
+			float t = (wheelie.pitch - wheelie.target_pitch) / (wheelie.bail_angle - wheelie.target_pitch);
+			ceiling = hold_duty * (1.0f - t);
+		}
+
+		// Gyro damping: if pitch is rising fast, reduce ceiling further
+		// (prevents overshoot from momentum before angle actually reaches limit)
+		if (wheelie.gyro_pitch > 0.0f) {
+			// gyro_pitch in deg/s — subtract proportionally from ceiling
+			float gyro_reduction = wheelie.gyro_pitch * wheelie.kd;
+			ceiling -= gyro_reduction;
+		}
+	}
+
+	// Clamp ceiling
+	if (ceiling < 0.0f) ceiling = 0.0f;
+	if (ceiling > wheelie.max_duty) ceiling = wheelie.max_duty;
+
+	// Store for the caller to apply to throttle output
+	wheelie.duty_output = ceiling;
+}
 
 // Get current assist level (1-5)
 uint8_t app_adc_get_assist_level(void) {
@@ -420,6 +631,8 @@ void app_adc_set_torque_cal(uint16_t offset, uint16_t adc_max) { (void)offset; (
 #endif // HAZ_TORQUE_UART_DIRECT
 
 // ERPM-tracking PAS duty - motor matches cadence through drivetrain
+// New design: torque adds a LEAD OFFSET rather than modulating ramp rate.
+// Flat zone for consistent cruising, linear ramp to max offset above that.
 static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	if (!conf->haz_pas_duty_enabled) {
 		haz_pas_duty_ctx.duty_cmd = 0.0f;
@@ -446,67 +659,35 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 	float gear_ratio = appconf->gear_detect_conf.internal_ratio;
 	if (!isfinite(gear_ratio) || gear_ratio <= 0.0f) gear_ratio = 38.0f;
 
-	// Config params — dual-purpose fields depending on torque mode:
-	//
-	// TORQUE MODE ON (haz_torque_enabled):
-	//   ramp_up      → Max duty ramp rate at full torque (duty/s)
-	//   ramp_down    → Ramp down rate when torque released (duty/s)
-	//   accel_gain   → (unused in torque mode)
-	//   load_gain    → (unused in torque mode)
-	//   lead_pct     → Cadence lead: 0=0.50×, 1.0=1.0×, 2.0=1.50× cadence
-	//   Cadence base tracks instantly (no ramp). Torque controls how fast
-	//   duty ramps above cadence base. strength scales the ramp rate.
-	//
-	// TORQUE MODE OFF (cadence inference):
-	//   ramp_up/down → duty/s slew rate limits
-	//   accel_gain   → Cadence accel boost strength
-	//   load_gain    → Load/current boost strength
-	//   lead_pct     → Lead %: 0-2 → 1.0-1.20 lead factor
+	// Config params
 	const float ramp_up = fmaxf(conf->haz_pas_duty_ramp_up, 0.05f);
 	const float ramp_down = fmaxf(conf->haz_pas_duty_ramp_down, 0.05f);
-	const float accel_gain = fmaxf(conf->haz_pas_duty_accel_gain, 0.0f);
-	const float load_gain = fmaxf(conf->haz_pas_duty_load_gain, 0.0f);
-
-	// Lead factor: different mapping depending on torque mode
-	float lead_raw = conf->haz_pas_duty_lead_pct;
-	if (lead_raw < 0.0f) lead_raw = 0.0f;
-	if (lead_raw > 2.0f) lead_raw = 2.0f;
-	float lead_factor;
-	if (conf->haz_torque_enabled) {
-		// Torque mode: 0→0.50, 1→1.00, 2→1.50
-		// Full range: motor can lag at half cadence or lead at 150%
-		lead_factor = 0.50f + lead_raw * 0.50f;
-	} else {
-		// Cadence mode: 0→1.00, 2→1.20 (original behavior)
-		lead_factor = 1.0f + lead_raw * 0.10f;
-	}
 	const float idle_timeout = fmaxf(conf->haz_pas_duty_idle_timeout, 0.1f);
+
+	// Lead factor: direct multiplier on cadence-to-ERPM
+	// 0.85 = motor runs at 85% of cadence speed, 1.0 = matched, 1.2 = 20% ahead
+	float lead_pct = conf->haz_pas_duty_lead_pct;
+	if (lead_pct < 0.0f) lead_pct = 0.0f;
+	if (lead_pct > 2.0f) lead_pct = 2.0f;
 
 	// ERPM→duty conversion factor from motor physics:
 	// duty = ERPM × lambda × sqrt(3) × 2π / (v_bus × 60)
-	// This auto-adjusts for battery voltage — no max_erpm setting needed.
 	const float erpm_to_duty = (lambda * 1.7320508f * 6.2831853f) / (v_bus * 60.0f);
 
 	// ========== SPEED LIMIT CHECK (STREET MODE ONLY) ==========
-	// PAS cuts off at 15.5 mph in STREET MODE only
-	// Offroad mode has no PAS speed limit
 	float wheel_speed = fabsf(mc_interface_get_speed());
 	float speed_power_scale = 1.0f;
-	
+
 	if (!mc_interface_is_offroad_mode()) {
-		// Street mode - apply 15.5 mph limit
-		const float pas_speed_limit_ms = 15.5f * 0.44704f;  // mph to m/s
-		const float pas_speed_taper_start = pas_speed_limit_ms * 0.90f;  // Start tapering at 90%
-		
+		const float pas_speed_limit_ms = 15.5f * 0.44704f;
+		const float pas_speed_taper_start = pas_speed_limit_ms * 0.90f;
+
 		if (wheel_speed >= pas_speed_limit_ms) {
-			// At or above limit - zero power
 			speed_power_scale = 0.0f;
 		} else if (wheel_speed > pas_speed_taper_start) {
-			// In taper zone - smooth reduction
 			speed_power_scale = (pas_speed_limit_ms - wheel_speed) / (pas_speed_limit_ms - pas_speed_taper_start);
 		}
-		
-		// If over speed limit, force ramp down to zero
+
 		if (speed_power_scale <= 0.0f) {
 			haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
 			if (haz_pas_duty_ctx.duty_cmd < 0.0f) haz_pas_duty_ctx.duty_cmd = 0.0f;
@@ -514,55 +695,37 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		}
 	}
 
-	// Idle detection: time since last real PAS edge from ISR timestamps.
-	// No LP filter lag — edge arrives = instant not-idle, no edge = instant idle.
-	// Uses the config idle_timeout for the dead time threshold.
+	// Idle detection
 	bool is_idle = (app_pas_get_time_since_real_step() > idle_timeout);
 
-	// Get pedal RPM with optional MEDIAN FILTER (outlier rejection)
-	// Tunable via VESC Tool:
-	// - PAS Duty: Smoothing (smoothing): 0.0=raw, 1.0=max smooth
-	// - PAS Duty: Median Filter (median_filter): 0=off, 1=latest, 3-11=median
-	
-	// Median buffer size: direct integer from setting (0-11)
-	int buf_size = (int)(conf->haz_pas_duty_median_filter + 0.5f);  // round
+	// ========== CADENCE INPUT: MEDIAN FILTER + INTERPOLATION ==========
+	int buf_size = (int)(conf->haz_pas_duty_median_filter + 0.5f);
 	if (buf_size < 0) buf_size = 0;
 	if (buf_size > 11) buf_size = 11;
-	
-	// Target smoothing: 0.0 = instant tracking, 1.0 = maximum smooth
-	// Repurposed: filters the cadence DUTY TARGET (floor for torque boost)
-	// rather than the cadence RPM input. PAS already LP-filters RPM in app_pas.c.
-	float smoothing = conf->haz_pas_duty_smoothing;
-	if (smoothing < 0.0f) smoothing = 0.0f;
-	if (smoothing > 1.0f) smoothing = 1.0f;
-	float target_lp_factor = (smoothing < 0.01f) ? 1.0f : (1.0f - smoothing * 0.99f);
-	
+
 	// Fixed 11-element ring buffer
 	static float rpm_buffer[11] = {0};
 	static int rpm_idx = 0;
 	static int buf_filled = 0;
-	
+
 	float pedal_rpm_raw = app_pas_get_pedal_rpm();
 	rpm_buffer[rpm_idx] = pedal_rpm_raw;
 	rpm_idx = (rpm_idx + 1) % 11;
 	if (buf_filled < 11) buf_filled++;
-	
+
 	float pedal_rpm;
 	if (buf_size <= 1) {
-		// 0 or 1 = no median, use raw (or latest) value directly
 		pedal_rpm = pedal_rpm_raw;
 	} else {
-		// Median filter with buf_size samples
 		int samples_to_use = (buf_filled < buf_size) ? buf_filled : buf_size;
-		if (samples_to_use < 3) samples_to_use = 3;  // median needs at least 3
-		
+		if (samples_to_use < 3) samples_to_use = 3;
+
 		float sorted[11];
 		for (int i = 0; i < samples_to_use; i++) {
 			int idx = (rpm_idx - 1 - i + 11) % 11;
 			sorted[i] = rpm_buffer[idx];
 		}
-		
-		// Insertion sort
+
 		for (int i = 1; i < samples_to_use; i++) {
 			float key = sorted[i];
 			int j = i - 1;
@@ -572,17 +735,13 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 			}
 			sorted[j + 1] = key;
 		}
-		
+
 		pedal_rpm = sorted[samples_to_use / 2];
 	}
-	
+
 	// Cadence: linear interpolation between PAS edges
-	// Instead of holding stale RPM for 25+ cycles between edges,
-	// smoothly ramp from previous cadence to current cadence over
-	// the expected edge period. Same approach as haz_pas_follow_process().
 	float edge_period = app_pas_get_step_period();
 
-	// Detect new PAS edge: raw RPM changed
 	if (fabsf(pedal_rpm - haz_pas_duty_ctx.interp_last_raw) > 0.5f) {
 		haz_pas_duty_ctx.interp_prev_rpm = haz_pas_duty_ctx.cadence_smooth;
 		haz_pas_duty_ctx.interp_next_rpm = pedal_rpm;
@@ -591,221 +750,137 @@ static float haz_pas_duty_process(volatile adc_config *conf, float dt_s) {
 		haz_pas_duty_ctx.interp_last_raw = pedal_rpm;
 	}
 
-	// Advance interpolation
 	haz_pas_duty_ctx.interp_elapsed += dt_s;
 	float interp_t = haz_pas_duty_ctx.interp_elapsed / haz_pas_duty_ctx.interp_period;
 	if (interp_t > 1.0f) interp_t = 1.0f;
 	if (!isfinite(interp_t) || haz_pas_duty_ctx.interp_period < 0.001f) interp_t = 1.0f;
 
-	haz_pas_duty_ctx.cadence_smooth =
+	float cadence_interp =
 		haz_pas_duty_ctx.interp_prev_rpm +
 		(haz_pas_duty_ctx.interp_next_rpm - haz_pas_duty_ctx.interp_prev_rpm) * interp_t;
 
-	// ========== ERPM-TRACKING + TORQUE-CONTROLLED RAMP ==========
-	//
-	// TORQUE MODE (haz_torque_enabled):
-	//   Cadence sets base duty (instant tracking, no ramp).
-	//   Torque controls ramp rate above cadence base:
-	//     ramp_rate = shaped_torque × strength × ramp_up (duty/s)
-	//   While stomping: duty ramps up at that rate.
-	//   On release: duty ramps down at ramp_down back to cadence base.
-	//   Never below cadence base, never above max_duty.
-	//
-	// CADENCE INFERENCE MODE (no torque sensor):
-	//   Original behavior — accel/load signals modulate lead factor.
-	//
-	static float smooth_accel_mult = 0.0f;
-	static float smooth_load_mult = 0.0f;
-	static float prev_event_period = 0.0f;
-	static uint32_t prev_step_count = 0;
-	static float accel_rate_smooth = 0.0f;
+	// Cadence LP filter (haz_pas_duty_cadence_smoothing)
+	float cad_smooth = conf->haz_pas_duty_cadence_smoothing;
+	if (cad_smooth < 0.0f) cad_smooth = 0.0f;
+	if (cad_smooth > 1.0f) cad_smooth = 1.0f;
+	float cad_lp = (cad_smooth < 0.01f) ? 1.0f : (1.0f - cad_smooth * 0.99f);
+	UTILS_LP_FAST(haz_pas_duty_ctx.cadence_smooth, cadence_interp, cad_lp);
+
+	// ========== TORQUE OFFSET ==========
+	// Torque adds a lead offset: effective_lead = lead_pct + torque_offset
+	// torque_offset ranges from min_offset (flat zone) to max_offset
+	float torque_offset = 0.0f;
+
+	if (conf->haz_pas_duty_torque_enabled) {
+		// Read torque sensor data
+		systime_t torque_age = chVTTimeElapsedSinceX(s_ext_torque_ts);
+		float torque_age_s = (float)torque_age / (float)CH_CFG_ST_FREQUENCY;
+		float torque_timeout = fmaxf(conf->haz_pas_duty_torque_idle_timeout, 0.1f);
+
+		float torque_frac = 0.0f;  // 0-1 normalized torque
+		if (torque_age_s < torque_timeout && s_ext_torque > 0) {
+			torque_frac = (float)s_ext_torque / 160.0f;
+		}
+
+		// Cadence-synced torque averaging: average torque over N cadence pulses
+		// This syncs torque response with pedal rhythm for natural feel
+		static float torque_pulse_accum = 0.0f;   // Running sum of torque samples
+		static int torque_pulse_samples = 0;       // Samples in current accumulation
+		static uint32_t torque_pulse_last_step = 0; // Last step count
+		static int torque_pulse_count = 0;         // Cadence pulses since last average
+		static float torque_cadence_avg = 0.0f;    // Output: averaged torque
+
+		int avg_pulses = (int)(conf->haz_pas_duty_torque_cadence_avg + 0.5f);
+		if (avg_pulses < 0) avg_pulses = 0;
+		if (avg_pulses > 20) avg_pulses = 20;
+
+		if (avg_pulses > 0) {
+			// Accumulate torque samples every tick
+			torque_pulse_accum += torque_frac;
+			torque_pulse_samples++;
+
+			// Check for new cadence pulse
+			uint32_t cur_steps = app_pas_get_step_count();
+			if (cur_steps != torque_pulse_last_step) {
+				torque_pulse_count += (int)(cur_steps - torque_pulse_last_step);
+				torque_pulse_last_step = cur_steps;
+			}
+
+			// After N cadence pulses, compute average and reset
+			if (torque_pulse_count >= avg_pulses && torque_pulse_samples > 0) {
+				torque_cadence_avg = torque_pulse_accum / (float)torque_pulse_samples;
+				torque_pulse_accum = 0.0f;
+				torque_pulse_samples = 0;
+				torque_pulse_count = 0;
+			}
+
+			torque_frac = torque_cadence_avg;
+		}
+
+		// LP filter on torque signal
+		float t_smooth = conf->haz_pas_duty_torque_smoothing;
+		if (t_smooth < 0.0f) t_smooth = 0.0f;
+		if (t_smooth > 1.0f) t_smooth = 1.0f;
+		float t_lp = (t_smooth < 0.01f) ? 1.0f : (1.0f - t_smooth * 0.99f);
+		UTILS_LP_FAST(s_ext_torque_smooth, torque_frac, t_lp);
+		float torque_in = fmaxf(s_ext_torque_smooth, 0.0f);
+		if (torque_in > 1.0f) torque_in = 1.0f;
+
+		// Flat zone + linear ramp to max offset
+		float flat_zone = conf->haz_pas_duty_torque_flat_zone;
+		if (flat_zone < 0.0f) flat_zone = 0.0f;
+		if (flat_zone > 1.0f) flat_zone = 1.0f;
+		float max_input = conf->haz_pas_duty_torque_max_input;
+		if (max_input < 0.01f) max_input = 0.01f;
+		if (max_input > 1.0f) max_input = 1.0f;
+		float min_off = fmaxf(conf->haz_pas_duty_torque_min_offset, 0.0f);
+		float max_off = fmaxf(conf->haz_pas_duty_torque_max_offset, min_off);
+
+		if (torque_in <= 0.001f) {
+			// No torque: no offset
+			torque_offset = 0.0f;
+		} else if (torque_in <= flat_zone) {
+			// In flat zone: constant min_offset (ez cruising)
+			torque_offset = min_off;
+		} else if (torque_in >= max_input) {
+			// At/above max input: full max_offset
+			torque_offset = max_off;
+		} else {
+			// Linear ramp from min_offset to max_offset
+			float t = (torque_in - flat_zone) / (max_input - flat_zone);
+			torque_offset = min_off + (max_off - min_off) * t;
+		}
+	}
+
+	// ========== COMPUTE TARGET DUTY ==========
 	float target_duty = 0.0f;
 	if (!is_idle && haz_pas_duty_ctx.cadence_smooth > 3.0f) {
+		// Effective lead = base lead + torque offset
+		float effective_lead = lead_pct + torque_offset;
 
-		if (conf->haz_torque_enabled) {
-			// ========== TORQUE SENSOR MODE ==========
-			// Read torque sensor
-			systime_t torque_age = chVTTimeElapsedSinceX(s_ext_torque_ts);
-			float torque_age_s = (float)torque_age / (float)CH_CFG_ST_FREQUENCY;
-			float torque_timeout = fmaxf(conf->haz_torque_idle_timeout, 0.1f);
-
-			float torque_frac = 0.0f;  // 0-1 normalized torque
-			if (torque_age_s < torque_timeout && s_ext_torque > 0) {
-				torque_frac = (float)s_ext_torque / 160.0f;
-			}
-
-			float start_thresh = conf->haz_torque_start_threshold / 160.0f;
-			if (torque_frac < start_thresh) torque_frac = 0.0f;
-
-			// LP filter (haz_torque_smoothing)
-			float t_smooth = fmaxf(conf->haz_torque_smoothing, 0.0f);
-			if (t_smooth > 0.99f) t_smooth = 0.99f;
-			float t_lp = (t_smooth < 0.01f) ? 1.0f : (1.0f - t_smooth * 0.99f);
-			UTILS_LP_FAST(s_ext_torque_smooth, torque_frac, t_lp);
-
-			// Expo shaping (responsiveness curve)
-			float resp = fmaxf(conf->haz_torque_responsiveness, 0.0f);
-			if (resp > 2.0f) resp = 2.0f;
-			float x = fmaxf(s_ext_torque_smooth, 0.0f);
-			if (x > 1.0f) x = 1.0f;
-			float shaped;
-			if (resp < 0.5f) {
-				shaped = x * x;
-			} else if (resp > 1.5f) {
-				shaped = sqrtf(x);
-			} else {
-				float blend = (resp - 0.5f);
-				shaped = (x * x) * (1.0f - blend)
-				       + sqrtf(fmaxf(x, 0.0f)) * blend;
-			}
-
-			// Torque → ramp rate (duty/s)
-			// Full stomp (shaped=1) at strength=1: ramp at ramp_up duty/s
-			// Light touch (shaped=0.3) at strength=2: ramp at 0.6 × ramp_up duty/s
-			float strength = fmaxf(conf->haz_torque_strength, 0.1f);
-			if (strength > 5.0f) strength = 5.0f;
-			float torque_ramp = shaped * strength * ramp_up;
-
-			// Cadence base duty — compute raw, then LP-filter the TARGET
-			// This smooths what the torque sensor boosts off of.
-			// Smoothing setting controls this filter, not the cadence input.
-			float base_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * lead_factor;
-			float cadence_duty_raw = base_erpm * erpm_to_duty;
-			cadence_duty_raw *= speed_power_scale;
-			if (cadence_duty_raw > max_duty) cadence_duty_raw = max_duty;
-			if (cadence_duty_raw < 0.0f) cadence_duty_raw = 0.0f;
-			static float cadence_duty_smooth = 0.0f;
-			UTILS_LP_FAST(cadence_duty_smooth, cadence_duty_raw, target_lp_factor);
-			float cadence_duty = cadence_duty_smooth;
-
-			// Ramp: torque active → climb, released → fall back to cadence
-			if (torque_ramp > 0.001f) {
-				haz_pas_duty_ctx.duty_cmd += torque_ramp * dt_s;
-			} else {
-				haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
-			}
-
-			// Clamp: never below cadence base, never above max
-			if (haz_pas_duty_ctx.duty_cmd < cadence_duty) {
-				haz_pas_duty_ctx.duty_cmd = cadence_duty;
-			}
-			if (haz_pas_duty_ctx.duty_cmd > max_duty) {
-				haz_pas_duty_ctx.duty_cmd = max_duty;
-			}
-
-			target_duty = haz_pas_duty_ctx.duty_cmd;
-
-		} else {
-			// ========== CADENCE INFERENCE MODE (no torque sensor) ==========
-			float assist_extra = 0.0f;
-			{
-
-		// === CADENCE ACCEL SIGNAL (period-based, LP-filtered) ===
-		float event_period = app_pas_get_event_period();
-		uint32_t cur_step_count = app_pas_get_step_count();
-		float raw_rpm_rate = 0.0f;
-
-		if (cur_step_count != prev_step_count && prev_event_period > 1e-4f && event_period > 1e-4f) {
-			float magnets = fmaxf(1.0f, (float)appconf->app_pas_conf.magnets);
-			float delta_rpm = (60.0f / magnets) * (1.0f/event_period - 1.0f/prev_event_period);
-			raw_rpm_rate = delta_rpm / event_period;  // RPM/s
-			prev_event_period = event_period;
-			prev_step_count = cur_step_count;
-		} else if (cur_step_count != prev_step_count) {
-			prev_event_period = event_period;
-			prev_step_count = cur_step_count;
-		}
-
-		// Heavy LP filter on rpm_rate — τ ≈ 300ms at 1kHz (kills spikes)
-		if (raw_rpm_rate > 0.0f) {
-			UTILS_LP_FAST(accel_rate_smooth, raw_rpm_rate, 0.01f);
-		} else {
-			accel_rate_smooth *= 0.995f;
-		}
-
-		float accel_target = accel_rate_smooth * accel_gain * 0.01f;
-		if (accel_target > 0.30f) accel_target = 0.30f;
-		if (accel_target < 0.0f) accel_target = 0.0f;
-
-		float accel_ramp = 0.5f * dt_s;
-		if (accel_target > smooth_accel_mult) {
-			smooth_accel_mult += fminf(accel_ramp, accel_target - smooth_accel_mult);
-		} else {
-			smooth_accel_mult += (accel_target - smooth_accel_mult) * 4.0f * dt_s;
-		}
-
-		// === LOAD SIGNAL (current-based effort proxy) ===
-		float motor_current = fabsf(mc_interface_get_tot_current_filtered());
-		float max_current = mcconf->l_current_max;
-		if (max_current < 1.0f) max_current = 30.0f;
-		float load_fraction = motor_current / max_current;
-		if (load_fraction > 1.0f) load_fraction = 1.0f;
-
-		float base_target_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * lead_factor;
-
-		float actual_erpm = fabsf(mc_interface_get_rpm());
-		float overshoot_ratio = 0.0f;
-		if (base_target_erpm > 100.0f) {
-			overshoot_ratio = (actual_erpm - base_target_erpm) / base_target_erpm;
-		}
-		float overshoot_scale = 1.0f - (overshoot_ratio * 5.0f);
-		if (overshoot_scale > 1.0f) overshoot_scale = 1.0f;
-		if (overshoot_scale < 0.0f) overshoot_scale = 0.0f;
-
-		float load_target = 0.0f;
-		if (load_fraction > 0.10f && load_gain > 0.01f) {
-			load_target = load_fraction * 0.20f * load_gain * overshoot_scale;
-			if (load_target > 0.20f) load_target = 0.20f;
-		}
-
-		float load_ramp = 0.4f * dt_s;
-		if (load_target > smooth_load_mult) {
-			smooth_load_mult += fminf(load_ramp, load_target - smooth_load_mult);
-		} else {
-			smooth_load_mult += (load_target - smooth_load_mult) * 6.0f * dt_s;
-		}
-		if (smooth_load_mult < 0.0f) smooth_load_mult = 0.0f;
-
-		assist_extra = smooth_accel_mult + smooth_load_mult;
-		if (assist_extra > 0.40f) assist_extra = 0.40f;
-
-		} // end cadence inference
-
-		float effective_lead = lead_factor * (1.0f + assist_extra);
 		float target_erpm = haz_pas_duty_ctx.cadence_smooth * gear_ratio * pole_pairs * effective_lead;
-
-		// Convert ERPM to duty using physics (voltage-independent)
 		target_duty = target_erpm * erpm_to_duty;
-
-		// Apply speed limit (street mode)
 		target_duty *= speed_power_scale;
 
 		if (target_duty > max_duty) target_duty = max_duty;
 		if (target_duty < 0.0f) target_duty = 0.0f;
-
-		// Cadence inference mode: use standard ramp
-		if (target_duty > haz_pas_duty_ctx.duty_cmd) {
-			haz_pas_duty_ctx.duty_cmd += ramp_up * dt_s;
-			if (haz_pas_duty_ctx.duty_cmd > target_duty)
-				haz_pas_duty_ctx.duty_cmd = target_duty;
-		} else {
-			haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
-			if (haz_pas_duty_ctx.duty_cmd < target_duty)
-				haz_pas_duty_ctx.duty_cmd = target_duty;
-		}
-		target_duty = haz_pas_duty_ctx.duty_cmd;
-
-		} // end cadence inference mode
 	}
 
-	// Final output
-	haz_pas_duty_ctx.duty_cmd = target_duty;
+	// ========== RAMP TO TARGET ==========
+	if (target_duty > haz_pas_duty_ctx.duty_cmd) {
+		haz_pas_duty_ctx.duty_cmd += ramp_up * dt_s;
+		if (haz_pas_duty_ctx.duty_cmd > target_duty)
+			haz_pas_duty_ctx.duty_cmd = target_duty;
+	} else {
+		haz_pas_duty_ctx.duty_cmd -= ramp_down * dt_s;
+		if (haz_pas_duty_ctx.duty_cmd < target_duty)
+			haz_pas_duty_ctx.duty_cmd = target_duty;
+	}
 
 	// Clamp
 	if (haz_pas_duty_ctx.duty_cmd < 0.0f) haz_pas_duty_ctx.duty_cmd = 0.0f;
 	if (haz_pas_duty_ctx.duty_cmd > max_duty) haz_pas_duty_ctx.duty_cmd = max_duty;
 
-	// Update previous cadence for next cycle's acceleration detection
 	haz_pas_duty_ctx.cadence_prev = haz_pas_duty_ctx.cadence_smooth;
 
 	return haz_pas_duty_ctx.duty_cmd;
@@ -1373,31 +1448,24 @@ static float haz_pas_follow_process(float dt_s) {
 
 static float s_direct_torque_current = 0.0f;    // Ramped output current (A)
 static float s_direct_torque_smooth = 0.0f;     // LP-filtered torque (0-1)
+static float s_stride_peak = 0.0f;              // Peak-hold for stride smoothing
 
 static void haz_direct_torque_reset(void) {
 	s_direct_torque_current = 0.0f;
 	s_direct_torque_smooth = 0.0f;
-}
-
-// 3-point piecewise linear curve.  Below in_low = 0, above in_high = out_high.
-static float haz_torque_curve_3pt(float x,
-		float in_low, float out_low,
-		float in_mid, float out_mid,
-		float in_high, float out_high) {
-	if (x <= in_low) return 0.0f;
-	if (x <= in_mid) {
-		float t = (x - in_low) / fmaxf(in_mid - in_low, 0.001f);
-		return out_low + t * (out_mid - out_low);
-	}
-	if (x <= in_high) {
-		float t = (x - in_mid) / fmaxf(in_high - in_mid, 0.001f);
-		return out_mid + t * (out_high - out_mid);
-	}
-	return out_high;
+	s_stride_peak = 0.0f;
 }
 
 // Returns > 0 if direct torque is active (motor already commanded).
 // Returns <= 0 if inactive — caller should fall through to Speed PID or release.
+//
+// Field mapping (repurposed from old 3-point curve):
+//   in_low   = deadzone       (0-0.5)   Min torque to engage
+//   out_low  = min_current_pct (0-0.3)  Base current fraction at deadzone edge
+//   in_mid   = response_curve (0.2-3.0) Power exponent (<1 generous, 1 linear, >1 progressive)
+//   out_mid  = stride_hold    (0-2.0s)  Peak-hold decay time constant
+//   in_high  = stride_blend   (0-1.0)   Held-peak weight in blend
+//   out_high = torque_scale   (0.5-3.0) Multiplier on raw sensor input
 static float haz_direct_torque_process(float dt_s) {
 	const app_configuration *appconf = app_get_configuration();
 	const adc_config *ac = &appconf->app_adc_conf;
@@ -1406,6 +1474,14 @@ static float haz_direct_torque_process(float dt_s) {
 		haz_direct_torque_reset();
 		return -1.0f;
 	}
+
+	// --- Config aliases (repurposed fields) ---
+	const float deadzone       = ac->haz_torque_direct_in_low;
+	const float min_current_pct = ac->haz_torque_direct_out_low;
+	const float response_curve = fmaxf(ac->haz_torque_direct_in_mid, 0.2f);
+	const float stride_hold_s  = ac->haz_torque_direct_out_mid;
+	const float stride_blend   = ac->haz_torque_direct_in_high;
+	const float torque_scale   = fmaxf(ac->haz_torque_direct_out_high, 0.1f);
 
 	// --- Read torque sensor ---
 	systime_t torque_age = chVTTimeElapsedSinceX(s_ext_torque_ts);
@@ -1417,9 +1493,14 @@ static float haz_direct_torque_process(float dt_s) {
 		torque_raw = (float)s_ext_torque / 160.0f;
 	}
 
-	// Deadzone
+	// Apply torque scale (compensate if sensor doesn't use full 0-160 range)
+	torque_raw *= torque_scale;
+	if (torque_raw > 1.0f) torque_raw = 1.0f;
+
+	// Deadzone (shared start_threshold still used as absolute gate)
 	float start_thresh = ac->haz_torque_start_threshold / 160.0f;
-	if (torque_raw < start_thresh) torque_raw = 0.0f;
+	float effective_deadzone = fmaxf(deadzone, start_thresh);
+	if (torque_raw < effective_deadzone) torque_raw = 0.0f;
 
 	// LP filter (reuses shared smoothing config)
 	float t_smooth = fmaxf(ac->haz_torque_smoothing, 0.0f);
@@ -1427,18 +1508,45 @@ static float haz_direct_torque_process(float dt_s) {
 	float t_lp = (t_smooth < 0.01f) ? 1.0f : (1.0f - t_smooth * 0.99f);
 	UTILS_LP_FAST(s_direct_torque_smooth, torque_raw, t_lp);
 
-	// --- 3-point torque → current ratio curve ---
-	float current_ratio = haz_torque_curve_3pt(s_direct_torque_smooth,
-			ac->haz_torque_direct_in_low,  ac->haz_torque_direct_out_low,
-			ac->haz_torque_direct_in_mid,  ac->haz_torque_direct_out_mid,
-			ac->haz_torque_direct_in_high, ac->haz_torque_direct_out_high);
+	// --- Stride smoothing: peak-hold with slow decay ---
+	// Tracks peak torque and decays slowly between foot transitions.
+	// Only holds when cadence is active (actually pedaling).
+	float cadence_rpm = fabsf(app_pas_get_pedal_rpm());
+	float cad_start = ac->haz_torque_direct_cadence_start;
+
+	if (s_direct_torque_smooth > s_stride_peak) {
+		s_stride_peak = s_direct_torque_smooth;  // Instant rise to new peaks
+	} else if (stride_hold_s > 0.01f && cadence_rpm > cad_start) {
+		// Exponential decay — holds current between L/R foot transitions
+		float decay_rate = dt_s / stride_hold_s;
+		if (decay_rate > 1.0f) decay_rate = 1.0f;
+		s_stride_peak *= (1.0f - decay_rate);
+	} else {
+		s_stride_peak = s_direct_torque_smooth;  // No hold: follow instantly
+	}
+
+	// Blend instantaneous with held peak
+	float effective_torque = s_direct_torque_smooth +
+		stride_blend * fmaxf(s_stride_peak - s_direct_torque_smooth, 0.0f);
+
+	// --- Normalize to 0-1 after deadzone removal ---
+	float torque_norm = (effective_torque - effective_deadzone) /
+		fmaxf(1.0f - effective_deadzone, 0.01f);
+	if (torque_norm < 0.0f) torque_norm = 0.0f;
+	if (torque_norm > 1.0f) torque_norm = 1.0f;
+
+	// --- Power curve: torque_norm^exponent ---
+	float curved = powf(torque_norm, response_curve);
+
+	// --- Map to current: min_current at bottom, max_current at top ---
+	float current_ratio = (torque_norm > 0.001f)
+		? (min_current_pct + curved * (1.0f - min_current_pct))
+		: 0.0f;
 
 	float target_current = current_ratio * ac->haz_torque_direct_max_current;
 
 	// --- Cadence gating ---
-	// Uses PAS step count for robust idle detection (same as Speed PID PAS)
-	float cadence_rpm = fabsf(app_pas_get_pedal_rpm());
-	float cad_start = ac->haz_torque_direct_cadence_start;
+	// cadence_rpm and cad_start already computed above for stride hold
 	float cad_full  = ac->haz_torque_direct_cadence_full;
 	float cad_min   = ac->haz_torque_direct_cadence_min;
 
@@ -2007,6 +2115,13 @@ static THD_FUNCTION(adc_thread, arg) {
 				static int freewheel_catch_gear = 0;
 				const float dt_s = (float)sleep_time / (float)CH_CFG_ST_FREQUENCY;
 
+				// ── WHEELIE MODE (governor) ──
+				// Computes a duty ceiling based on IMU pitch.
+				// Your throttle still controls — wheelie code just caps the output.
+				wheelie_process(dt_s);
+				// wheelie.duty_output = duty ceiling (0 to max_duty)
+				// Applied further down when computing duty_to_send
+
 				float throttle_mag = fabsf(pwr);
 				if (throttle_mag > 1.0f) throttle_mag = 1.0f;
 				
@@ -2214,6 +2329,19 @@ static THD_FUNCTION(adc_thread, arg) {
 								
 								// If we're at or above speed limit, force release motor
 								if (speed_scale <= 0.0f) {
+									duty_to_send = 0.0f;
+								}
+							}
+
+							// ========== WHEELIE GOVERNOR ==========
+							// Cap duty at wheelie ceiling — your throttle commands,
+							// wheelie code limits how much actually reaches the motor
+							if (wheelie.enabled && wheelie.active) {
+								if (duty_to_send > wheelie.duty_output) {
+									duty_to_send = wheelie.duty_output;
+								}
+								// Bail = instant cut
+								if (wheelie.bail_triggered) {
 									duty_to_send = 0.0f;
 								}
 							}

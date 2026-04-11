@@ -778,38 +778,47 @@ typedef struct {
 	float haz_freewheel_catch_erpm_offset;        // ERPM before target to start slowing
 	float haz_freewheel_catch_final_rate;         // Duty/s for last gentle approach
 	float haz_freewheel_catch_modifier;           // Tweak timing (1.0=normal, <1=earlier)
-	// PAS Duty - sexy duty-based PAS control
-	bool haz_pas_duty_enabled;
-	float haz_pas_duty_smoothing;
-	float haz_pas_duty_lead_pct;
-	float haz_pas_duty_accel_gain;
-	float haz_pas_duty_load_gain;
-	float haz_pas_duty_ramp_up;
-	float haz_pas_duty_ramp_down;
-	float haz_pas_duty_median_filter;
-	float haz_pas_duty_idle_timeout;
-	// Torque Sensor Mode - external torque sensor via ESP32 BLE
-	// When enabled, replaces cadence accel + load accel with real torque data.
-	// Still uses PAS cadence for speed matching. Torque modulates how hard motor pushes.
-	bool haz_torque_enabled;                  // Enable torque sensor for hybrid duty PAS mode
+	// PAS Duty Mode - ERPM-tracking duty PAS with optional torque offset
+	// Base: motor matches cadence × gearbox × lead%. Torque adds offset to lead.
+	bool haz_pas_duty_enabled;                    // Master enable
+	float haz_pas_duty_lead_pct;                  // Base lead factor (0-2). 0.85 = motor at 85% cadence speed
+	float haz_pas_duty_ramp_up;                   // Duty/s ramp up rate
+	float haz_pas_duty_ramp_down;                 // Duty/s ramp down rate
+	float haz_pas_duty_idle_timeout;              // Seconds idle before PAS cuts off
+	float haz_pas_duty_cadence_smoothing;         // LP filter on cadence signal (0=raw, 1=max smooth)
+	float haz_pas_duty_median_filter;             // Median filter buffer size (0=off, 3-11=active)
+	// Torque offset mode - torque input adds lead offset above base
+	// Base target = cadence × lead%. Torque adds min_offset..max_offset on top.
+	// Flat zone: torque input below flat_zone gives constant min_offset (ez cruising).
+	// Above flat_zone, linear ramp from min_offset to max_offset at max_input.
+	bool haz_pas_duty_torque_enabled;             // Enable torque offset for PAS duty
+	float haz_pas_duty_torque_min_offset;         // Min lead offset as fraction (e.g. 0.15 = +15% lead)
+	float haz_pas_duty_torque_max_offset;         // Max lead offset as fraction (e.g. 0.50 = +50% lead)
+	float haz_pas_duty_torque_flat_zone;          // Torque fraction for flat min response (0-1, e.g. 0.2 = 20%)
+	float haz_pas_duty_torque_max_input;          // Torque fraction needed for max offset (0-1, e.g. 0.8 = 80%)
+	float haz_pas_duty_torque_smoothing;          // LP filter on torque signal (0=raw, 1=max smooth)
+	float haz_pas_duty_torque_idle_timeout;       // Seconds of no torque before offset drops
+	float haz_pas_duty_torque_cadence_avg;        // Num cadence pulses to average torque over (0=off, 1-20)
+	// Torque Sensor - shared settings for Speed PID PAS mode
+	// (Duty PAS mode has its own torque settings above)
+	bool haz_torque_enable_current_pas;       // Enable torque sensor for current control PAS mode
 	float haz_torque_strength;                // Assist multiplier (0.1-5.0, default 1.0)
 	float haz_torque_smoothing;               // LP filter on torque 0.0-1.0 (default 0.3)
 	float haz_torque_start_threshold;         // Min normalized torque to engage (0-50, default 5)
 	float haz_torque_idle_timeout;            // Seconds no torque before rampdown (default 0.5)
 	float haz_torque_responsiveness;          // Curve shape: 0=gentle 1=linear 2=aggressive (default 1.0)
-	bool haz_torque_enable_current_pas;       // Enable torque sensor for current control PAS mode
 	// Direct Torque Current Control — torque sensor drives phase current directly
 	// When enabled, bypasses Speed PID PAS. Torque in → current out, with
-	// cadence gating for safe low-RPM behavior and speed fade at limit.
+	// cadence gating, stride smoothing, and speed fade at limit.
 	bool haz_torque_direct_enable;            // Master toggle: ON = direct current, OFF = speed PID
 	float haz_torque_direct_max_current;      // Max phase current (A)
-	// 3-point torque→current curve (torque input 0.0-1.0, current output 0.0-1.0 × max)
-	float haz_torque_direct_in_low;           // Torque input low point (deadzone below)
-	float haz_torque_direct_out_low;          // Current ratio at low point
-	float haz_torque_direct_in_mid;           // Torque input mid point
-	float haz_torque_direct_out_mid;          // Current ratio at mid point
-	float haz_torque_direct_in_high;          // Torque input high point
-	float haz_torque_direct_out_high;         // Current ratio at high point
+	// Torque response mapping (repurposed: no longer a 3-point curve)
+	float haz_torque_direct_in_low;           // Deadzone: min normalized torque to engage (0-0.5)
+	float haz_torque_direct_out_low;          // Min current %: base current fraction at deadzone edge (0-0.3)
+	float haz_torque_direct_in_mid;           // Response curve: power exponent (<1 generous, 1 linear, >1 progressive)
+	float haz_torque_direct_out_mid;          // Stride hold: peak-hold decay time constant (seconds)
+	float haz_torque_direct_in_high;          // Stride blend: held-peak weight in dip fill (0-1)
+	float haz_torque_direct_out_high;         // Torque scale: multiplier on raw sensor input (0.5-3.0)
 	// Cadence gating — limits current at low/zero cadence to prevent chain shock
 	float haz_torque_direct_cadence_start;    // RPM below which current is limited
 	float haz_torque_direct_cadence_full;     // RPM above which full current available

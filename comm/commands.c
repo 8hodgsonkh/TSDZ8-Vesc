@@ -1136,6 +1136,58 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 				mcpwm_foc_clear_position_correction();
 			}
 		}
+		// Hazza wheelie balance mode
+		// Format: [0x48] [0x57] [cmd] [data...] = "HW" + command
+		// cmd=0x00: Disable wheelie mode
+		// cmd=0x01: Enable wheelie mode
+		// cmd=0x02: Set target angle [angle_hi][angle_lo] (×100)
+		// cmd=0x03: Set PID gains [kp_hi][kp_lo][ki_hi][ki_lo][kd_hi][kd_lo] (×10000)
+		// cmd=0x04: Set max duty [duty_hi][duty_lo] (×1000)
+		// cmd=0x05: Set bail angle [angle_hi][angle_lo] (×100)
+		// cmd=0x06: Calibrate IMU zero (set current orientation as level)
+		if (len >= 3 && data[0] == 0x48 && data[1] == 0x57) {
+			uint8_t cmd = data[2];
+			switch (cmd) {
+			case 0x00:
+				app_adc_wheelie_enable(false);
+				break;
+			case 0x01:
+				app_adc_wheelie_enable(true);
+				break;
+			case 0x02:
+				if (len >= 5) {
+					uint16_t angle = ((uint16_t)data[3] << 8) | data[4];
+					app_adc_wheelie_set_target((float)angle / 100.0f);
+				}
+				break;
+			case 0x03:
+				if (len >= 9) {
+					uint16_t kp = ((uint16_t)data[3] << 8) | data[4];
+					uint16_t ki = ((uint16_t)data[5] << 8) | data[6];
+					uint16_t kd = ((uint16_t)data[7] << 8) | data[8];
+					app_adc_wheelie_set_pid(
+						(float)kp / 10000.0f,
+						(float)ki / 10000.0f,
+						(float)kd / 10000.0f);
+				}
+				break;
+			case 0x04:
+				if (len >= 5) {
+					uint16_t duty = ((uint16_t)data[3] << 8) | data[4];
+					app_adc_wheelie_set_max_duty((float)duty / 1000.0f);
+				}
+				break;
+			case 0x05:
+				if (len >= 5) {
+					uint16_t angle = ((uint16_t)data[3] << 8) | data[4];
+					app_adc_wheelie_set_bail((float)angle / 100.0f);
+				}
+				break;
+			case 0x06:
+				app_adc_wheelie_calibrate_zero();
+				break;
+			}
+		}
 		if (appdata_func) {
 			appdata_func(data, len);
 		}

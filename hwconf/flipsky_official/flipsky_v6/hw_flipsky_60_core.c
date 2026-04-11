@@ -174,7 +174,7 @@ void hw_init_gpio(void) {
 #endif
 
 #ifdef HW_HAS_LUNA_SERIAL_DISPLAY
-	luna_display_serial_start(1); // Start with PAS level 1
+	luna_display_serial_start(0); // Start with PAS level 0 (no assist until user selects)
 #endif
 }
 

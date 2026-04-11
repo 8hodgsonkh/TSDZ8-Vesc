@@ -210,39 +210,57 @@
 #ifndef APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER
 #define APPCONF_ADC_HAZ_FREEWHEEL_CATCH_MODIFIER		1.0f	// Global feel modifier (higher = earlier catch)
 #endif
-// Hazza PAS Duty - simple cadence-based duty control
-// Smooth alternative to current-based PAS - just ramps duty based on pedal speed
+// Hazza PAS Duty - cadence-tracking duty control with optional torque offset
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_ENABLED
 #define APPCONF_ADC_HAZ_PAS_DUTY_ENABLED			false
 #endif
-#ifndef APPCONF_ADC_HAZ_PAS_DUTY_SMOOTHING
-#define APPCONF_ADC_HAZ_PAS_DUTY_SMOOTHING			0.15f	// LP filter: 0.0=raw, 1.0=max smooth
-#endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_LEAD_PCT
-#define APPCONF_ADC_HAZ_PAS_DUTY_LEAD_PCT			1.0f	// Lead %: 0=match, 1.0=10% ahead, 2.0=20% ahead
-#endif
-#ifndef APPCONF_ADC_HAZ_PAS_DUTY_ACCEL_GAIN
-#define APPCONF_ADC_HAZ_PAS_DUTY_ACCEL_GAIN			0.7f	// Cadence accel boost (0=off, 2.0=aggressive)
-#endif
-#ifndef APPCONF_ADC_HAZ_PAS_DUTY_LOAD_GAIN
-#define APPCONF_ADC_HAZ_PAS_DUTY_LOAD_GAIN			0.5f	// Load/current boost (0=off, 2.0=aggressive)
+#define APPCONF_ADC_HAZ_PAS_DUTY_LEAD_PCT			0.85f	// Base motor speed fraction of cadence (0.85 = 85%)
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP
-#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP			0.3f	// Duty/s ramp up (lower = smoother)
+#define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_UP			0.3f	// Duty/s ramp up
 #endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN
 #define APPCONF_ADC_HAZ_PAS_DUTY_RAMP_DOWN			0.5f	// Duty/s ramp down
 #endif
-#ifndef APPCONF_ADC_HAZ_PAS_DUTY_MEDIAN_FILTER
-#define APPCONF_ADC_HAZ_PAS_DUTY_MEDIAN_FILTER			5.0f	// Median samples: 0=off, 1=latest, 3-11=median
-#endif
 #ifndef APPCONF_ADC_HAZ_PAS_DUTY_IDLE_TIMEOUT
 #define APPCONF_ADC_HAZ_PAS_DUTY_IDLE_TIMEOUT			0.5f	// Idle timeout (s)
 #endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_CADENCE_SMOOTHING
+#define APPCONF_ADC_HAZ_PAS_DUTY_CADENCE_SMOOTHING		0.30f	// LP filter on cadence: 0.0=raw, 1.0=max smooth
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_MEDIAN_FILTER
+#define APPCONF_ADC_HAZ_PAS_DUTY_MEDIAN_FILTER			3.0f	// Median samples: 0=off, 3-11=median
+#endif
+// PAS Duty torque offset settings
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_ENABLED
+#define APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_ENABLED			false
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_MIN_OFFSET
+#define APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_MIN_OFFSET		0.15f	// Min lead offset at low torque
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_MAX_OFFSET
+#define APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_MAX_OFFSET		0.50f	// Max lead offset at full torque
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_FLAT_ZONE
+#define APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_FLAT_ZONE		0.20f	// Torque fraction below which = flat min offset
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_MAX_INPUT
+#define APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_MAX_INPUT		0.80f	// Torque fraction to reach max offset
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_SMOOTHING
+#define APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_SMOOTHING		0.30f	// LP filter on torque signal
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_IDLE_TIMEOUT
+#define APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_IDLE_TIMEOUT		0.5f	// Torque idle timeout (s)
+#endif
+#ifndef APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_CADENCE_AVG
+#define APPCONF_ADC_HAZ_PAS_DUTY_TORQUE_CADENCE_AVG		3.0f	// Cadence pulses to average torque over
+#endif
 
-// Torque Sensor defaults
-#ifndef APPCONF_ADC_HAZ_TORQUE_ENABLED
-#define APPCONF_ADC_HAZ_TORQUE_ENABLED				false
+// Torque Sensor defaults (Speed PID PAS mode)
+#ifndef APPCONF_ADC_HAZ_TORQUE_ENABLE_CURRENT_PAS
+#define APPCONF_ADC_HAZ_TORQUE_ENABLE_CURRENT_PAS		false
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_STRENGTH
 #define APPCONF_ADC_HAZ_TORQUE_STRENGTH				1.0f
@@ -259,9 +277,6 @@
 #ifndef APPCONF_ADC_HAZ_TORQUE_RESPONSIVENESS
 #define APPCONF_ADC_HAZ_TORQUE_RESPONSIVENESS			1.0f
 #endif
-#ifndef APPCONF_ADC_HAZ_TORQUE_ENABLE_CURRENT_PAS
-#define APPCONF_ADC_HAZ_TORQUE_ENABLE_CURRENT_PAS		false
-#endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_ENABLE
 #define APPCONF_ADC_HAZ_TORQUE_DIRECT_ENABLE			false
 #endif
@@ -272,19 +287,19 @@
 #define APPCONF_ADC_HAZ_TORQUE_DIRECT_IN_LOW			0.05f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_LOW
-#define APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_LOW			0.05f
+#define APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_LOW			0.08f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_IN_MID
-#define APPCONF_ADC_HAZ_TORQUE_DIRECT_IN_MID			0.40f
+#define APPCONF_ADC_HAZ_TORQUE_DIRECT_IN_MID			0.80f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_MID
-#define APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_MID			0.35f
+#define APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_MID			0.30f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_IN_HIGH
-#define APPCONF_ADC_HAZ_TORQUE_DIRECT_IN_HIGH			0.85f
+#define APPCONF_ADC_HAZ_TORQUE_DIRECT_IN_HIGH			0.70f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_HIGH
-#define APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_HIGH			1.0f
+#define APPCONF_ADC_HAZ_TORQUE_DIRECT_OUT_HIGH			1.50f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_CADENCE_START
 #define APPCONF_ADC_HAZ_TORQUE_DIRECT_CADENCE_START		10.0f
@@ -296,13 +311,13 @@
 #define APPCONF_ADC_HAZ_TORQUE_DIRECT_CADENCE_MIN		0.15f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_SPEED_FADE
-#define APPCONF_ADC_HAZ_TORQUE_DIRECT_SPEED_FADE		0.80f
+#define APPCONF_ADC_HAZ_TORQUE_DIRECT_SPEED_FADE		0.85f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_RAMP_UP
-#define APPCONF_ADC_HAZ_TORQUE_DIRECT_RAMP_UP			100.0f
+#define APPCONF_ADC_HAZ_TORQUE_DIRECT_RAMP_UP			120.0f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_RAMP_DOWN
-#define APPCONF_ADC_HAZ_TORQUE_DIRECT_RAMP_DOWN			100.0f
+#define APPCONF_ADC_HAZ_TORQUE_DIRECT_RAMP_DOWN			80.0f
 #endif
 #ifndef APPCONF_ADC_HAZ_TORQUE_DIRECT_USE_GEARS
 #define APPCONF_ADC_HAZ_TORQUE_DIRECT_USE_GEARS			false
