@@ -824,6 +824,11 @@ void mc_interface_set_brake_current_rel(float val) {
  * The current value.
  */
 void mc_interface_set_handbrake(float current) {
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(current) > 0.001) {
 		SHUTDOWN_RESET();
 	}
@@ -861,10 +866,18 @@ void mc_interface_set_handbrake_rel(float val) {
 		SHUTDOWN_RESET();
 	}
 
-	mc_interface_set_handbrake(val * fabsf(motor_now()->m_conf.lo_current_min));
+	// HAZZA M5: apply assist current scale to keep relative handbrake consistent
+	// with set_current_rel. set_handbrake() itself takes an absolute current,
+	// so scaling has to happen at the relative entry point.
+	mc_interface_set_handbrake(val * fabsf(motor_now()->m_conf.lo_current_min) * m_assist_current_scale);
 }
 
 void mc_interface_set_openloop_current(float current, float rpm) {
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(current) > 0.001) {
 		SHUTDOWN_RESET();
 	}
@@ -889,6 +902,11 @@ void mc_interface_set_openloop_current(float current, float rpm) {
 	events_add("set_openloop_current", current);
 }
 void mc_interface_set_openloop_phase(float current, float phase){
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(current) > 0.001) {
 		SHUTDOWN_RESET();
 	}
@@ -913,6 +931,11 @@ void mc_interface_set_openloop_phase(float current, float phase){
 	events_add("set_openloop_phase", phase);
 }
 void mc_interface_set_openloop_duty(float dutyCycle, float rpm){
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(dutyCycle) > 0.001) {
 		SHUTDOWN_RESET();
 	}
@@ -937,6 +960,11 @@ void mc_interface_set_openloop_duty(float dutyCycle, float rpm){
 	events_add("set_openloop_duty", dutyCycle);
 }
 void mc_interface_set_openloop_duty_phase(float dutyCycle, float phase){
+	if (m_motor_locked) {
+		mc_interface_release_motor();
+		return;
+	}
+
 	if (fabsf(dutyCycle) > 0.001) {
 		SHUTDOWN_RESET();
 	}

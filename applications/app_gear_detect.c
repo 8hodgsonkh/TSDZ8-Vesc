@@ -28,10 +28,15 @@ static float s_fused_speed_ms = 0.0f;     // Current fused wheel speed in m/s
 static bool s_fused_active = false;        // True when ERPM-derived speed is being used
 static float s_magnet_speed_ms = 0.0f;     // Last raw magnet sensor speed for validation
 
-// Hysteresis state
-static int s_last_gear = 0;
-static int s_pending_gear = 0;
-static int s_consecutive_count = 0;
+// Gear state — driven strictly by wheel pulses
+static int s_last_gear = 0;               // Last confirmed gear (updated only on pulses)
+static int s_pending_gear = 0;            // Candidate gear needing confirmation
+static int s_consecutive_count = 0;       // Consecutive pulses agreeing on pending_gear
+
+// Pulse-tracking for edge-driven detection
+static uint32_t s_last_pulse_count = 0;   // Pulse count seen at last update
+static float s_last_pulse_ratio = 0.0f;   // Gear ratio at last pulse (for shift detect)
+static uint32_t s_shift_hold_pulses = 0;  // Pulses remaining to hold off re-latch after shift
 
 // Helper to get cassette teeth by index (0-11)
 static inline uint8_t get_cassette_teeth(const gear_detection_config *conf, int idx) {
@@ -113,70 +118,129 @@ void app_gear_detect_reset(void) {
     s_last_gear = 0;
     s_pending_gear = 0;
     s_consecutive_count = 0;
+    s_last_pulse_count = 0;
+    s_last_pulse_ratio = 0.0f;
+    s_shift_hold_pulses = 0;
+}
+
+/**
+ * @brief Process gear detection on a new wheel pulse.
+ *
+ * Called ONLY when a new wheel pulse has arrived. This is the sole place
+ * where s_last_gear is allowed to change. Between pulses the gear is held
+ * so ERPM interpolation can run cleanly without fighting re-detection.
+ *
+ * Steps per pulse:
+ *  1. Compute observed gear ratio from fresh wheel speed + ERPM.
+ *  2. Detect a mid-shift: ratio changed sharply from last pulse → hold off.
+ *  3. Apply 2-pulse hysteresis to avoid latching on a single noisy pulse.
+ *  4. Commit gear when two consecutive pulses agree.
+ */
+static void process_gear_on_pulse(float wheel_speed_kph, float erpm, const gear_detection_config *conf) {
+    if (wheel_speed_kph < conf->min_speed_kph || erpm < (float)conf->min_erpm) {
+        // Too slow — clear state and bail
+        if (wheel_speed_kph < 1.0f) {
+            s_last_gear = 0;
+            s_pending_gear = 0;
+            s_consecutive_count = 0;
+            s_shift_hold_pulses = 0;
+        }
+        return;
+    }
+
+    // Compute the raw observed cassette ratio this pulse
+    float wheel_circumference_m = (float)conf->wheel_diameter_mm * 3.14159f / 1000.0f;
+    float wheel_rpm = (wheel_speed_kph * 1000.0f / 60.0f) / wheel_circumference_m;
+    float motor_rpm = erpm / ((float)conf->motor_poles / 2.0f);
+    float observed_teeth = (float)conf->chainring_teeth * motor_rpm /
+                           (conf->internal_ratio * wheel_rpm);
+
+    // Mid-shift detection: if observed_teeth jumped sharply from last pulse,
+    // the chain is mid-shift — hold off latching for 2 pulses to let it settle.
+    // Threshold: >8% step in teeth matches the smallest cassette step (~10% for 19→17T)
+    if (s_last_pulse_ratio > 1.0f) {
+        float ratio_step = fabsf(observed_teeth - s_last_pulse_ratio) / s_last_pulse_ratio;
+        if (ratio_step > 0.08f) {
+            // Chain is mid-shift — suppress latching for 2 pulses
+            s_shift_hold_pulses = 2;
+            s_pending_gear = 0;
+            s_consecutive_count = 0;
+        }
+    }
+    s_last_pulse_ratio = observed_teeth;
+
+    if (s_shift_hold_pulses > 0) {
+        s_shift_hold_pulses--;
+        return;  // Hold off — still settling after shift
+    }
+
+    // Find the closest matching gear
+    int best_gear = 0;
+    float best_diff = 999.0f;
+    for (int g = 0; g < conf->num_gears && g < GEAR_MAX_GEARS; g++) {
+        uint8_t cog_teeth = get_cassette_teeth(conf, g);
+        if (cog_teeth == 0) continue;
+        float diff = fabsf(observed_teeth - (float)cog_teeth) / (float)cog_teeth;
+        if (diff < best_diff && diff < conf->detect_tolerance) {
+            best_diff = diff;
+            best_gear = g + 1;
+        }
+    }
+
+    if (best_gear <= 0) {
+        // No gear matched this pulse — reset consecutive count but keep last known
+        s_consecutive_count = 0;
+        return;
+    }
+
+    // 2-pulse hysteresis: need two consecutive pulses on the same gear before committing
+    if (best_gear == s_pending_gear) {
+        s_consecutive_count++;
+        if (s_consecutive_count >= 2) {
+            s_last_gear = best_gear;
+        }
+    } else {
+        s_pending_gear = best_gear;
+        s_consecutive_count = 1;
+        // First pulse after a shift — immediately update last_gear as a provisional value
+        // so fused speed interpolation isn't stuck on stale gear for 2 whole revs.
+        // It will be confirmed (or corrected) on the next pulse.
+        if (s_last_gear == 0) {
+            s_last_gear = best_gear;  // Only snap from unknown; confirmed gears need 2 pulses
+        }
+    }
 }
 
 int app_gear_detect_get(float speed_kph, int32_t erpm, float duty_cycle, float motor_amps) {
     const app_configuration *appconf = app_get_configuration();
-    
+    (void)speed_kph;
+    (void)erpm;
+    (void)duty_cycle;
+    (void)motor_amps;
+
     if (!appconf->gear_detect_conf.enabled) {
         return 0;
     }
-    
-    const gear_detection_config *conf = &appconf->gear_detect_conf;
-    
-    // Only calculate gear when chain is tensioned (motor current > 5A)
-    // Lowered from 10A to catch gear changes during brief load dips mid-shift
-    bool under_load = (motor_amps > 5.0f);
-    
-    int raw_gear = detect_gear_raw(speed_kph, erpm, conf);
-    int display_gear = s_last_gear;
-    
-    if (under_load && raw_gear > 0) {
-        // Under load with valid reading - apply hysteresis
-        if (raw_gear == s_pending_gear) {
-            s_consecutive_count++;
-            if (s_consecutive_count >= 2) {
-                // 2 consecutive same readings - update (was 3, reduced for faster response)
-                display_gear = raw_gear;
-                s_last_gear = raw_gear;
-            }
-        } else {
-            // New gear detected, start counting
-            s_pending_gear = raw_gear;
-            s_consecutive_count = 1;
-        }
-    } else if (!under_load && s_last_gear > 0) {
-        // Coasting - hold last known gear
-        display_gear = s_last_gear;
-    } else if (speed_kph < 1.0f) {
-        // Stopped - clear gear
-        display_gear = 0;
-        s_last_gear = 0;
-        s_consecutive_count = 0;
-    }
-    
-    return display_gear;
+
+    // Gear state is now fully driven by pulse events in process_gear_on_pulse().
+    // This function is a pure read accessor — it no longer mutates gear state.
+    // The caller can use this to read the last confirmed gear at any time.
+    return s_last_gear;
 }
 
 /**
  * @brief Get gear from current VESC state (convenience function)
- * 
- * Uses RAW magnet sensor speed (not fused) to avoid circular dependency.
- * Gear detection must always use the magnet as ground truth.
+ *
+ * Pulse processing and gear state updates happen inside
+ * app_gear_detect_update_fused_speed() which runs first every app_adc cycle.
+ * This function is a pure read accessor — returns the last confirmed gear.
  */
 int app_gear_detect_get_current(void) {
-    // Use raw hardware speed, NOT mc_interface_get_speed() which returns fused value
-#ifdef HW_HAS_WHEEL_SPEED_SENSOR
-    float speed_ms = hw_get_speed();  // Raw magnet sensor m/s
-#else
-    float speed_ms = mc_interface_get_speed();  // Fallback: ERPM-based
-#endif
-    float speed_kph = speed_ms * 3.6f;
-    int32_t erpm = (int32_t)mc_interface_get_rpm();
-    float duty = fabsf(mc_interface_get_duty_cycle_now()) * 100.0f;
-    float motor_amps = fabsf(mc_interface_get_tot_current_filtered());
-    
-    return app_gear_detect_get(speed_kph, erpm, duty, motor_amps);
+    const app_configuration *appconf = app_get_configuration();
+    if (!appconf->gear_detect_conf.enabled) {
+        return 0;
+    }
+    return s_last_gear;
 }
 
 /**
@@ -272,9 +336,6 @@ static float erpm_to_wheel_speed_ms(float erpm, int gear) {
 static int redetect_gear_from_magnet(float magnet_speed_kph, float erpm) {
     const app_configuration *appconf = app_get_configuration();
     const gear_detection_config *conf = &appconf->gear_detect_conf;
-    
-    // Use slightly looser tolerance for magnet-based correction
-    // since magnet is 1 pulse/rev and may have some jitter
     return detect_gear_raw(magnet_speed_kph, (int32_t)erpm, conf);
 }
 
@@ -317,43 +378,38 @@ void app_gear_detect_update_fused_speed(void) {
     
     float motor_current = fabsf(mc_interface_get_tot_current_filtered());
     float erpm = fabsf(mc_interface_get_rpm());
-    int gear = s_last_gear;  // Use internal state directly, no circular call
-    
+
+    // ========================================================================
+    // PULSE-DRIVEN GEAR ANCHOR (runs first — before any fusion)
+    // If a new wheel pulse arrived, process it immediately so gear is fresh
+    // for ERPM interpolation in this same cycle.
+    // ========================================================================
+    uint32_t current_pulses = hw_wheel_speed_get_pulses();
+    if (current_pulses != s_last_pulse_count) {
+        s_last_pulse_count = current_pulses;
+        process_gear_on_pulse(magnet_speed_ms * 3.6f, erpm, &appconf->gear_detect_conf);
+    }
+
+    int gear = s_last_gear;  // Freshly updated from pulse above if one arrived
+
     // Thresholds for chain engagement detection
     const float current_engage_threshold = 3.0f;   // Above 3A = chain definitely engaged
     const float current_disengage_threshold = 1.5f; // Below 1.5A = chain may be slack (hysteresis)
     const float min_erpm_for_fusion = 300.0f;       // Need some ERPM for meaningful calculation
     const float max_pulse_age_for_trust = 1500;     // If magnet pulse >1.5s old, speed is stale
-    
-    // ========================================================================
-    // MAGNET-ANCHORED GEAR CORRECTION
-    // Every fresh magnet pulse is a chance to correct the gear if it's wrong.
-    // This catches gear changes that the load-based detection misses (e.g.
-    // shifting under power where current briefly dips during the shift).
-    // ========================================================================
-    if (magnet_speed_ms > 1.0f && pulse_age_ms < max_pulse_age_for_trust && 
+
+    // Sanity cross-check: if fused ERPM speed disagrees badly with magnet even
+    // after the pulse-driven correction, we may be mid-shift. Use magnet locally
+    // for this cycle but do NOT commit to s_last_gear — wait for next pulse.
+    if (magnet_speed_ms > 1.0f && pulse_age_ms < max_pulse_age_for_trust &&
         erpm > min_erpm_for_fusion && gear > 0) {
         float erpm_speed_ms = erpm_to_wheel_speed_ms(erpm, gear);
         float ratio = (erpm_speed_ms > 0.1f) ? (erpm_speed_ms / magnet_speed_ms) : 0.0f;
-        
-        if (ratio < 0.8f || ratio > 1.25f) {
-            // >20% disagreement — current gear is wrong. Re-detect immediately
-            // using magnet speed as ground truth (no load or hysteresis required)
-            float magnet_kph = magnet_speed_ms * 3.6f;
-            int corrected_gear = redetect_gear_from_magnet(magnet_kph, erpm);
-            
-            if (corrected_gear > 0 && corrected_gear != gear) {
-                // Validate: does the corrected gear produce a speed that matches magnet?
-                float corrected_speed = erpm_to_wheel_speed_ms(erpm, corrected_gear);
-                float corrected_ratio = corrected_speed / magnet_speed_ms;
-                
-                if (corrected_ratio > 0.85f && corrected_ratio < 1.18f) {
-                    // Good match — adopt immediately, skip hysteresis
-                    s_last_gear = corrected_gear;
-                    s_pending_gear = corrected_gear;
-                    s_consecutive_count = 3;  // Pre-saturate so normal path doesn't fight us
-                    gear = corrected_gear;    // Use corrected gear for fusion below
-                }
+        if (ratio < 0.80f || ratio > 1.25f) {
+            // Severe disagreement — chain is probably mid-shift
+            int fallback = redetect_gear_from_magnet(magnet_speed_ms * 3.6f, erpm);
+            if (fallback > 0) {
+                gear = fallback;  // Local use only, not committed
             }
         }
     }
@@ -375,8 +431,8 @@ void app_gear_detect_update_fused_speed(void) {
             bool erpm_sane = true;
             if (magnet_speed_ms > 0.5f && pulse_age_ms < max_pulse_age_for_trust) {
                 float ratio = erpm_speed_ms / magnet_speed_ms;
-                if (ratio < 0.75f || ratio > 1.35f) {
-                    // Still disagrees even after gear correction — maybe mid-shift
+                if (ratio < 0.85f || ratio > 1.18f) {
+                    // Still disagrees >15% even after gear correction — maybe mid-shift
                     erpm_sane = false;
                 }
             }

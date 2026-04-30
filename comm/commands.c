@@ -744,9 +744,10 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 			buffer_append_uint32(send_buffer, mc_interface_get_perf_metrics(), &ind);
 		}
 		if (mask & ((uint32_t)1 << 24)) {
-			// Torque sensor: raw ADC (uint16) + normalized 0-160 (uint16)
+			// Torque sensor: raw ADC (uint16) + normalized 0-160 (uint16) + current cmd (int16, 0.1A)
 			buffer_append_uint16(send_buffer, app_adc_get_torque_raw(), &ind);
 			buffer_append_uint16(send_buffer, app_adc_get_ext_torque(), &ind);
+			buffer_append_int16(send_buffer, (int16_t)(app_adc_get_direct_torque_cmd() * 10.0f), &ind);
 		}
 
 		reply_func(send_buffer, ind);
@@ -1186,6 +1187,31 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 			case 0x06:
 				app_adc_wheelie_calibrate_zero();
 				break;
+			case 0x07:  // Set max pitch rate (deg/s, ×10)
+				if (len >= 5) {
+					uint16_t v = ((uint16_t)data[3] << 8) | data[4];
+					app_adc_wheelie_set_max_pitch_rate((float)v / 10.0f);
+				}
+				break;
+			case 0x08:  // Set min wheel speed (km/h, ×10)
+				if (len >= 5) {
+					uint16_t v = ((uint16_t)data[3] << 8) | data[4];
+					app_adc_wheelie_set_min_speed((float)v / 10.0f);
+				}
+				break;
+			case 0x09:  // Set roll bail angle (deg, ×100)
+				if (len >= 5) {
+					uint16_t v = ((uint16_t)data[3] << 8) | data[4];
+					app_adc_wheelie_set_roll_bail((float)v / 100.0f);
+				}
+				break;
+			case 0x0A:  // Set panic thresholds: margin (deg ×100), rate (deg/s ×10)
+				if (len >= 7) {
+					uint16_t mg = ((uint16_t)data[3] << 8) | data[4];
+					uint16_t rt = ((uint16_t)data[5] << 8) | data[6];
+					app_adc_wheelie_set_panic((float)mg / 100.0f, (float)rt / 10.0f);
+				}
+				break;
 			}
 		}
 		if (appdata_func) {
@@ -1310,9 +1336,10 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 			buffer_append_uint32(send_buffer, mc_interface_get_perf_metrics(), &ind);
 		}
 		if (mask & ((uint32_t)1 << 24)) {
-			// Torque sensor: raw ADC (uint16) + normalized 0-160 (uint16)
+			// Torque sensor: raw ADC (uint16) + normalized 0-160 (uint16) + current cmd (int16, 0.1A)
 			buffer_append_uint16(send_buffer, app_adc_get_torque_raw(), &ind);
 			buffer_append_uint16(send_buffer, app_adc_get_ext_torque(), &ind);
+			buffer_append_int16(send_buffer, (int16_t)(app_adc_get_direct_torque_cmd() * 10.0f), &ind);
 		}
 
 		reply_func(send_buffer, ind);

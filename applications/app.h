@@ -59,12 +59,17 @@ void app_adc_set_ext_torque(uint16_t value);
 uint16_t app_adc_get_ext_torque(void);
 uint16_t app_adc_get_torque_raw(void);
 void app_adc_set_torque_cal(uint16_t offset, uint16_t adc_max);
+float app_adc_get_direct_torque_cmd(void);
 // Wheelie balance mode
 void app_adc_wheelie_enable(bool enable);
 void app_adc_wheelie_set_target(float angle_deg);
 void app_adc_wheelie_set_pid(float kp, float ki, float kd);
 void app_adc_wheelie_set_max_duty(float duty);
 void app_adc_wheelie_set_bail(float angle_deg);
+void app_adc_wheelie_set_max_pitch_rate(float deg_per_s);
+void app_adc_wheelie_set_min_speed(float kph);
+void app_adc_wheelie_set_roll_bail(float angle_deg);
+void app_adc_wheelie_set_panic(float margin_deg, float rate_deg_s);
 void app_adc_wheelie_calibrate_zero(void);
 
 typedef enum {

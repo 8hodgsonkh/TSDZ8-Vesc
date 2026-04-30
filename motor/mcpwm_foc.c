@@ -3918,53 +3918,66 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			}
 
 			// =============================================================================
-			// HAZZA: Simple Field Weakening with Boost Level
-			// When approaching duty ceiling (90-95%), ramp up negative Id
-			// At 90% duty = 0% FW, at 95% duty = 100% FW
-			// Boost level controls max FW: Level N = max -3.6N amps
-			//   Level 0 = disabled, Level 5 = -18A max
-			// FW effect increases ERPM beyond what voltage alone can do.
+			// HAZZA: Throttle-driven Field Weakening (manual control)
+			// 0..75% throttle  -> duty climbs over its full range, FW request = 0
+			// 75..100% throttle -> duty pinned at max, FW request linear 0->1
+			// id_fw_target = id_fw_max * fw_request, smoothly tracked.
+			// No more duty-ceiling auto-ramp that resets every throttle release --
+			// you are directly modulating Id across the top quarter of the stick.
+			// id_fw_max scales with boost level: Level N = -3.6 N amps. Level 0 = off.
+			// Engagement gated by ERPM > 100 to avoid FW at standstill.
 			// =============================================================================
 			if (motor_now->m_mtpa_boost_active) {
 				const float omega_e = erpm_now * (2.0f * M_PI / 60.0f);  // Electrical rad/s
-				
-				// FW activates only when duty hits the actual ceiling (max_duty).
-				// No proportional band — just a time-based ramp once at the wall.
-				// This avoids wasting current as heat when voltage headroom exists.
-				float duty_abs = fabsf(state_now->duty_now);
-				const float fw_threshold = conf_now->l_max_duty - 0.005f;  // Within 0.5% of ceiling
-				bool at_ceiling = (duty_abs > fw_threshold) && (omega_e > 100.0f);
-				
-				// Store for debug
-				motor_now->m_fw_mod_now = duty_abs;
-				motor_now->m_fw_at_ceiling = at_ceiling;
-				motor_now->m_fw_in_boost = (motor_now->m_mtpa_boost_iq < -0.1f);
-				
-				// Max FW current based on boost level: Level N = -3.6N amps
-				// Level 5 = -18A max
-				float id_fw_max = -3.6f * motor_now->m_mtpa_boost_level;
-				
-				// Time-based ramp: ~18A/s at 30kHz = 1.0s to reach -18A (level 5)
-				const float ramp_rate = 0.0006f;
-				
-				if (at_ceiling) {
-					// At the wall — ramp Id toward full FW current
-					if (motor_now->m_mtpa_boost_iq > id_fw_max) {
-						motor_now->m_mtpa_boost_iq -= ramp_rate;
-						if (motor_now->m_mtpa_boost_iq < id_fw_max) {
-							motor_now->m_mtpa_boost_iq = id_fw_max;
-						}
-					}
+
+				const float fw_pos_start = 0.75f;
+				float thr = motor_now->m_throttle_pos;
+				if (thr < 0.0f) thr = 0.0f;
+				if (thr > 1.0f) thr = 1.0f;
+				float fw_request;
+				if (thr <= fw_pos_start) {
+					fw_request = 0.0f;
 				} else {
-					// Below ceiling — ramp back to zero
-					if (motor_now->m_mtpa_boost_iq < 0.0f) {
-						motor_now->m_mtpa_boost_iq += ramp_rate;
-						if (motor_now->m_mtpa_boost_iq > 0.0f) {
-							motor_now->m_mtpa_boost_iq = 0.0f;
-						}
+					fw_request = (thr - fw_pos_start) / (1.0f - fw_pos_start);
+					if (fw_request > 1.0f) fw_request = 1.0f;
+				}
+				if (omega_e <= 100.0f) {
+					fw_request = 0.0f;  // hold off until motor is actually spinning
+				}
+
+				// Max FW current based on boost level: Level N = -3.6N amps
+				const float id_fw_max = -3.6f * motor_now->m_mtpa_boost_level;  // negative
+				const float id_fw_target = id_fw_max * fw_request;              // negative or zero
+				// Asymmetric slew so the feel is the same regardless of starting
+				// duty: at 30kHz tick rate,
+				//   ramp_up  = 0.0024  -> 72 A/s  (full at boost level 5 in ~0.25 s)
+				//   ramp_dn  = 0.0006  -> 18 A/s  (gentle release, no Id snap-off)
+				// Old 0.0006 up was masked by duty-climb time on a 0->100 slam but
+				// felt slow when duty was already partway up. Faster up rate makes
+				// FW arrive together with the duty ceiling in both cases.
+				const float ramp_up = 0.0024f;
+				const float ramp_dn = 0.0006f;
+
+				// Slew toward target -- |id| growing uses ramp_up, shrinking uses ramp_dn
+				if (motor_now->m_mtpa_boost_iq > id_fw_target) {
+					// id_fw_target is more negative -> growing |id|
+					motor_now->m_mtpa_boost_iq -= ramp_up;
+					if (motor_now->m_mtpa_boost_iq < id_fw_target) {
+						motor_now->m_mtpa_boost_iq = id_fw_target;
+					}
+				} else if (motor_now->m_mtpa_boost_iq < id_fw_target) {
+					// id_fw_target is less negative (toward 0) -> shrinking |id|
+					motor_now->m_mtpa_boost_iq += ramp_dn;
+					if (motor_now->m_mtpa_boost_iq > id_fw_target) {
+						motor_now->m_mtpa_boost_iq = id_fw_target;
 					}
 				}
-				
+
+				// Debug telemetry kept compatible with existing fields
+				motor_now->m_fw_mod_now = fabsf(state_now->duty_now);
+				motor_now->m_fw_at_ceiling = (fw_request > 0.01f);
+				motor_now->m_fw_in_boost = (motor_now->m_mtpa_boost_iq < -0.1f);
+
 				// Apply the field weakening offset to Id
 				id_mtpa += motor_now->m_mtpa_boost_iq;
 			} else {

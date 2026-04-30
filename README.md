@@ -13,6 +13,44 @@ An open source motor controller firmware.
 This is the source code for the VESC DC/BLDC/FOC controller. Read more at
 [https://vesc-project.com/](https://vesc-project.com/)
 
+---
+
+## Hazza's TSDZ8 Mid-Drive Fork
+
+Custom fork for a TSDZ8 mid-drive e-bike motor on a MakerX GO-FOC S100 D100S controller.
+
+### What's different
+
+**Direct Torque UART** — The TSDZ8's XMC1302 torque sensor controller sends raw torque ADC
+values over UART at 500Hz directly to the VESC, bypassing the original display protocol entirely.
+The XMC handles calibration (32-sample average + 10 margin at boot). The VESC takes its output
+at face value — zero means zero, no second offset subtraction.
+
+**Katana Smoothing** — Adaptive noise filter for the torque signal, inspired by
+[Casainho's OpenSource Firmware (OSF)](https://github.com/OpenSourceEBike/TSDZ2-Smart-EBike)
+for the TSDZ2/TSDZ8 series motors. OSF's extensive work on torque sensor signal processing
+and the TSDZ platform in general was invaluable — Katana builds on those foundations with a
+ring-buffer median approach that cuts through noise spikes while preserving genuine torque
+transients. Configurable via `haz_torque_smoothing` (0 = passthrough, 0.3 = light, 0.7+ = heavy).
+
+**PAS Integration** — Cadence-based pedal assist with idle timeout detection, cadence
+deceleration ramp-down, and hybrid duty mode for smooth power delivery through a 38:1
+internal gearbox.
+
+**ESP32-S3 BLE Display** — Companion 7" touchscreen display connected via BLE through the
+NRF52 on the S100 board. Selective telemetry, torque test screen with dual-line graphing
+(raw torque + current command), voice event system with swappable voice packs, and full
+ride analytics.
+
+### Credits
+
+- **Benjamin Vedder** — VESC firmware and the entire VESC ecosystem
+- **Casainho & OSF contributors** — OpenSource Firmware for TSDZ2/TSDZ8, torque sensor
+  signal processing research, and the original firmware that made these motors hackable
+- **MakerX** — GO-FOC S100 D100S hardware
+
+---
+
 ## Supported boards
 
 All of them!
