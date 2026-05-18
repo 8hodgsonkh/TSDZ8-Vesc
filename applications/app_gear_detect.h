@@ -70,8 +70,17 @@ float app_gear_detect_target_erpm(float speed_kph, int gear);
 int app_gear_detect_get_last_gear(void);
 
 /**
+ * @brief Notify gear detection that the external shift sensor fired.
+ *
+ * The sensor does not indicate direction; it only opens a real-shift window so
+ * the detector can ignore transient ERPM/wheel mismatch until the drivetrain
+ * settles and then confirm the new stable gear from wheel pulses.
+ */
+void app_gear_detect_note_shift_event(void);
+
+/**
  * @brief Update fused wheel speed — call every app_adc cycle.
- * Blends magnet sensor (1 pulse/rev) with ERPM-derived speed when
+ * Blends magnet sensor speed with ERPM-derived speed when
  * chain is engaged, injecting high-res speed via mc_interface override.
  */
 void app_gear_detect_update_fused_speed(void);

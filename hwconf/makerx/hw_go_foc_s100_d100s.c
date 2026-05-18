@@ -312,6 +312,22 @@ static volatile uint32_t wheel_pulse_period_us = 0;
 static volatile wheel_speed_state_t wheel_state = WHEEL_SPEED_STATE_UNKNOWN;
 static volatile float wheel_speed_rps = 0.0f;
 
+#define HW_WHEEL_SPEED_PERIOD_AVG_SAMPLES	((HW_WHEEL_SPEED_MAGNETS > 1) ? HW_WHEEL_SPEED_MAGNETS : 1)
+
+static volatile uint32_t wheel_period_history[HW_WHEEL_SPEED_PERIOD_AVG_SAMPLES];
+static volatile uint32_t wheel_period_sum_us = 0;
+static volatile uint32_t wheel_period_samples = 0;
+static volatile uint32_t wheel_period_index = 0;
+
+static void wheel_speed_clear_period_history(void) {
+	for (int i = 0; i < HW_WHEEL_SPEED_PERIOD_AVG_SAMPLES; i++) {
+		wheel_period_history[i] = 0;
+	}
+	wheel_period_sum_us = 0;
+	wheel_period_samples = 0;
+	wheel_period_index = 0;
+}
+
 // Call this from mc_interface timer task (called every 1ms)
 // ADC_Value[] is updated at FOC rate (~30kHz), so we get good resolution
 void hw_update_speed_sensor(void) {
@@ -342,10 +358,25 @@ void hw_update_speed_sensor(void) {
 			// Calculate period
 			if (wheel_last_pulse_time > 0) {
 				uint32_t period = now_us - wheel_last_pulse_time;
-				if (period > 1000 && period < 10000000) {  // 0.1 RPM to 60000 RPM sanity check
+				if (period > 1000 && period < 10000000) {  // Ignore obvious bounce/stale intervals
 					wheel_pulse_period_us = period;
-					// RPS = 1 / (period_sec * magnets)
-					wheel_speed_rps = 1000000.0f / ((float)period * HW_WHEEL_SPEED_MAGNETS);
+
+					// Average a rolling wheel revolution when multiple magnets are installed.
+					if (wheel_period_samples >= HW_WHEEL_SPEED_PERIOD_AVG_SAMPLES) {
+						wheel_period_sum_us -= wheel_period_history[wheel_period_index];
+					} else {
+						wheel_period_samples++;
+					}
+					wheel_period_history[wheel_period_index] = period;
+					wheel_period_sum_us += period;
+					wheel_period_index++;
+					if (wheel_period_index >= HW_WHEEL_SPEED_PERIOD_AVG_SAMPLES) {
+						wheel_period_index = 0;
+					}
+
+					// RPS = pulse_count / (period_sum_sec * magnets)
+					wheel_speed_rps = (1000000.0f * (float)wheel_period_samples) /
+							((float)wheel_period_sum_us * (float)HW_WHEEL_SPEED_MAGNETS);
 				}
 			}
 			wheel_last_pulse_time = now_us;
@@ -366,6 +397,8 @@ void hw_update_speed_sensor(void) {
 	if (wheel_last_pulse_time > 0 && (now_us - wheel_last_pulse_time) > 2000000) {
 		wheel_speed_rps = 0.0f;
 		wheel_pulse_period_us = 0;
+		wheel_last_pulse_time = 0;
+		wheel_speed_clear_period_history();
 	}
 }
 

@@ -830,6 +830,21 @@ typedef struct {
 	float haz_torque_direct_ramp_down;        // A/s ramp down rate
 	// Gear integration
 	bool haz_torque_direct_use_gears;         // Use gear detection for current scaling
+	// Paddle-Shift Gear Shift Assist — throttle-only duty unload during shifts.
+	// Active ONLY in HYBRID_DUTY rider-throttle branch. Returns a duty CEILING.
+	// PAS / current modes are never affected.
+	bool  haz_shift_assist_enabled;           // Master enable
+	float haz_shift_min_throttle;             // Below this rider-duty, ignore trigger (0-0.5)
+	float haz_shift_slip_pct;                 // Unload target = current_duty * (1 - slip) when gear known (0.02-0.40)
+	float haz_shift_fallback_drop_pct;        // Fallback drop when gear=0 (0.10-0.80)
+	float haz_shift_drop_rate;                // Ceiling drop rate (duty/s)
+	float haz_shift_unload_offset;            // Tweak: added to gear-table unload target (+/- duty)
+	uint16_t haz_shift_hold_ms;               // Hold at unloaded duty (ms)
+	float haz_shift_reload_current_a;         // Δ filtered current to detect chain re-engagement (A)
+	uint16_t haz_shift_wait_timeout_ms;       // Max wait before forced restore (ms)
+	float haz_shift_restore_rate;             // Ceiling rise rate back to rider (duty/s)
+	uint16_t haz_shift_lockout_ms;            // Anti-chatter lockout after restore (ms)
+	uint16_t haz_shift_debounce_ms;           // ISR-side trigger debounce (ms)
 } adc_config;
 
 // Nunchuk control types

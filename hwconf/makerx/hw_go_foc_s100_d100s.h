@@ -334,11 +334,11 @@ bool hw_sample_shutdown_button(void);
 #define HW_WHEEL_SPEED_THRESH_LOW	1000	// Below this = magnet present (low)
 
 // Number of magnets on wheel (pulses per revolution)
-#define HW_WHEEL_SPEED_MAGNETS		1
+#define HW_WHEEL_SPEED_MAGNETS		7
 
 // Standard VESC wheel speed interface (called from mc_interface.c)
 void hw_update_speed_sensor(void);
-float hw_get_speed(void);  // Returns wheel revs per second
+float hw_get_speed(void);  // Returns wheel speed in m/s
 float hw_get_distance_abs(void);  // Returns distance in meters
 
 // Extra functions for debugging

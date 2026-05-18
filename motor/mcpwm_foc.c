@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include "virtual_motor.h"
 #include "foc_math.h"
+#include "app.h"
 
 // Private variables
 static volatile bool m_dccal_done = false;
@@ -3882,23 +3883,24 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 		FOC_PROFILE_LINE_FINE();
 
 		// Apply MTPA. See: https://github.com/vedderb/bldc/pull/179
-		// Only enable above 250 ERPM to prevent stall vibration at startup
+		// Only enable MTPA above 250 ERPM to prevent stall vibration at startup.
+		// ESP-controlled FW boost is duty-ceiling gated below, not speed gated.
 		const float ld_lq_diff = conf_now->foc_motor_ld_lq_diff;
 		const float erpm_now = fabsf(RADPS2RPM_f(motor_now->m_pll_speed));
 		const bool mtpa_enabled = (conf_now->foc_mtpa_mode != MTPA_MODE_OFF && ld_lq_diff != 0.0);
 		const bool boost_active = motor_now->m_mtpa_boost_active;
+		const bool mtpa_allowed = mtpa_enabled && erpm_now > 250.0f;
 
 		// Enter block if MTPA is enabled OR if FW boost is active
-		if ((mtpa_enabled || boost_active) &&
-				motor_now->m_control_mode != CONTROL_MODE_OPENLOOP_PHASE &&
-				erpm_now > 250.0f) {
+		if ((mtpa_allowed || boost_active) &&
+				motor_now->m_control_mode != CONTROL_MODE_OPENLOOP_PHASE) {
 			const float lambda = conf_now->foc_motor_flux_linkage;
 
 			float id_mtpa = 0.0f;
 			float iq_mtpa = iq_set_tmp;
 
 			// MTPA torque angle optimization (only when MTPA mode is enabled)
-			if (mtpa_enabled) {
+			if (mtpa_allowed) {
 				float iq_ref = iq_set_tmp;
 				if (conf_now->foc_mtpa_mode == MTPA_MODE_IQ_MEASURED) {
 					iq_ref = utils_min_abs(iq_set_tmp, state_now->iq_filter);
@@ -3918,18 +3920,14 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			}
 
 			// =============================================================================
-			// HAZZA: Throttle-driven Field Weakening (manual control)
+			// HAZZA: Throttle-requested, duty-ceiling-gated Field Weakening.
 			// 0..75% throttle  -> duty climbs over its full range, FW request = 0
-			// 75..100% throttle -> duty pinned at max, FW request linear 0->1
-			// id_fw_target = id_fw_max * fw_request, smoothly tracked.
-			// No more duty-ceiling auto-ramp that resets every throttle release --
-			// you are directly modulating Id across the top quarter of the stick.
+			// 75..100% throttle -> rider requests FW, but Id only ramps once actual
+			// duty is at the voltage ceiling. A max-throttle launch therefore cannot
+			// spend FW Id while the hybrid duty ramp is still climbing.
 			// id_fw_max scales with boost level: Level N = -3.6 N amps. Level 0 = off.
-			// Engagement gated by ERPM > 100 to avoid FW at standstill.
 			// =============================================================================
 			if (motor_now->m_mtpa_boost_active) {
-				const float omega_e = erpm_now * (2.0f * M_PI / 60.0f);  // Electrical rad/s
-
 				const float fw_pos_start = 0.75f;
 				float thr = motor_now->m_throttle_pos;
 				if (thr < 0.0f) thr = 0.0f;
@@ -3941,8 +3939,10 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 					fw_request = (thr - fw_pos_start) / (1.0f - fw_pos_start);
 					if (fw_request > 1.0f) fw_request = 1.0f;
 				}
-				if (omega_e <= 100.0f) {
-					fw_request = 0.0f;  // hold off until motor is actually spinning
+
+				const float duty_fw_start = 0.95f * conf_now->l_max_duty;
+				if (duty_abs < duty_fw_start) {
+					fw_request = 0.0f;
 				}
 
 				// Max FW current based on boost level: Level N = -3.6N amps
@@ -3975,7 +3975,7 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 
 				// Debug telemetry kept compatible with existing fields
 				motor_now->m_fw_mod_now = fabsf(state_now->duty_now);
-				motor_now->m_fw_at_ceiling = (fw_request > 0.01f);
+				motor_now->m_fw_at_ceiling = (duty_abs >= duty_fw_start);
 				motor_now->m_fw_in_boost = (motor_now->m_mtpa_boost_iq < -0.1f);
 
 				// Apply the field weakening offset to Id
@@ -3996,7 +3996,7 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			// For high-saliency IPM motors, the id component adds significant battery draw.
 			// This mode scales the entire MTPA vector down to respect battery current limits.
 			// =============================================================================
-			if (mtpa_enabled && conf_now->foc_mtpa_power_cap) {
+			if (mtpa_allowed && conf_now->foc_mtpa_power_cap) {
 				// Estimate battery current for this MTPA current vector
 				// I_batt = mod_d * id + mod_q * iq
 				// We use the measured/filtered modulation values as our best estimate

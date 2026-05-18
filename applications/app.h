@@ -72,6 +72,10 @@ void app_adc_wheelie_set_roll_bail(float angle_deg);
 void app_adc_wheelie_set_panic(float margin_deg, float rate_deg_s);
 void app_adc_wheelie_calibrate_zero(void);
 
+// Paddle-shift gear shift assist (throttle-only HYBRID_DUTY mode).
+// Trigger is RT/ISR-safe — sets an atomic flag consumed in the app_adc thread.
+void app_adc_trigger_shift(void);
+
 typedef enum {
 	UART_PORT_COMM_HEADER = 0,
 	UART_PORT_BUILTIN,

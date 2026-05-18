@@ -32,6 +32,7 @@
 #include "comm_can.h"
 #include "hw.h"
 #include "app_gear_detect.h"
+#include "app_shift_assist.h"
 #include "terminal.h"
 #include "commands.h"
 #include "imu.h"
@@ -1940,6 +1941,16 @@ void app_adc_configure(adc_config *conf) {
 
 	config = *conf;
 	ms_without_power = 0.0;
+
+	// Refresh paddle-shift assist tunables on every config update.
+	app_shift_assist_configure((const adc_config *)&config);
+}
+
+void app_adc_trigger_shift(void) {
+	app_gear_detect_note_shift_event();
+	if (config.haz_shift_assist_enabled) {
+		app_shift_assist_trigger();
+	}
 }
 
 void app_adc_start(bool use_rx_tx) {
@@ -1969,6 +1980,15 @@ void app_adc_start(bool use_rx_tx) {
 #endif
 
 	stop_now = false;
+	app_shift_assist_init();
+
+	// Shift sensor on PWM/ICU pin (PB6 on S100). Bafang SS01 is open-collector,
+	// pulls LOW when magnet present. Use input + pull-up; poll falling-edge
+	// in the adc thread loop.
+#ifdef HW_ICU_GPIO
+	palSetPadMode(HW_ICU_GPIO, HW_ICU_PIN, PAL_MODE_INPUT_PULLUP);
+#endif
+
 	chThdCreateStatic(adc_thread_wa, sizeof(adc_thread_wa), NORMALPRIO, adc_thread, NULL);
 }
 
@@ -2068,6 +2088,26 @@ static THD_FUNCTION(adc_thread, arg) {
 		// Update fused wheel speed: blends magnet sensor with ERPM-derived speed
 		// Must run BEFORE anything that calls mc_interface_get_speed()
 		app_gear_detect_update_fused_speed();
+
+		// Shift sensor poll (PB6/HW_ICU). Falling-edge = magnet detected (Bafang SS01).
+		// Sensor has its own Schmitt trigger -- no software debounce here. The FSM
+		// handles debounce/lockout via haz_shift_debounce_ms / haz_shift_lockout_ms.
+#ifdef HW_ICU_GPIO
+		const app_configuration *shift_appconf = app_get_configuration();
+		bool shift_sensor_needed = config.haz_shift_assist_enabled ||
+				(shift_appconf && shift_appconf->gear_detect_conf.enabled);
+		if (shift_sensor_needed) {
+			static uint8_t shift_pin_prev = 1;   // assume HIGH at boot (pull-up)
+			uint8_t lvl = palReadPad(HW_ICU_GPIO, HW_ICU_PIN) ? 1 : 0;
+			if (shift_pin_prev == 1 && lvl == 0) {
+				app_gear_detect_note_shift_event();
+				if (config.haz_shift_assist_enabled) {
+					app_shift_assist_trigger();
+				}
+			}
+			shift_pin_prev = lvl;
+		}
+#endif
 
 #if HAZ_TORQUE_UART_DIRECT
 		// Drain TSDZ8 UART bytes — non-blocking
@@ -2548,6 +2588,17 @@ static THD_FUNCTION(adc_thread, arg) {
 							if (osf_duty_ramped < 0.0f) osf_duty_ramped = 0.0f;
 							if (osf_duty_ramped > mcconf->l_max_duty) osf_duty_ramped = mcconf->l_max_duty;
 
+							// ========== PADDLE-SHIFT GEAR SHIFT ASSIST ==========
+							// Throttle-only ceiling: when a shift trigger fires, this returns
+							// a temporary cap below the rider's request to unload the chain.
+							// When IDLE, returns rider duty unchanged. Never increases duty.
+							{
+								float shift_ceiling = app_shift_assist_apply(duty_target, osf_duty_ramped, dt_s);
+								if (shift_ceiling < osf_duty_ramped) {
+									osf_duty_ramped = shift_ceiling;
+								}
+							}
+
 							// ========== CRITICAL: HARD SPEED LIMIT ENFORCEMENT ==========
 							// Even if ramped duty is high, NEVER allow motor assist above speed limit
 							// This is a safety clamp - applies the speed_scale to the actual output
@@ -2591,6 +2642,8 @@ static THD_FUNCTION(adc_thread, arg) {
 						}
 					} else {
 						// PAS MODE: throttle is zero, check for pedaling
+						// Throttle released — abort any in-flight shift assist (throttle-only feature).
+						app_shift_assist_abort();
 
 						// Direct Torque mode takes priority — bypasses duty/speed PID entirely
 						if (config.haz_torque_direct_enable) {
@@ -2640,6 +2693,7 @@ static THD_FUNCTION(adc_thread, arg) {
 					osf_duty_ramped = 0.0f;
 					freewheel_catch_state = 0;
 					freewheel_catch_duty = 0.0f;
+					app_shift_assist_abort();
 				}
 			}
 			break;

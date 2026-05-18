@@ -31,12 +31,47 @@ static float s_magnet_speed_ms = 0.0f;     // Last raw magnet sensor speed for v
 // Gear state — driven strictly by wheel pulses
 static int s_last_gear = 0;               // Last confirmed gear (updated only on pulses)
 static int s_pending_gear = 0;            // Candidate gear needing confirmation
-static int s_consecutive_count = 0;       // Consecutive pulses agreeing on pending_gear
+static uint32_t s_consecutive_count = 0;  // Consecutive pulses agreeing on pending_gear
+static uint32_t s_stable_pulses = 0;      // Pulses matching the confirmed gear
 
 // Pulse-tracking for edge-driven detection
 static uint32_t s_last_pulse_count = 0;   // Pulse count seen at last update
 static float s_last_pulse_ratio = 0.0f;   // Gear ratio at last pulse (for shift detect)
 static uint32_t s_shift_hold_pulses = 0;  // Pulses remaining to hold off re-latch after shift
+static uint32_t s_sensor_shift_pulses = 0; // Search window opened by physical shift sensor
+
+static float s_teeth_scale = 1.0f;        // PI trim for stable drivetrain/sensor bias
+static float s_teeth_scale_i = 0.0f;
+
+#define GEAR_DETECT_PI_KP                 0.08f
+#define GEAR_DETECT_PI_KI                 0.015f
+#define GEAR_DETECT_SCALE_LIMIT           0.12f
+#define GEAR_DETECT_LOADED_CURRENT_A      1.5f
+
+#if defined(HW_WHEEL_SPEED_MAGNETS) && HW_WHEEL_SPEED_MAGNETS > 0
+#define GEAR_DETECT_WHEEL_PULSES_PER_REV	HW_WHEEL_SPEED_MAGNETS
+#else
+#define GEAR_DETECT_WHEEL_PULSES_PER_REV	1
+#endif
+
+static inline uint32_t gear_detect_half_rev_pulses(void) {
+    uint32_t pulses = (GEAR_DETECT_WHEEL_PULSES_PER_REV + 1U) / 2U;
+    return pulses < 2U ? 2U : pulses;
+}
+
+static inline uint32_t gear_detect_full_rev_pulses(void) {
+    return GEAR_DETECT_WHEEL_PULSES_PER_REV < 1U ? 1U : GEAR_DETECT_WHEEL_PULSES_PER_REV;
+}
+
+static inline float gear_detect_clampf(float value, float min_value, float max_value) {
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+static inline bool gear_detect_shift_window_active(void) {
+    return s_sensor_shift_pulses > 0 || s_shift_hold_pulses > 0;
+}
 
 // Helper to get cassette teeth by index (0-11)
 static inline uint8_t get_cassette_teeth(const gear_detection_config *conf, int idx) {
@@ -55,6 +90,46 @@ static inline uint8_t get_cassette_teeth(const gear_detection_config *conf, int 
         case 11: return conf->cassette_teeth_12;
         default: return 0;
     }
+}
+
+static int find_closest_gear(float observed_teeth, const gear_detection_config *conf) {
+    int best_gear = 0;
+    float best_diff = 999.0f;
+
+    for (int g = 0; g < conf->num_gears && g < GEAR_MAX_GEARS; g++) {
+        uint8_t cog_teeth = get_cassette_teeth(conf, g);
+        if (cog_teeth == 0) continue;
+
+        float diff = fabsf(observed_teeth - (float)cog_teeth) / (float)cog_teeth;
+        if (diff < best_diff && diff < conf->detect_tolerance) {
+            best_diff = diff;
+            best_gear = g + 1;
+        }
+    }
+
+    return best_gear;
+}
+
+static void gear_detect_update_teeth_scale(float observed_teeth, const gear_detection_config *conf) {
+    if (s_last_gear <= 0 || s_last_gear > conf->num_gears || s_last_gear > GEAR_MAX_GEARS) {
+        return;
+    }
+
+    uint8_t expected_teeth = get_cassette_teeth(conf, s_last_gear - 1);
+    if (expected_teeth == 0 || observed_teeth < 1.0f) {
+        return;
+    }
+
+    float corrected_teeth = observed_teeth * s_teeth_scale;
+    float error = ((float)expected_teeth - corrected_teeth) / (float)expected_teeth;
+    if (fabsf(error) > conf->detect_tolerance) {
+        return;
+    }
+
+    s_teeth_scale_i = gear_detect_clampf(s_teeth_scale_i + GEAR_DETECT_PI_KI * error,
+            -GEAR_DETECT_SCALE_LIMIT, GEAR_DETECT_SCALE_LIMIT);
+    s_teeth_scale = gear_detect_clampf(1.0f + s_teeth_scale_i + GEAR_DETECT_PI_KP * error,
+            1.0f - GEAR_DETECT_SCALE_LIMIT, 1.0f + GEAR_DETECT_SCALE_LIMIT);
 }
 
 /**
@@ -95,23 +170,7 @@ static int detect_gear_raw(float speed_kph, int32_t erpm, const gear_detection_c
     float observed_cog_teeth = (float)conf->chainring_teeth * motor_rpm / 
                                (conf->internal_ratio * wheel_rpm);
     
-    // Find closest matching gear
-    int best_gear = 0;
-    float best_diff = 999.0f;
-    
-    for (int g = 0; g < conf->num_gears && g < GEAR_MAX_GEARS; g++) {
-        uint8_t cog_teeth = get_cassette_teeth(conf, g);
-        if (cog_teeth == 0) continue;
-        
-        float diff = fabsf(observed_cog_teeth - (float)cog_teeth) / 
-                     (float)cog_teeth;
-        if (diff < best_diff && diff < conf->detect_tolerance) {
-            best_diff = diff;
-            best_gear = g + 1;  // 1-indexed gears
-        }
-    }
-    
-    return best_gear;
+    return find_closest_gear(observed_cog_teeth * s_teeth_scale, conf);
 }
 
 void app_gear_detect_reset(void) {
@@ -121,6 +180,25 @@ void app_gear_detect_reset(void) {
     s_last_pulse_count = 0;
     s_last_pulse_ratio = 0.0f;
     s_shift_hold_pulses = 0;
+    s_sensor_shift_pulses = 0;
+    s_stable_pulses = 0;
+    s_teeth_scale = 1.0f;
+    s_teeth_scale_i = 0.0f;
+}
+
+void app_gear_detect_note_shift_event(void) {
+    const app_configuration *appconf = app_get_configuration();
+    if (!appconf->gear_detect_conf.enabled) {
+        return;
+    }
+
+    uint32_t settle_pulses = gear_detect_half_rev_pulses();
+    s_sensor_shift_pulses = gear_detect_full_rev_pulses() + settle_pulses;
+    s_shift_hold_pulses = settle_pulses;
+    s_pending_gear = 0;
+    s_consecutive_count = 0;
+    s_stable_pulses = 0;
+    s_last_pulse_ratio = 0.0f;
 }
 
 /**
@@ -133,10 +211,11 @@ void app_gear_detect_reset(void) {
  * Steps per pulse:
  *  1. Compute observed gear ratio from fresh wheel speed + ERPM.
  *  2. Detect a mid-shift: ratio changed sharply from last pulse → hold off.
- *  3. Apply 2-pulse hysteresis to avoid latching on a single noisy pulse.
- *  4. Commit gear when two consecutive pulses agree.
+ *  3. Apply wheel-fraction hysteresis to avoid latching on noisy pulse spacing.
+ *  4. Commit gear when a short run of pulses agree.
  */
-static void process_gear_on_pulse(float wheel_speed_kph, float erpm, const gear_detection_config *conf) {
+static void process_gear_on_pulse(float wheel_speed_kph, float erpm, float motor_current,
+        const gear_detection_config *conf) {
     if (wheel_speed_kph < conf->min_speed_kph || erpm < (float)conf->min_erpm) {
         // Too slow — clear state and bail
         if (wheel_speed_kph < 1.0f) {
@@ -144,6 +223,8 @@ static void process_gear_on_pulse(float wheel_speed_kph, float erpm, const gear_
             s_pending_gear = 0;
             s_consecutive_count = 0;
             s_shift_hold_pulses = 0;
+            s_sensor_shift_pulses = 0;
+            s_stable_pulses = 0;
         }
         return;
     }
@@ -154,38 +235,45 @@ static void process_gear_on_pulse(float wheel_speed_kph, float erpm, const gear_
     float motor_rpm = erpm / ((float)conf->motor_poles / 2.0f);
     float observed_teeth = (float)conf->chainring_teeth * motor_rpm /
                            (conf->internal_ratio * wheel_rpm);
+    float corrected_teeth = observed_teeth * s_teeth_scale;
+
+    const uint32_t settle_pulses = gear_detect_half_rev_pulses();
+    bool sensor_shift_active = s_sensor_shift_pulses > 0;
+    bool chain_loaded = motor_current >= GEAR_DETECT_LOADED_CURRENT_A;
+
+    if (s_sensor_shift_pulses > 0) {
+        s_sensor_shift_pulses--;
+    }
+
+    if (!sensor_shift_active && !chain_loaded && s_last_gear > 0) {
+        uint8_t expected_teeth = get_cassette_teeth(conf, s_last_gear - 1);
+        if (expected_teeth > 0 && corrected_teeth < (float)expected_teeth * 0.85f) {
+            s_pending_gear = 0;
+            s_consecutive_count = 0;
+            return;
+        }
+    }
 
     // Mid-shift detection: if observed_teeth jumped sharply from last pulse,
-    // the chain is mid-shift — hold off latching for 2 pulses to let it settle.
+    // the chain is mid-shift — hold off latching for about half a wheel turn.
     // Threshold: >8% step in teeth matches the smallest cassette step (~10% for 19→17T)
-    if (s_last_pulse_ratio > 1.0f) {
-        float ratio_step = fabsf(observed_teeth - s_last_pulse_ratio) / s_last_pulse_ratio;
+    if (!sensor_shift_active && chain_loaded && s_last_pulse_ratio > 1.0f) {
+        float ratio_step = fabsf(corrected_teeth - s_last_pulse_ratio) / s_last_pulse_ratio;
         if (ratio_step > 0.08f) {
-            // Chain is mid-shift — suppress latching for 2 pulses
-            s_shift_hold_pulses = 2;
+            // Chain is mid-shift — suppress latching while it settles.
+            s_shift_hold_pulses = settle_pulses;
             s_pending_gear = 0;
             s_consecutive_count = 0;
         }
     }
-    s_last_pulse_ratio = observed_teeth;
+    s_last_pulse_ratio = corrected_teeth;
 
     if (s_shift_hold_pulses > 0) {
         s_shift_hold_pulses--;
         return;  // Hold off — still settling after shift
     }
 
-    // Find the closest matching gear
-    int best_gear = 0;
-    float best_diff = 999.0f;
-    for (int g = 0; g < conf->num_gears && g < GEAR_MAX_GEARS; g++) {
-        uint8_t cog_teeth = get_cassette_teeth(conf, g);
-        if (cog_teeth == 0) continue;
-        float diff = fabsf(observed_teeth - (float)cog_teeth) / (float)cog_teeth;
-        if (diff < best_diff && diff < conf->detect_tolerance) {
-            best_diff = diff;
-            best_gear = g + 1;
-        }
-    }
+    int best_gear = find_closest_gear(corrected_teeth, conf);
 
     if (best_gear <= 0) {
         // No gear matched this pulse — reset consecutive count but keep last known
@@ -193,20 +281,33 @@ static void process_gear_on_pulse(float wheel_speed_kph, float erpm, const gear_
         return;
     }
 
-    // 2-pulse hysteresis: need two consecutive pulses on the same gear before committing
+    // Need a short run of matching pulses before committing; with multi-magnet
+    // wheels this is still only a fraction of a wheel turn, not multiple turns.
     if (best_gear == s_pending_gear) {
         s_consecutive_count++;
-        if (s_consecutive_count >= 2) {
+        if (s_consecutive_count >= settle_pulses) {
+            if (s_last_gear != best_gear) {
+                s_stable_pulses = 0;
+            }
             s_last_gear = best_gear;
         }
     } else {
         s_pending_gear = best_gear;
         s_consecutive_count = 1;
         // First pulse after a shift — immediately update last_gear as a provisional value
-        // so fused speed interpolation isn't stuck on stale gear for 2 whole revs.
+        // so fused speed interpolation isn't stuck on stale gear for the confirm window.
         // It will be confirmed (or corrected) on the next pulse.
         if (s_last_gear == 0) {
-            s_last_gear = best_gear;  // Only snap from unknown; confirmed gears need 2 pulses
+            s_last_gear = best_gear;  // Only snap from unknown; confirmed gears need the full window
+        }
+    }
+
+    if (!gear_detect_shift_window_active() && best_gear == s_last_gear) {
+        if (s_stable_pulses < 1000000U) {
+            s_stable_pulses++;
+        }
+        if (chain_loaded && s_stable_pulses >= settle_pulses) {
+            gear_detect_update_teeth_scale(observed_teeth, conf);
         }
     }
 }
@@ -387,7 +488,7 @@ void app_gear_detect_update_fused_speed(void) {
     uint32_t current_pulses = hw_wheel_speed_get_pulses();
     if (current_pulses != s_last_pulse_count) {
         s_last_pulse_count = current_pulses;
-        process_gear_on_pulse(magnet_speed_ms * 3.6f, erpm, &appconf->gear_detect_conf);
+        process_gear_on_pulse(magnet_speed_ms * 3.6f, erpm, motor_current, &appconf->gear_detect_conf);
     }
 
     int gear = s_last_gear;  // Freshly updated from pulse above if one arrived
@@ -398,11 +499,20 @@ void app_gear_detect_update_fused_speed(void) {
     const float min_erpm_for_fusion = 300.0f;       // Need some ERPM for meaningful calculation
     const float max_pulse_age_for_trust = 1500;     // If magnet pulse >1.5s old, speed is stale
 
+    // Determine if chain is engaged (with hysteresis)
+    static bool chain_engaged = false;
+    if (motor_current > current_engage_threshold && erpm > min_erpm_for_fusion) {
+        chain_engaged = true;
+    } else if (motor_current < current_disengage_threshold || erpm < min_erpm_for_fusion * 0.5f) {
+        chain_engaged = false;
+    }
+
     // Sanity cross-check: if fused ERPM speed disagrees badly with magnet even
     // after the pulse-driven correction, we may be mid-shift. Use magnet locally
     // for this cycle but do NOT commit to s_last_gear — wait for next pulse.
     if (magnet_speed_ms > 1.0f && pulse_age_ms < max_pulse_age_for_trust &&
-        erpm > min_erpm_for_fusion && gear > 0) {
+        erpm > min_erpm_for_fusion && gear > 0 &&
+        (chain_engaged || gear_detect_shift_window_active())) {
         float erpm_speed_ms = erpm_to_wheel_speed_ms(erpm, gear);
         float ratio = (erpm_speed_ms > 0.1f) ? (erpm_speed_ms / magnet_speed_ms) : 0.0f;
         if (ratio < 0.80f || ratio > 1.25f) {
@@ -412,14 +522,6 @@ void app_gear_detect_update_fused_speed(void) {
                 gear = fallback;  // Local use only, not committed
             }
         }
-    }
-    
-    // Determine if chain is engaged (with hysteresis)
-    static bool chain_engaged = false;
-    if (motor_current > current_engage_threshold && erpm > min_erpm_for_fusion) {
-        chain_engaged = true;
-    } else if (motor_current < current_disengage_threshold || erpm < min_erpm_for_fusion * 0.5f) {
-        chain_engaged = false;
     }
     
     if (chain_engaged && gear > 0) {
